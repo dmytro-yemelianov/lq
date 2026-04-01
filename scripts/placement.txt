@@ -1,0 +1,376 @@
+# seL4 kernel and elfloader files - RISC-V 64-bit only, qemu-riscv-virt platform
+# Format: original/path/file.ext                    new/path/file.ext
+
+# === KERNEL: Generic source files ===
+kernel/src/api/faults.c                             kernel/api/faults.c
+kernel/src/api/syscall.c                            kernel/api/syscall.c
+kernel/src/assert.c                                 kernel/assert.c
+kernel/src/benchmark/benchmark.c                    kernel/benchmark/benchmark.c
+kernel/src/benchmark/benchmark_track.c              kernel/benchmark/benchmark_track.c
+kernel/src/benchmark/benchmark_utilisation.c        kernel/benchmark/benchmark_utilisation.c
+kernel/src/fastpath/fastpath.c                      kernel/fastpath/fastpath.c
+kernel/src/inlines.c                                kernel/inlines.c
+kernel/src/kernel/boot.c                            kernel/kernel/boot.c
+kernel/src/kernel/cspace.c                          kernel/kernel/cspace.c
+kernel/src/kernel/faulthandler.c                    kernel/kernel/faulthandler.c
+kernel/src/kernel/sporadic.c                        kernel/kernel/sporadic.c
+kernel/src/kernel/stack.c                           kernel/kernel/stack.c
+kernel/src/kernel/thread.c                          kernel/kernel/thread.c
+kernel/src/machine/capdl.c                          kernel/machine/capdl.c
+kernel/src/machine/fpu.c                            kernel/machine/fpu.c
+kernel/src/machine/io.c                             kernel/machine/io.c
+kernel/src/machine/profiler.c                       kernel/machine/profiler.c
+kernel/src/machine/registerset.c                    kernel/machine/registerset.c
+kernel/src/model/preemption.c                       kernel/model/preemption.c
+kernel/src/model/smp.c                              kernel/model/smp.c
+kernel/src/model/statedata.c                        kernel/model/statedata.c
+kernel/src/object/cnode.c                           kernel/object/cnode.c
+kernel/src/object/domain.c                          kernel/object/domain.c
+kernel/src/object/endpoint.c                        kernel/object/endpoint.c
+kernel/src/object/interrupt.c                       kernel/object/interrupt.c
+kernel/src/object/notification.c                    kernel/object/notification.c
+kernel/src/object/objecttype.c                      kernel/object/objecttype.c
+kernel/src/object/reply.c                           kernel/object/reply.c
+kernel/src/object/schedcontext.c                    kernel/object/schedcontext.c
+kernel/src/object/schedcontrol.c                    kernel/object/schedcontrol.c
+kernel/src/object/tcb.c                             kernel/object/tcb.c
+kernel/src/object/untyped.c                         kernel/object/untyped.c
+kernel/src/smp/ipi.c                                kernel/smp/ipi.c
+kernel/src/smp/lock.c                               kernel/smp/lock.c
+kernel/src/string.c                                 kernel/string.c
+kernel/src/util.c                                   kernel/util.c
+
+# === KERNEL: RISC-V 64-bit architecture-specific source files ===
+kernel/src/arch/riscv/head.S                        kernel/arch/riscv/head.S
+kernel/src/arch/riscv/traps.S                       kernel/arch/riscv/traps.S
+kernel/src/arch/riscv/idle.S                        kernel/arch/riscv/idle.S
+kernel/src/arch/riscv/c_traps.c                     kernel/arch/riscv/c_traps.c
+kernel/src/arch/riscv/idle.c                        kernel/arch/riscv/idle.c
+kernel/src/arch/riscv/api/benchmark.c               kernel/arch/riscv/api/benchmark.c
+kernel/src/arch/riscv/api/faults.c                  kernel/arch/riscv/api/faults.c
+kernel/src/arch/riscv/kernel/boot.c                 kernel/arch/riscv/kernel/boot.c
+kernel/src/arch/riscv/kernel/thread.c               kernel/arch/riscv/kernel/thread.c
+kernel/src/arch/riscv/kernel/vspace.c               kernel/arch/riscv/kernel/vspace.c
+kernel/src/arch/riscv/machine/capdl.c               kernel/arch/riscv/machine/capdl.c
+kernel/src/arch/riscv/machine/fpu.c                 kernel/arch/riscv/machine/fpu.c
+kernel/src/arch/riscv/machine/hardware.c            kernel/arch/riscv/machine/hardware.c
+kernel/src/arch/riscv/machine/io.c                  kernel/arch/riscv/machine/io.c
+kernel/src/arch/riscv/machine/registerset.c         kernel/arch/riscv/machine/registerset.c
+kernel/src/arch/riscv/model/statedata.c             kernel/arch/riscv/model/statedata.c
+kernel/src/arch/riscv/object/interrupt.c            kernel/arch/riscv/object/interrupt.c
+kernel/src/arch/riscv/object/objecttype.c           kernel/arch/riscv/object/objecttype.c
+kernel/src/arch/riscv/object/tcb.c                  kernel/arch/riscv/object/tcb.c
+kernel/src/arch/riscv/smp/ipi.c                     kernel/arch/riscv/smp/ipi.c
+
+# === KERNEL: Linker script ===
+kernel/src/arch/riscv/common_riscv.lds              kernel/arch/riscv/common_riscv.lds
+
+# === KERNEL: Generic headers ===
+kernel/include/api/debug.h                          kernel/include/api/debug.h
+kernel/include/api/failures.h                       kernel/include/api/failures.h
+kernel/include/api/faults.h                         kernel/include/api/faults.h
+kernel/include/api.h                                kernel/include/api.h
+kernel/include/api/syscall.h                        kernel/include/api/syscall.h
+kernel/include/api/types.h                          kernel/include/api/types.h
+kernel/include/assert.h                             kernel/include/assert.h
+kernel/include/basic_types.h                        kernel/include/basic_types.h
+kernel/include/benchmark/benchmark.h                kernel/include/benchmark/benchmark.h
+kernel/include/benchmark/benchmark_track.h          kernel/include/benchmark/benchmark_track.h
+kernel/include/benchmark/benchmark_utilisation.h    kernel/include/benchmark/benchmark_utilisation.h
+kernel/include/benchmark/benchmark_utilisation_.h   kernel/include/benchmark/benchmark_utilisation_.h
+kernel/include/bootinfo.h                           kernel/include/bootinfo.h
+kernel/include/compound_types.h                     kernel/include/compound_types.h
+kernel/include/config.h                             kernel/include/config.h
+kernel/include/drivers/irq/riscv_plic0.h            kernel/include/drivers/irq/riscv_plic0.h
+kernel/include/drivers/irq/riscv_plic_dummy.h       kernel/include/drivers/irq/riscv_plic_dummy.h
+kernel/include/drivers/uart.h                       kernel/include/drivers/uart.h
+kernel/include/fastpath/fastpath.h                  kernel/include/fastpath/fastpath.h
+kernel/include/hardware.h                           kernel/include/hardware.h
+kernel/include/kernel/boot.h                        kernel/include/kernel/boot.h
+kernel/include/kernel/cspace.h                      kernel/include/kernel/cspace.h
+kernel/include/kernel/faulthandler.h                kernel/include/kernel/faulthandler.h
+kernel/include/kernel/sporadic.h                    kernel/include/kernel/sporadic.h
+kernel/include/kernel/stack.h                       kernel/include/kernel/stack.h
+kernel/include/kernel/thread.h                      kernel/include/kernel/thread.h
+kernel/include/kernel/traps.h                       kernel/include/kernel/traps.h
+kernel/include/kernel/vspace.h                      kernel/include/kernel/vspace.h
+kernel/include/linker.h                             kernel/include/linker.h
+kernel/include/machine/assembler.h                  kernel/include/machine/assembler.h
+kernel/include/machine/capdl.h                      kernel/include/machine/capdl.h
+kernel/include/machine/debug.h                      kernel/include/machine/debug.h
+kernel/include/machine/fpu.h                        kernel/include/machine/fpu.h
+kernel/include/machine.h                            kernel/include/machine.h
+kernel/include/machine/interrupt.h                  kernel/include/machine/interrupt.h
+kernel/include/machine/io.h                         kernel/include/machine/io.h
+kernel/include/machine/profiler.h                   kernel/include/machine/profiler.h
+kernel/include/machine/registerset.h                kernel/include/machine/registerset.h
+kernel/include/machine/timer.h                      kernel/include/machine/timer.h
+kernel/include/model/preemption.h                   kernel/include/model/preemption.h
+kernel/include/model/smp.h                          kernel/include/model/smp.h
+kernel/include/model/statedata.h                    kernel/include/model/statedata.h
+kernel/include/object/cap.h                         kernel/include/object/cap.h
+kernel/include/object/cnode.h                       kernel/include/object/cnode.h
+kernel/include/object/domain.h                      kernel/include/object/domain.h
+kernel/include/object/endpoint.h                    kernel/include/object/endpoint.h
+kernel/include/object.h                             kernel/include/object.h
+kernel/include/object/interrupt.h                   kernel/include/object/interrupt.h
+kernel/include/object/notification.h                kernel/include/object/notification.h
+kernel/include/object/objecttype.h                  kernel/include/object/objecttype.h
+kernel/include/object/reply.h                       kernel/include/object/reply.h
+kernel/include/object/schedcontext.h                kernel/include/object/schedcontext.h
+kernel/include/object/schedcontrol.h                kernel/include/object/schedcontrol.h
+kernel/include/object/structures.h                  kernel/include/object/structures.h
+kernel/include/object/tcb.h                         kernel/include/object/tcb.h
+kernel/include/object/untyped.h                     kernel/include/object/untyped.h
+kernel/include/smp/ipi.h                            kernel/include/smp/ipi.h
+kernel/include/smp/lock.h                           kernel/include/smp/lock.h
+kernel/include/stdarg.h                             kernel/include/stdarg.h
+kernel/include/stdint.h                             kernel/include/stdint.h
+kernel/include/string.h                             kernel/include/string.h
+kernel/include/types.h                              kernel/include/types.h
+kernel/include/util.h                               kernel/include/util.h
+
+# === KERNEL: 64-bit mode headers ===
+kernel/include/64/mode/api/ipc_buffer.h             kernel/include/64/mode/api/ipc_buffer.h
+kernel/include/64/mode/stdint.h                     kernel/include/64/mode/stdint.h
+kernel/include/64/mode/util.h                       kernel/include/64/mode/util.h
+
+# === KERNEL: RISC-V architecture headers ===
+kernel/include/arch/riscv/arch/api/types.h          kernel/include/arch/riscv/arch/api/types.h
+kernel/include/arch/riscv/arch/benchmark.h          kernel/include/arch/riscv/arch/benchmark.h
+kernel/include/arch/riscv/arch/bootinfo.h           kernel/include/arch/riscv/arch/bootinfo.h
+kernel/include/arch/riscv/arch/fastpath/fastpath.h  kernel/include/arch/riscv/arch/fastpath/fastpath.h
+kernel/include/arch/riscv/arch/kernel/boot.h        kernel/include/arch/riscv/arch/kernel/boot.h
+kernel/include/arch/riscv/arch/kernel/thread.h      kernel/include/arch/riscv/arch/kernel/thread.h
+kernel/include/arch/riscv/arch/kernel/traps.h       kernel/include/arch/riscv/arch/kernel/traps.h
+kernel/include/arch/riscv/arch/kernel/vspace.h      kernel/include/arch/riscv/arch/kernel/vspace.h
+kernel/include/arch/riscv/arch/linker.h             kernel/include/arch/riscv/arch/linker.h
+kernel/include/arch/riscv/arch/machine/capdl.h      kernel/include/arch/riscv/arch/machine/capdl.h
+kernel/include/arch/riscv/arch/machine/fpu.h        kernel/include/arch/riscv/arch/machine/fpu.h
+kernel/include/arch/riscv/arch/machine.h            kernel/include/arch/riscv/arch/machine.h
+kernel/include/arch/riscv/arch/machine/hardware.h   kernel/include/arch/riscv/arch/machine/hardware.h
+kernel/include/arch/riscv/arch/machine/plic.h       kernel/include/arch/riscv/arch/machine/plic.h
+kernel/include/arch/riscv/arch/machine/registerset.h kernel/include/arch/riscv/arch/machine/registerset.h
+kernel/include/arch/riscv/arch/machine/timer.h      kernel/include/arch/riscv/arch/machine/timer.h
+kernel/include/arch/riscv/arch/model/smp.h          kernel/include/arch/riscv/arch/model/smp.h
+kernel/include/arch/riscv/arch/model/statedata.h    kernel/include/arch/riscv/arch/model/statedata.h
+kernel/include/arch/riscv/arch/object/interrupt.h   kernel/include/arch/riscv/arch/object/interrupt.h
+kernel/include/arch/riscv/arch/object/objecttype.h  kernel/include/arch/riscv/arch/object/objecttype.h
+kernel/include/arch/riscv/arch/object/structures.h  kernel/include/arch/riscv/arch/object/structures.h
+kernel/include/arch/riscv/arch/sbi.h                kernel/include/arch/riscv/arch/sbi.h
+kernel/include/arch/riscv/arch/smp/ipi.h            kernel/include/arch/riscv/arch/smp/ipi.h
+kernel/include/arch/riscv/arch/smp/ipi_inline.h     kernel/include/arch/riscv/arch/smp/ipi_inline.h
+kernel/include/arch/riscv/arch/types.h              kernel/include/arch/riscv/arch/types.h
+
+# === KERNEL: RISC-V 64-bit mode headers ===
+kernel/include/arch/riscv/arch/64/mode/hardware.h   kernel/include/arch/riscv/arch/64/mode/hardware.h
+kernel/include/arch/riscv/arch/64/mode/kernel/stack.h kernel/include/arch/riscv/arch/64/mode/kernel/stack.h
+kernel/include/arch/riscv/arch/64/mode/machine.h    kernel/include/arch/riscv/arch/64/mode/machine.h
+kernel/include/arch/riscv/arch/64/mode/object/structures.h kernel/include/arch/riscv/arch/64/mode/object/structures.h
+kernel/include/arch/riscv/arch/64/mode/smp/ipi.h    kernel/include/arch/riscv/arch/64/mode/smp/ipi.h
+kernel/include/arch/riscv/arch/64/mode/types.h      kernel/include/arch/riscv/arch/64/mode/types.h
+
+# === ELFLOADER: RISC-V 64-bit source files ===
+tools/seL4/elfloader-tool/src/arch-riscv/crt0.S     kernel/startup/arch-riscv/crt0.S
+tools/seL4/elfloader-tool/src/arch-riscv/boot.c     kernel/startup/arch-riscv/boot.c
+tools/seL4/elfloader-tool/src/arch-riscv/console.c  kernel/startup/arch-riscv/console.c
+
+# === ELFLOADER: Common source files ===
+tools/seL4/elfloader-tool/src/common.c              kernel/startup/common.c
+tools/seL4/elfloader-tool/src/defaults.c            kernel/startup/defaults.c
+tools/seL4/elfloader-tool/src/fdt.c                 kernel/startup/fdt.c
+tools/seL4/elfloader-tool/src/printf.c              kernel/startup/printf.c
+tools/seL4/elfloader-tool/src/string.c              kernel/startup/string.c
+tools/seL4/elfloader-tool/src/drivers/driver.c      kernel/startup/drivers/driver.c
+tools/seL4/elfloader-tool/src/drivers/uart/common.c kernel/startup/drivers/uart/common.c
+tools/seL4/elfloader-tool/src/binaries/elf/elf.c    kernel/startup/binaries/elf/elf.c
+tools/seL4/elfloader-tool/src/binaries/elf/elf64.c  kernel/startup/binaries/elf/elf64.c
+
+# === ELFLOADER: Linker scripts ===
+tools/seL4/elfloader-tool/src/linker.lds            kernel/startup/linker.lds
+tools/seL4/elfloader-tool/src/archive.bin.lds       kernel/startup/archive.bin.lds
+
+# === ELFLOADER: RISC-V headers ===
+tools/seL4/elfloader-tool/include/arch-riscv/elfloader.h kernel/startup/include/arch-riscv/elfloader.h
+tools/seL4/elfloader-tool/include/arch-riscv/sbi.h  kernel/startup/include/arch-riscv/sbi.h
+
+# === ELFLOADER: Common headers ===
+tools/seL4/elfloader-tool/include/abort.h           kernel/startup/include/abort.h
+tools/seL4/elfloader-tool/include/assembler.h       kernel/startup/include/assembler.h
+tools/seL4/elfloader-tool/include/drivers/common.h  kernel/startup/include/drivers/common.h
+tools/seL4/elfloader-tool/include/drivers.h         kernel/startup/include/drivers.h
+tools/seL4/elfloader-tool/include/drivers/uart.h    kernel/startup/include/drivers/uart.h
+tools/seL4/elfloader-tool/include/elfloader_common.h kernel/startup/include/elfloader_common.h
+tools/seL4/elfloader-tool/include/fdt.h             kernel/startup/include/fdt.h
+tools/seL4/elfloader-tool/include/printf.h          kernel/startup/include/printf.h
+tools/seL4/elfloader-tool/include/strops.h          kernel/startup/include/strops.h
+tools/seL4/elfloader-tool/include/types.h           kernel/startup/include/types.h
+tools/seL4/elfloader-tool/include/vargs.h           kernel/startup/include/vargs.h
+tools/seL4/elfloader-tool/include/binaries/elf/elf.h kernel/startup/include/binaries/elf/elf.h
+tools/seL4/elfloader-tool/include/binaries/elf/elf64.h kernel/startup/include/binaries/elf/elf64.h
+
+# ==============================================================================
+# USERLAND: sel4runtime - C runtime for seL4 user-space (RISC-V 64-bit)
+# ==============================================================================
+
+# === sel4runtime: Generic source files ===
+projects/sel4runtime/src/crt1.c                     userland/taskman/runenv/src/crt1.c
+projects/sel4runtime/src/env.c                      userland/taskman/runenv/src/env.c
+projects/sel4runtime/src/init.c                     userland/taskman/runenv/src/init.c
+projects/sel4runtime/src/init.h                     userland/taskman/runenv/src/init.h
+projects/sel4runtime/src/memcpy.c                   userland/taskman/runenv/src/memcpy.c
+projects/sel4runtime/src/memset.c                   userland/taskman/runenv/src/memset.c
+projects/sel4runtime/src/start.c                    userland/taskman/runenv/src/start.c
+projects/sel4runtime/src/start_root.c               userland/taskman/runenv/src/start_root.c
+projects/sel4runtime/src/util.h                     userland/taskman/runenv/src/util.h
+projects/sel4runtime/src/vsyscall.c                 userland/taskman/runenv/src/vsyscall.c
+
+# === sel4runtime: RISC-V assembly (shared 32/64) ===
+projects/sel4runtime/crt/arch/riscv/crt0.S          userland/taskman/runenv/crt/arch/riscv/crt0.S
+projects/sel4runtime/crt/arch/riscv/sel4_crt0.S     userland/taskman/runenv/crt/arch/riscv/sel4_crt0.S
+
+# === sel4runtime: RISC-V 64-bit assembly ===
+projects/sel4runtime/crt/sel4_arch/riscv64/crti.S   userland/taskman/runenv/crt/sel4_arch/riscv64/crti.S
+projects/sel4runtime/crt/sel4_arch/riscv64/crtn.S   userland/taskman/runenv/crt/sel4_arch/riscv64/crtn.S
+
+# === sel4runtime: Generic headers ===
+projects/sel4runtime/include/sel4runtime.h          userland/taskman/runenv/include/sel4runtime.h
+projects/sel4runtime/include/sel4runtime/auxv.h     userland/taskman/runenv/include/sel4runtime/auxv.h
+projects/sel4runtime/include/sel4runtime/elf.h      userland/taskman/runenv/include/sel4runtime/elf.h
+projects/sel4runtime/include/sel4runtime/start.h    userland/taskman/runenv/include/sel4runtime/start.h
+projects/sel4runtime/include/sel4runtime/stddef.h   userland/taskman/runenv/include/sel4runtime/stddef.h
+projects/sel4runtime/include/sel4runtime/stdint.h   userland/taskman/runenv/include/sel4runtime/stdint.h
+projects/sel4runtime/include/sel4runtime/thread.h   userland/taskman/runenv/include/sel4runtime/thread.h
+
+# === sel4runtime: 64-bit mode header ===
+projects/sel4runtime/include/mode/64/sel4runtime/mode/elf.h userland/taskman/runenv/include/mode/64/sel4runtime/mode/elf.h
+
+# === sel4runtime: RISC-V architecture header ===
+projects/sel4runtime/include/arch/riscv/sel4runtime/thread_arch.h userland/taskman/runenv/include/arch/riscv/sel4runtime/thread_arch.h
+
+# ==============================================================================
+# USERLAND: musllibc - C standard library (RISC-V 64-bit)
+# ==============================================================================
+
+# === musllibc: Public headers ===
+projects/musllibc/include/                          userland/libc/include/
+
+# === musllibc: Architecture headers (RISC-V 64-bit) ===
+projects/musllibc/arch/riscv64/                     userland/libc/arch/riscv64/
+projects/musllibc/arch/generic/                     userland/libc/arch/generic/
+
+# === musllibc: Source directories (all) ===
+projects/musllibc/src/                              userland/libc/src/
+
+# === musllibc: CRT files (generic) ===
+projects/musllibc/crt/crt1.c                        userland/libc/crt/crt1.c
+projects/musllibc/crt/crti.c                        userland/libc/crt/crti.c
+projects/musllibc/crt/crtn.c                        userland/libc/crt/crtn.c
+projects/musllibc/crt/rcrt1.c                       userland/libc/crt/rcrt1.c
+projects/musllibc/crt/Scrt1.c                       userland/libc/crt/Scrt1.c
+
+# === musllibc: Dynamic linker ===
+projects/musllibc/ldso/                             userland/libc/ldso/
+
+# === musllibc: seL4-specific patches (RISC-V 64-bit) ===
+projects/musllibc/patches/arch/riscv64/             userland/libc/patches/arch/riscv64/
+
+# === musllibc: Exclude other architectures from src/ ===
+!userland/libc/src/fenv/riscv32/
+!userland/libc/src/fenv/aarch64/
+!userland/libc/src/fenv/arm/
+!userland/libc/src/fenv/i386/
+!userland/libc/src/fenv/m68k/
+!userland/libc/src/fenv/mips/
+!userland/libc/src/fenv/mips64/
+!userland/libc/src/fenv/mipsn32/
+!userland/libc/src/fenv/powerpc/
+!userland/libc/src/fenv/powerpc64/
+!userland/libc/src/fenv/s390x/
+!userland/libc/src/fenv/sh/
+!userland/libc/src/fenv/x32/
+!userland/libc/src/fenv/x86_64/
+!userland/libc/src/fenv/loongarch64/
+!userland/libc/src/ldso/riscv32/
+!userland/libc/src/ldso/aarch64/
+!userland/libc/src/ldso/arm/
+!userland/libc/src/ldso/i386/
+!userland/libc/src/ldso/mips/
+!userland/libc/src/ldso/mips64/
+!userland/libc/src/ldso/mipsn32/
+!userland/libc/src/ldso/powerpc/
+!userland/libc/src/ldso/powerpc64/
+!userland/libc/src/ldso/s390x/
+!userland/libc/src/ldso/sh/
+!userland/libc/src/ldso/x32/
+!userland/libc/src/ldso/x86_64/
+!userland/libc/src/ldso/loongarch64/
+!userland/libc/src/math/riscv32/
+!userland/libc/src/math/aarch64/
+!userland/libc/src/math/arm/
+!userland/libc/src/math/i386/
+!userland/libc/src/math/m68k/
+!userland/libc/src/math/mips/
+!userland/libc/src/math/powerpc/
+!userland/libc/src/math/s390x/
+!userland/libc/src/math/sh/
+!userland/libc/src/math/x32/
+!userland/libc/src/math/x86_64/
+!userland/libc/src/math/loongarch64/
+!userland/libc/src/process/riscv32/
+!userland/libc/src/process/aarch64/
+!userland/libc/src/process/arm/
+!userland/libc/src/process/i386/
+!userland/libc/src/process/s390x/
+!userland/libc/src/process/sh/
+!userland/libc/src/process/x32/
+!userland/libc/src/process/x86_64/
+!userland/libc/src/setjmp/riscv32/
+!userland/libc/src/setjmp/aarch64/
+!userland/libc/src/setjmp/arm/
+!userland/libc/src/setjmp/i386/
+!userland/libc/src/setjmp/m68k/
+!userland/libc/src/setjmp/microblaze/
+!userland/libc/src/setjmp/mips/
+!userland/libc/src/setjmp/mips64/
+!userland/libc/src/setjmp/mipsn32/
+!userland/libc/src/setjmp/or1k/
+!userland/libc/src/setjmp/powerpc/
+!userland/libc/src/setjmp/powerpc64/
+!userland/libc/src/setjmp/s390x/
+!userland/libc/src/setjmp/sh/
+!userland/libc/src/setjmp/x32/
+!userland/libc/src/setjmp/x86_64/
+!userland/libc/src/setjmp/loongarch64/
+!userland/libc/src/signal/riscv32/
+!userland/libc/src/signal/aarch64/
+!userland/libc/src/signal/arm/
+!userland/libc/src/signal/i386/
+!userland/libc/src/signal/m68k/
+!userland/libc/src/signal/mips/
+!userland/libc/src/signal/mips64/
+!userland/libc/src/signal/mipsn32/
+!userland/libc/src/signal/or1k/
+!userland/libc/src/signal/powerpc/
+!userland/libc/src/signal/powerpc64/
+!userland/libc/src/signal/s390x/
+!userland/libc/src/signal/sh/
+!userland/libc/src/signal/x32/
+!userland/libc/src/signal/x86_64/
+!userland/libc/src/signal/loongarch64/
+!userland/libc/src/thread/riscv32/
+!userland/libc/src/thread/aarch64/
+!userland/libc/src/thread/arm/
+!userland/libc/src/thread/i386/
+!userland/libc/src/thread/m68k/
+!userland/libc/src/thread/microblaze/
+!userland/libc/src/thread/mips/
+!userland/libc/src/thread/mips64/
+!userland/libc/src/thread/mipsn32/
+!userland/libc/src/thread/or1k/
+!userland/libc/src/thread/powerpc/
+!userland/libc/src/thread/powerpc64/
+!userland/libc/src/thread/s390x/
+!userland/libc/src/thread/sh/
+!userland/libc/src/thread/x32/
+!userland/libc/src/thread/x86_64/
