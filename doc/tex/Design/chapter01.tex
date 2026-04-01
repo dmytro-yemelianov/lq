@@ -1,0 +1,85 @@
+\chapter{High-Level Architecture Overview}
+
+\section{What is QSOE?}
+
+QSOE (Quick and Secure Operating Environment) is an operating environment
+that combines the formally verified seL4 microkernel with a QNX
+Neutrino-style programming model.  The result is a system that provides
+the proven, elegant synchronous message-passing API of QNX on top of the
+strongest isolation and capability-security guarantees available in any
+production microkernel.
+
+The target platform is RISC-V 64-bit, initially running on
+\texttt{qemu-riscv-virt}.
+
+\section{Design goals}
+
+\begin{enumerate}
+    \item \textbf{QNX-compatible API} --- provide the core QNX IPC
+        primitives (\texttt{ChannelCreate}, \texttt{ConnectAttach},
+        \texttt{MsgSend}/\texttt{Receive}/\texttt{Reply},
+        \texttt{MsgSendPulse}, \texttt{ThreadCreate}, timers,
+        synchronization) as a C library linked by user-space programs.
+    \item \textbf{Formally verified foundation} --- leverage seL4's
+        proven correctness and capability model rather than building a
+        new kernel from scratch.
+    \item \textbf{Minimal trusted computing base} --- only the seL4
+        kernel runs in supervisor mode; everything else, including
+        \texttt{taskman}, is a user-space process.
+    \item \textbf{POSIX user-space via musl libc} --- standard C library
+        support through musl, patched for seL4.
+\end{enumerate}
+
+\section{System layers}
+
+Figure~\ref{fig:layers} shows the overall software stack.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    layer/.style={
+        draw, rounded corners=3pt, minimum width=12cm,
+        minimum height=1.2cm, align=center, font=\small
+    },
+    label/.style={font=\footnotesize\itshape, text=gray},
+]
+    \node[layer, fill=blue!8]                          (kern) {seL4 microkernel};
+    \node[layer, fill=green!8,  above=0.3cm of kern]   (boot) {elfloader / startup};
+    \node[layer, fill=yellow!8, above=0.3cm of boot]   (rt)   {sel4runtime + musl libc};
+    \node[layer, fill=orange!8, above=0.3cm of rt]     (tm)   {\texttt{taskman} --- process, memory, path, system services};
+    \node[layer, fill=red!6,    above=0.3cm of tm]     (api)  {QNX-compatible C library (Channels, Connections, Messages)};
+    \node[layer, fill=purple!6, above=0.3cm of api]    (app)  {User applications / resource managers};
+
+    \node[label, left=0.3cm of kern]  {S-mode};
+    \node[label, left=0.3cm of boot]  {M/S-mode};
+    \node[label, left=0.3cm of rt]    {U-mode};
+    \node[label, left=0.3cm of tm]    {U-mode};
+    \node[label, left=0.3cm of api]   {U-mode};
+    \node[label, left=0.3cm of app]   {U-mode};
+\end{tikzpicture}
+\caption{QSOE software stack}
+\label{fig:layers}
+\end{figure}
+
+\section{Mapping QNX concepts to seL4}
+
+The fundamental insight behind QSOE is that seL4 already provides the
+low-level mechanisms that correspond closely to QNX's IPC model:
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}ll@{}}
+    \toprule
+    \textbf{QNX concept}             & \textbf{seL4 foundation} \\
+    \midrule
+    Channel                          & seL4 Endpoint \\
+    Connection (via \texttt{ConnectAttach}) & Capability to an Endpoint \\
+    \texttt{MsgSend}/\texttt{MsgReceive}/\texttt{MsgReply} & seL4 synchronous IPC (\texttt{seL4\_Call}/\texttt{seL4\_Recv}/\texttt{seL4\_Reply}) \\
+    Pulse (\texttt{MsgSendPulse})    & seL4 Notification \\
+    Connection ID (coid)             & Capability badge \\
+    Resource Manager                 & User-space server with capabilities \\
+    \bottomrule
+\end{tabular}
+\caption{QNX--seL4 concept mapping}
+\label{tab:mapping}
+\end{table}

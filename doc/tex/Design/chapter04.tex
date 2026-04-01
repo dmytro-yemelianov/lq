@@ -1,0 +1,73 @@
+\chapter{QNX-Compatible C Library}
+
+\section{Purpose}
+
+QSOE provides a C library layer that exposes QNX Neutrino-compatible
+IPC and threading primitives.  This library is linked by all user-space
+programs (including taskman itself) and translates QNX API calls into
+the appropriate seL4 system calls and capability operations.
+
+It is built on top of musl libc, which provides standard POSIX/C
+functions, and extends it with the QNX-specific interfaces.
+
+\section{Core IPC functions}
+
+\subsection{Channels}
+
+\begin{lstlisting}[language=C]
+int ChannelCreate(unsigned flags);
+int ChannelDestroy(int chid);
+\end{lstlisting}
+
+A \emph{channel} is the server-side IPC endpoint.  Creating a channel
+allocates an seL4 Endpoint capability and registers it in the process's
+channel table.
+
+\subsection{Connections}
+
+\begin{lstlisting}[language=C]
+int ConnectAttach(uint32_t nd, pid_t pid, int chid,
+                  unsigned index, int flags);
+int ConnectDetach(int coid);
+\end{lstlisting}
+
+A \emph{connection} is the client-side handle.  \texttt{ConnectAttach}
+obtains a badged copy of the target channel's Endpoint capability,
+enabling the client to send messages.
+
+\subsection{Messages}
+
+\begin{lstlisting}[language=C]
+int MsgSend(int coid, const void *smsg, int sbytes,
+            void *rmsg, int rbytes);
+int MsgReceive(int chid, void *msg, int bytes,
+               struct _msg_info *info);
+int MsgReply(int rcvid, int status,
+             const void *msg, int bytes);
+int MsgSendPulse(int coid, int priority,
+                 int code, int value);
+\end{lstlisting}
+
+These form the fundamental Send/Receive/Reply triad.  The synchronous
+variants map directly to \texttt{seL4\_Call}, \texttt{seL4\_Recv}, and
+\texttt{seL4\_Reply}.  Pulses use seL4 Notification objects.
+
+\section{Threading}
+
+\begin{lstlisting}[language=C]
+int ThreadCreate(pid_t pid, void *(*func)(void *),
+                 void *arg, const struct _thread_attr *attr);
+int ThreadDestroy(int tid, int priority, void *status);
+\end{lstlisting}
+
+Thread creation allocates a new seL4 TCB (Thread Control Block),
+configures its scheduling parameters, and starts execution at the
+specified function.
+
+\section{Relationship to musl libc}
+
+Standard C/POSIX functions (\texttt{printf}, \texttt{malloc},
+\texttt{open}, \texttt{read}, etc.) are provided by musl libc, patched
+to route system calls through seL4 IPC to \texttt{taskman} or the
+appropriate resource manager rather than through Linux \texttt{ecall}
+traps.

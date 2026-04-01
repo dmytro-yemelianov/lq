@@ -1,0 +1,104 @@
+\chapter{Boot Sequence}
+
+\section{Overview}
+
+QSOE boots through a well-defined chain of handoffs, from firmware
+through the elfloader into the seL4 kernel, which then starts the
+initial user-space process (the \emph{root server}).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    stage/.style={
+        draw, rounded corners=3pt, minimum width=10cm,
+        minimum height=1.0cm, align=center, font=\small
+    },
+    arr/.style={-{Stealth[length=6pt]}, thick},
+]
+    \node[stage, fill=gray!10]                          (sbi)  {OpenSBI (M-mode firmware)};
+    \node[stage, fill=green!8,  below=0.5cm of sbi]    (elf)  {elfloader --- extracts kernel.elf + rootserver.elf from CPIO};
+    \node[stage, fill=blue!8,   below=0.5cm of elf]    (kern) {seL4 kernel --- creates initial thread, sets PC to rootserver entry};
+    \node[stage, fill=orange!8, below=0.5cm of kern]   (rt)   {\texttt{\_sel4\_start} (sel4runtime) $\rightarrow$ \texttt{main()}};
+
+    \draw[arr] (sbi)  -- node[right, font=\footnotesize] {a0=hart\_id, a1=DTB} (elf);
+    \draw[arr] (elf)  -- node[right, font=\footnotesize] {a0\ldots a7: rootserver info} (kern);
+    \draw[arr] (kern) -- node[right, font=\footnotesize] {\texttt{sret} to user space} (rt);
+\end{tikzpicture}
+\caption{QSOE boot sequence on RISC-V}
+\label{fig:boot}
+\end{figure}
+
+\section{OpenSBI}
+
+OpenSBI runs in M-mode and provides the Supervisor Binary Interface.
+It initializes hardware, handles traps that must be served in M-mode,
+and jumps to the elfloader at the address specified in the firmware
+configuration.  It passes the hart ID in \texttt{a0} and the device
+tree blob (DTB) address in \texttt{a1}.
+
+\section{Elfloader (startup)}
+
+The elfloader is a minimal S-mode program whose sole purpose is to
+unpack and launch the kernel.  It contains an embedded CPIO archive
+with two ELF images:
+
+\begin{itemize}
+    \item \texttt{kernel.elf} --- the seL4 microkernel
+    \item \texttt{rootserver.elf} --- the initial user-space process
+          (taskman, linked with sel4runtime and musl libc)
+\end{itemize}
+
+The elfloader:
+\begin{enumerate}
+    \item Parses the CPIO archive to locate both ELF images.
+    \item Loads each image into its designated physical memory region.
+    \item Reads the ELF entry points (\texttt{e\_entry}) from both images.
+    \item Sets up initial page tables for the kernel.
+    \item Jumps to the kernel entry point, passing the rootserver's
+          physical location and virtual entry address via registers
+          \texttt{a0}--\texttt{a7}.
+\end{enumerate}
+
+\section{seL4 kernel initialization}
+
+The kernel receives the rootserver information through the standard
+RISC-V calling convention:
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}ll@{}}
+    \toprule
+    \textbf{Register} & \textbf{Content} \\
+    \midrule
+    \texttt{a0} & rootserver physical start \\
+    \texttt{a1} & rootserver physical end \\
+    \texttt{a2} & physical--virtual offset \\
+    \texttt{a3} & rootserver virtual entry (\texttt{\_sel4\_start}) \\
+    \texttt{a4} & DTB address \\
+    \texttt{a5} & DTB size \\
+    \texttt{a6} & hart ID \\
+    \texttt{a7} & core ID \\
+    \bottomrule
+\end{tabular}
+\caption{Registers passed from elfloader to kernel}
+\label{tab:bootregs}
+\end{table}
+
+The kernel creates the initial thread (root task), stores the
+rootserver's entry address via \texttt{setNextPC()}, populates the
+\texttt{seL4\_BootInfo} structure with available capabilities and
+untyped memory, and executes \texttt{sret} to enter user space.
+
+\section{Root server startup (sel4runtime)}
+
+Execution lands at \texttt{\_sel4\_start} in
+\texttt{crt/arch/riscv/sel4\_crt0.S}, which:
+\begin{enumerate}
+    \item Sets the global pointer (\texttt{gp}) for linker relaxation.
+    \item Establishes a 16\,KB stack.
+    \item Calls \texttt{\_\_sel4\_start\_root(boot\_info)} in C, which
+          parses the auxiliary vector, initializes TLS via the \texttt{tp}
+          register, runs constructors, and finally calls \texttt{main()}.
+\end{enumerate}
+
+At this point, \texttt{taskman}'s \texttt{main()} takes over.

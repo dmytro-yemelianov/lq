@@ -1,0 +1,52 @@
+\documentclass[11pt,a4paper]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, fit, calc}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    urlcolor=blue!70!black,
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\bfseries\color{blue!70!black},
+    commentstyle=\itshape\color{green!50!black},
+    stringstyle=\color{red!60!black},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+}
+
+\title{%
+    \vspace{-1cm}
+    \textbf{QSOE} \\[0.3em]
+    \Large Quick and Secure Operating Environment \\[0.5em]
+    \large Design and Architecture
+}
+\author{Yuri Zaporozhets}
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+\include{chapter01}
+\include{chapter02}
+\include{chapter03}
+\include{chapter04}
+
+\end{document}

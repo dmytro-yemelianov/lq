@@ -1,0 +1,70 @@
+\chapter{taskman --- The Central System Server}
+
+\section{Role}
+
+\texttt{taskman} is the root server process in QSOE.  It is analogous
+to QNX Neutrino's \texttt{procnto}: a single user-space process that
+combines the responsibilities of a process manager, memory manager,
+path manager, and system service provider.
+
+Because seL4 provides only the bare capability and IPC mechanisms,
+\texttt{taskman} is responsible for all higher-level OS policy.
+
+\section{Startup}
+
+After sel4runtime hands control to \texttt{main()}, taskman:
+
+\begin{enumerate}
+    \item Inspects \texttt{seL4\_BootInfo} to discover available untyped
+          memory and initial capabilities.
+    \item Creates its main channel (an seL4 Endpoint) and begins
+          listening for incoming messages.
+    \item Initializes internal subsystems: memory allocator, process
+          table, pathname space.
+\end{enumerate}
+
+\section{Services}
+
+\texttt{taskman} multiplexes several service domains over a single
+channel, dispatching on message type:
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Domain}   & \textbf{Operations}
+                       & \textbf{QNX equivalent} \\
+    \midrule
+    Memory             & \texttt{mmap()}, \texttt{munmap()}, shared memory
+                       & \texttt{procnto} memmgr \\
+    Process            & \texttt{ProcessCreate()}, \texttt{ProcessTerminate()}
+                       & \texttt{procnto} process manager \\
+    Pathname           & path registration, resolution, \texttt{open()}
+                       & \texttt{procnto} pathmgr \\
+    System             & \texttt{sysinfo()}, \texttt{sysshutdown()},
+                         \texttt{ioport\_access\_grant()}
+                       & various \texttt{procnto} calls \\
+    \bottomrule
+\end{tabular}
+\caption{taskman service domains}
+\label{tab:taskman-services}
+\end{table}
+
+\section{Message-passing model}
+
+All interaction with \texttt{taskman} follows the QNX
+Send/Receive/Reply pattern:
+
+\begin{enumerate}
+    \item A client calls \texttt{MsgSend()} (maps to \texttt{seL4\_Call}),
+          which blocks the sender.
+    \item \texttt{taskman} calls \texttt{MsgReceive()} (maps to
+          \texttt{seL4\_Recv}) to dequeue the next message.
+    \item \texttt{taskman} processes the request and calls
+          \texttt{MsgReply()} (maps to \texttt{seL4\_Reply}) to unblock
+          the sender with the result.
+\end{enumerate}
+
+Asynchronous notifications (pulses) use \texttt{MsgSendPulse()},
+mapped to seL4 Notification objects, for interrupt delivery and
+lightweight signaling.
