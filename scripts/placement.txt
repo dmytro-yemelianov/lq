@@ -177,6 +177,9 @@ tools/seL4/elfloader-tool/src/arch-riscv/console.c  kernel/startup/arch-riscv/co
 
 # === ELFLOADER: Common source files ===
 tools/seL4/elfloader-tool/src/common.c              kernel/startup/common.c
+tools/seL4/elfloader-tool/src/hash.h                kernel/startup/hash.h
+tools/seL4/elfloader-tool/src/crypt_sha256.h        kernel/startup/crypt_sha256.h
+tools/seL4/elfloader-tool/src/crypt_md5.h           kernel/startup/crypt_md5.h
 tools/seL4/elfloader-tool/src/defaults.c            kernel/startup/defaults.c
 tools/seL4/elfloader-tool/src/fdt.c                 kernel/startup/fdt.c
 tools/seL4/elfloader-tool/src/printf.c              kernel/startup/printf.c
@@ -184,6 +187,7 @@ tools/seL4/elfloader-tool/src/string.c              kernel/startup/string.c
 tools/seL4/elfloader-tool/src/drivers/driver.c      kernel/startup/drivers/driver.c
 tools/seL4/elfloader-tool/src/drivers/uart/common.c kernel/startup/drivers/uart/common.c
 tools/seL4/elfloader-tool/src/binaries/elf/elf.c    kernel/startup/binaries/elf/elf.c
+tools/seL4/elfloader-tool/src/binaries/elf/elf32.c  kernel/startup/binaries/elf/elf32.c
 tools/seL4/elfloader-tool/src/binaries/elf/elf64.c  kernel/startup/binaries/elf/elf64.c
 
 # === ELFLOADER: Linker scripts ===
@@ -193,6 +197,10 @@ tools/seL4/elfloader-tool/src/archive.bin.lds       kernel/startup/archive.bin.l
 # === ELFLOADER: RISC-V headers ===
 tools/seL4/elfloader-tool/include/arch-riscv/elfloader.h kernel/startup/include/arch-riscv/elfloader.h
 tools/seL4/elfloader-tool/include/arch-riscv/sbi.h  kernel/startup/include/arch-riscv/sbi.h
+
+# === ELFLOADER: libcpio (CPIO archive parser, used by elfloader) ===
+projects/util_libs/libcpio/src/cpio.c               lib/cpio/src/cpio.c
+projects/util_libs/libcpio/include/cpio/cpio.h      lib/cpio/include/cpio/cpio.h
 
 # === ELFLOADER: Common headers ===
 tools/seL4/elfloader-tool/include/abort.h           kernel/startup/include/abort.h
@@ -207,6 +215,7 @@ tools/seL4/elfloader-tool/include/strops.h          kernel/startup/include/strop
 tools/seL4/elfloader-tool/include/types.h           kernel/startup/include/types.h
 tools/seL4/elfloader-tool/include/vargs.h           kernel/startup/include/vargs.h
 tools/seL4/elfloader-tool/include/binaries/elf/elf.h kernel/startup/include/binaries/elf/elf.h
+tools/seL4/elfloader-tool/include/binaries/elf/elf32.h kernel/startup/include/binaries/elf/elf32.h
 tools/seL4/elfloader-tool/include/binaries/elf/elf64.h kernel/startup/include/binaries/elf/elf64.h
 
 # ==============================================================================

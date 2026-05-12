@@ -27,6 +27,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Project root is one level up from scripts/. The fetched upstream checkout
+# belongs there (NOT under scripts/, which is reserved for scripts).
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PLACEMENT_FILE="${SCRIPT_DIR}/placement.txt"
 MANIFEST_URL="https://github.com/seL4/sel4test-manifest.git"
 SOURCE_DIR_NAME="sel4test-full"
@@ -60,13 +63,14 @@ if [[ -d "${SCRIPT_DIR}/kernel" ]] && [[ -d "${SCRIPT_DIR}/tools/seL4/elfloader-
     SOURCE_DIR="${SCRIPT_DIR}"
 fi
 
-# Option 2: Check if sel4test-full exists in current working directory
-if [[ -z "${SOURCE_DIR}" ]] && [[ -d "./${SOURCE_DIR_NAME}/kernel" ]]; then
-    info "Found ${SOURCE_DIR_NAME} in current directory."
-    SOURCE_DIR="$(pwd)/${SOURCE_DIR_NAME}"
+# Option 2: Check the canonical location at the project root.
+if [[ -z "${SOURCE_DIR}" ]] && [[ -d "${PROJECT_ROOT}/${SOURCE_DIR_NAME}/kernel" ]]; then
+    info "Found ${SOURCE_DIR_NAME} at project root."
+    SOURCE_DIR="${PROJECT_ROOT}/${SOURCE_DIR_NAME}"
 fi
 
-# Option 3: Need to fetch using repo
+# Option 3: Need to fetch using repo. Always fetch into the project root,
+# regardless of CWD, so the same canonical layout is produced every time.
 if [[ -z "${SOURCE_DIR}" ]]; then
     step "sel4test-full not found. Fetching using repo..."
 
@@ -83,18 +87,15 @@ if [[ -z "${SOURCE_DIR}" ]]; then
         exit 1
     fi
 
-    # Create and enter source directory
-    mkdir -p "${SOURCE_DIR_NAME}"
-    cd "${SOURCE_DIR_NAME}"
-
-    info "Initializing repo with manifest: ${MANIFEST_URL}"
-    repo init -u "${MANIFEST_URL}"
-
-    info "Syncing repositories (this may take a while)..."
-    repo sync -j4
-
-    cd ..
-    SOURCE_DIR="$(pwd)/${SOURCE_DIR_NAME}"
+    SOURCE_DIR="${PROJECT_ROOT}/${SOURCE_DIR_NAME}"
+    mkdir -p "${SOURCE_DIR}"
+    (
+        cd "${SOURCE_DIR}"
+        info "Initializing repo with manifest: ${MANIFEST_URL}"
+        repo init -u "${MANIFEST_URL}"
+        info "Syncing repositories (this may take a while)..."
+        repo sync -j4
+    )
     info "Fetch complete: ${SOURCE_DIR}"
 fi
 
