@@ -253,19 +253,18 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
 
     /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
      *    12) and guard value 0; the CNode is 2^12 slots so addresses
-     *    fit in 12 bits. */
-    seL4_Word cnode_data = (52UL << 6); /* CNode_CapData: guard size << 6 */
+     *    fit in 12 bits. seL4_CNode_CapData layout: bits[0..5] =
+     *    guardSize, bits[6..63] = guard value. */
+    seL4_Word cnode_data = 52UL;  /* guardSize=52, guard=0 */
     err = qsoe_tcb_configure(tcb, 0 /*fault_ep*/,
                               cnode, cnode_data,
                               vspace, 0 /*vspace_data*/,
                               CHILD_IPC_BUFFER, ipc_frame);
     if (err) { sel4_debug_puts("spawn: TCB_Configure failed\n"); return -ENOMEM; }
 
-    /* v0.3.0: equal priority so taskman's seL4_Yield rotates to tester.
-     * On non-MCS, Yield only round-robins within one priority — it
-     * doesn't drop to lower-priority threads. Once taskman blocks on
-     * seL4_Recv (v0.3.2), this can drop back to 254. */
-    err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB, 255);
+    /* Spawned processes run below taskman. taskman blocks on Recv when
+     * it has no work, so lower-priority threads always get the CPU. */
+    err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB, 254);
     if (err) { sel4_debug_puts("spawn: TCB_SetPriority failed\n"); return -ENOMEM; }
 
     /* 7. WriteRegisters: pc=e_entry, a0=pid, sp=stack (tester's start.S
@@ -281,7 +280,16 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_tcb_write_registers(tcb, 0, &ctx);
     if (err) { sel4_debug_puts("spawn: TCB_WriteRegisters failed\n"); return -ENOMEM; }
 
-    /* 8. Liftoff. */
+    /* 8. Register the new process in taskman's process table so the
+     *    lifecycle handlers can find its CSpace + slot allocator. */
+    int reg_err = tm_process_register(pid, cnode, tcb, vspace,
+                                       QSOE_CAP_WELL_KNOWN_END);
+    if (reg_err) {
+        sel4_debug_puts("spawn: tm_process_register failed\n");
+        return reg_err;
+    }
+
+    /* 9. Liftoff. */
     err = qsoe_tcb_resume(tcb);
     if (err) { sel4_debug_puts("spawn: TCB_Resume failed\n"); return -ENOMEM; }
 

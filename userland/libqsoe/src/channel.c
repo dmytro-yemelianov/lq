@@ -1,14 +1,18 @@
 /*
  * libqsoe/src/channel.c — ChannelCreate / ChannelDestroy.
  *
- * For v0.2 only the QSOE_LIBQSOE_IN_TASKMAN build is exercised. The
- * non-IN_TASKMAN path (the real IPC to taskman) is stubbed; it lands
- * in v0.3 once we have a second process to call from.
+ * IN_TASKMAN build  : direct call into the local tm_* handler.
+ * Standalone build  : seL4_Call to taskman via QSOE_CAP_TASKMAN_EP,
+ *                     with the wire protocol defined in <qsoe/wire.h>.
  */
 
 #include "../include/qsoe/qrv.h"
 #include "../include/qsoe/slots.h"
+#include "../include/qsoe/wire.h"
 #include "state.h"
+
+#include "sel4_types.h"
+#include "qsoe_invoke.h"
 
 #ifdef QSOE_LIBQSOE_IN_TASKMAN
 #  include "server.h"
@@ -16,10 +20,10 @@
 
 int ChannelCreate(unsigned flags)
 {
-#ifdef QSOE_LIBQSOE_IN_TASKMAN
     int chid = qsoe_state_alloc_chid();
     if (chid < 0) { qsoe_errno = ENOMEM; return -1; }
 
+#ifdef QSOE_LIBQSOE_IN_TASKMAN
     unsigned long recv_slot = 0;
     int err = tm_channel_create(QSOE_PID_TASKMAN, chid, flags,
                                 (unsigned long *)&recv_slot);
@@ -31,9 +35,21 @@ int ChannelCreate(unsigned flags)
     qsoe_state_bind_chid(chid, recv_slot);
     return chid;
 #else
-    (void)flags;
-    qsoe_errno = EINVAL;
-    return -1;
+    /* Wire: MR0 = chid, MR1 = flags. Reply: label = errno, MR0 = recv slot. */
+    seL4_Word mr0 = (seL4_Word)chid;
+    seL4_Word mr1 = (seL4_Word)flags;
+    seL4_Word mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_CHANNEL_CREATE, 0, 0, 2);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) {
+        qsoe_state_bind_chid(chid, 0);
+        qsoe_errno = (int)err;
+        return -1;
+    }
+    qsoe_state_bind_chid(chid, mr0);
+    return chid;
 #endif
 }
 
@@ -48,7 +64,15 @@ int ChannelDestroy(int chid)
     qsoe_state_bind_chid(chid, 0);
     return 0;
 #else
-    qsoe_errno = EINVAL;
-    return -1;
+    /* Wire: MR0 = recv_slot. Reply: label = errno. */
+    seL4_Word mr0 = (seL4_Word)recv_slot;
+    seL4_Word mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_CHANNEL_DESTROY, 0, 0, 1);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    qsoe_state_bind_chid(chid, 0);
+    return 0;
 #endif
 }

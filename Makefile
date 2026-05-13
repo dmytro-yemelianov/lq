@@ -313,15 +313,48 @@ $(TASKMAN_ELF): $(TASKMAN_OBJS)
 # Tester — second user-space program, spawned by taskman.
 # ----------------------------------------------------------------------------
 
+# libqsoe for tester is the same source as libqsoe-in-taskman, just
+# compiled WITHOUT QSOE_LIBQSOE_IN_TASKMAN — so its entrypoints take
+# the real-IPC path (seL4_Call to taskman) instead of direct tm_*
+# function calls.
+TESTER_LIBQSOE_CFLAGS := $(TM_CFLAGS) -I$(TASKMAN_DIR)
+
 $(TESTBUILD)/start.o: $(TESTER_DIR)/start.S
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-$(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h
+$(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
+                     $(TASKMAN_DIR)/sel4_types.h \
+                     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+                     $(LIBQSOE_DIR)/include/qsoe/slots.h
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-$(TESTER_ELF): $(TESTBUILD)/start.o $(TESTBUILD)/main.o
+$(TESTBUILD)/libqsoe/channel.o: $(LIBQSOE_DIR)/src/channel.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(TESTBUILD)/libqsoe/connect.o: $(LIBQSOE_DIR)/src/connect.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(TESTBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(TESTBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+TESTER_OBJS := \
+    $(TESTBUILD)/start.o \
+    $(TESTBUILD)/main.o \
+    $(TESTBUILD)/libqsoe/channel.o \
+    $(TESTBUILD)/libqsoe/connect.o \
+    $(TESTBUILD)/libqsoe/state.o \
+    $(TESTBUILD)/libqsoe/msg.o
+
+$(TESTER_ELF): $(TESTER_OBJS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \

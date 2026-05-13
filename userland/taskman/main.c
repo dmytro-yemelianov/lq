@@ -15,11 +15,71 @@
 #include "spawn.h"
 #include "../libqsoe/include/qsoe/qrv.h"
 #include "../libqsoe/include/qsoe/slots.h"
+#include "../libqsoe/include/qsoe/wire.h"
 #include <qsoe/sys_version.h>
 #include <cpio/cpio.h>
 
 extern char _userland_cpio_start[];
 extern char _userland_cpio_end[];
+
+/* Dispatch one incoming message. Inputs: the request's badge + MRs.
+ * Outputs: the reply tag and the reply MRs (the first 1-2 of which
+ * may carry returned slots, etc.). */
+static seL4_MessageInfo_t
+tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
+            seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3,
+            seL4_Word *out_mr0, seL4_Word *out_mr1)
+{
+    (void)mr3;
+    pid_t caller = (pid_t)badge;
+    unsigned label = (unsigned)seL4_MessageInfo_get_label(info);
+    seL4_Word err = 0;
+    seL4_Word reply_len = 0;
+    *out_mr0 = 0;
+    *out_mr1 = 0;
+
+    switch (label) {
+    case TM_REQ_CHANNEL_CREATE: {
+        int chid = (int)mr0;
+        unsigned flags = (unsigned)mr1;
+        unsigned long recv_slot = 0;
+        int rc = tm_channel_create(caller, chid, flags, &recv_slot);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else    { *out_mr0 = recv_slot; reply_len = 1; }
+        break;
+    }
+    case TM_REQ_CHANNEL_DESTROY: {
+        seL4_CPtr recv_slot = (seL4_CPtr)mr0;
+        int rc = tm_channel_destroy(caller, recv_slot);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_CONNECT_ATTACH: {
+        pid_t target_pid = (pid_t)mr0;
+        int target_chid = (int)mr1;
+        unsigned flags = (unsigned)mr2;
+        unsigned long send_slot = 0;
+        int rc = tm_connect_attach(caller, target_pid, target_chid,
+                                    flags, &send_slot);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else    { *out_mr0 = send_slot; reply_len = 1; }
+        break;
+    }
+    case TM_REQ_CONNECT_DETACH: {
+        seL4_CPtr send_slot = (seL4_CPtr)mr0;
+        int rc = tm_connect_detach(caller, send_slot);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    default:
+        /* Application-level message (v0.3 demo). Echo back with MR0
+         * incremented, so tester sees the round-trip succeed. */
+        *out_mr0 = mr0 + 1;
+        reply_len = 1;
+        break;
+    }
+    return seL4_MessageInfo_new(err, 0, 0, reply_len);
+}
 
 #define QSOE_STR_(x) #x
 #define QSOE_STR(x)  QSOE_STR_(x)
@@ -102,6 +162,16 @@ int main(seL4_BootInfo *bi)
         sel4_debug_puts("FATAL: failed to retype primary endpoint\n");
         for (;;) __asm__ volatile("nop");
     }
+    /* Register taskman's primary channel in the registry so ConnectAttach
+     * from other processes can find it as (pid=1, chid=1). The master
+     * and recv cap are the same slot — taskman invokes the cap directly
+     * for both seL4_Recv (server-side) and as the mint source for new
+     * connections. */
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, 1,
+                                      primary_ep, primary_ep) != 0) {
+        sel4_debug_puts("FATAL: failed to register primary channel\n");
+        for (;;) __asm__ volatile("nop");
+    }
 
     /* Find tester.elf in the embedded userland CPIO. */
     unsigned long cpio_len = (unsigned long)
@@ -119,11 +189,25 @@ int main(seL4_BootInfo *bi)
         sel4_debug_puts("FATAL: tm_spawn returned non-zero\n");
         for (;;) __asm__ volatile("nop");
     }
-    sel4_debug_puts("taskman: tester spawned, idling.\n");
+    sel4_debug_puts("taskman: dispatcher ready\n");
 
-    /* Cooperative idle: yield so lower-priority threads run. v0.3.2
-     * replaces this with seL4_Recv on the primary endpoint, which
-     * blocks until a real request arrives. */
-    for (;;) qsoe_sys_yield();
+    /* Dispatch loop: ReplyRecv pattern. seL4_Recv blocks until the
+     * first message; thereafter ReplyRecv atomically sends the reply
+     * to the previous caller and waits for the next. */
+    seL4_Word badge;
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t info = qsoe_sys_recv(primary_ep, &badge,
+                                             &mr0, &mr1, &mr2, &mr3);
+    for (;;) {
+        seL4_Word reply_mr0, reply_mr1;
+        seL4_MessageInfo_t reply_info = tm_dispatch(info, badge,
+                                                     mr0, mr1, mr2, mr3,
+                                                     &reply_mr0, &reply_mr1);
+        mr0 = reply_mr0;
+        mr1 = reply_mr1;
+        mr2 = 0; mr3 = 0;
+        info = qsoe_sys_reply_recv(primary_ep, reply_info, &badge,
+                                    &mr0, &mr1, &mr2, &mr3);
+    }
     return 0;
 }
