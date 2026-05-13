@@ -212,6 +212,54 @@ int main(pid_t pid)
         }
     }
 
+    /* --- 7a. Pulses (v0.4.2). Create a side-channel, self-connect to it,
+     *         send 3 pulses with different code/value, then MsgReceive
+     *         3 times — each fills _pulse via taskman's queue. --- */
+    {
+        int pulse_chid = ChannelCreate(QSOE_SIDE_CHANNEL);
+        sel4_debug_puts("[tester] pulse chid=");
+        puthex((unsigned long)pulse_chid);
+        sel4_debug_putchar('\n');
+
+        int pulse_coid = ConnectAttach(ND_LOCAL_NODE, qsoe_self_pid,
+                                        pulse_chid, 0, 0);
+        sel4_debug_puts("[tester] pulse coid=");
+        puthex((unsigned long)pulse_coid);
+        sel4_debug_putchar('\n');
+
+        for (int i = 0; i < 3; ++i) {
+            int rc = MsgSendPulse(pulse_coid, 10, /*code=*/i + 1,
+                                   /*value=*/(i + 1) * 100);
+            sel4_debug_puts("[tester] MsgSendPulse(code=");
+            putd(i + 1);
+            sel4_debug_puts(",val=");
+            putd((i + 1) * 100);
+            sel4_debug_puts(") -> rc=");
+            putd(rc);
+            sel4_debug_putchar('\n');
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            struct _pulse p;
+            struct _msg_info mi;
+            int rcv = MsgReceive(pulse_chid, &p, sizeof p, &mi);
+            sel4_debug_puts("[tester] MsgReceive pulse rcv=");
+            putd(rcv);
+            sel4_debug_puts(" flags=");
+            puthex((unsigned long)mi.flags);
+            sel4_debug_puts(" code=");
+            putd(p.code);
+            sel4_debug_puts(" value=");
+            putd(p.value.sival_int);
+            sel4_debug_puts(" scoid=");
+            putd(p.scoid);
+            sel4_debug_putchar('\n');
+        }
+
+        ConnectDetach(pulse_coid);
+        ChannelDestroy(pulse_chid);
+    }
+
     /* --- 7b. posix_spawn hello.elf. v0.4.1: a sibling process spawned
      *         from this one, not from taskman. No waitpid yet — we
      *         yield to let hello print, then ProcessTerminate as

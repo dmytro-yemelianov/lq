@@ -51,8 +51,9 @@ typedef unsigned int  gid_t;
 
 /* Error codes (QNX-compatible subset for v0.x). */
 #define EOK            0
-#define ESRCH          3
 #define ENOENT         2
+#define ESRCH          3
+#define EAGAIN        11
 #define EBADF          9
 #define ENOMEM        12
 #define EINVAL        22
@@ -121,6 +122,44 @@ int MsgSend(int coid, const void *smsg, int sbytes,
             void *rmsg, int rbytes);
 int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info);
 int MsgReply(int rcvid, int status, const void *msg, int bytes);
+
+/*
+ * Pulses (v0.4.2). Async fixed-size messages: 8-bit signed code
+ * + 32-bit value. Queued at the target channel; receiver picks them
+ * up via MsgReceive alongside regular messages.
+ *
+ * Layout matches QNX's struct _pulse. type == _PULSE_TYPE marks
+ * application pulses; v0.5+ adds kernel-defined subtypes for
+ * signal/timer delivery etc.
+ *
+ * MsgReceive sets _msg_info.flags |= QSOE_MI_PULSE when it returns a
+ * pulse rather than a regular message, and writes the _pulse struct
+ * into the receiver's msg buffer. The receive function still returns
+ * the rcvid; for pulses the rcvid is "no reply expected" but we
+ * return the sender's pid for symmetry.
+ */
+#define _PULSE_TYPE       0
+#define QSOE_MI_PULSE     0x00000010u   /* _msg_info.flags bit */
+
+typedef int  int32_t;
+typedef short int16_t;
+typedef unsigned short uint16_t;
+typedef signed char  int8_t;
+typedef unsigned char uint8_t;
+
+struct _pulse {
+    uint16_t type;       /* _PULSE_TYPE for application pulses */
+    uint16_t subtype;    /* 0 for app pulses */
+    int8_t   code;       /* user-defined, signed 8-bit */
+    uint8_t  reserved[3];
+    union {
+        int32_t  sival_int;
+        void    *sival_ptr;
+    } value;
+    int32_t  scoid;      /* taskman's view of the sender connection */
+};
+
+int MsgSendPulse(int coid, int priority, int code, int value);
 
 /*
  * Connection introspection / control.

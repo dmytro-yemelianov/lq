@@ -53,6 +53,19 @@ typedef struct {
     seL4_CPtr ntfn_in_caller;   /* slot the child got the Notification cap in */
 } tm_thread_t;
 
+/* v0.4.2 pulse queue: 8 entries per channel. Async fixed-size
+ * messages; sender appends via tm_pulse_send, receiver pops via
+ * tm_pulse_fetch on the same channel. Overflow → -EAGAIN (sender
+ * may retry; v0.5 may resize). */
+#define TM_PULSE_QUEUE_LEN 8
+
+typedef struct {
+    pid_t    sender_pid;
+    int      priority;
+    int      code;
+    int      value;
+} tm_pulse_t;
+
 typedef struct {
     int       in_use;
     seL4_CPtr master;        /* taskman-side master cap slot */
@@ -60,6 +73,11 @@ typedef struct {
     pid_t     owner_pid;
     int       owner_chid;
     unsigned  flags;
+    /* v0.4.2 pulse ring buffer. */
+    tm_pulse_t pulse_queue[TM_PULSE_QUEUE_LEN];
+    int        pulse_head;   /* next slot to read */
+    int        pulse_tail;   /* next slot to write */
+    int        pulse_count;
 } tm_channel_t;
 
 typedef struct {
@@ -106,6 +124,18 @@ int            tm_process_create_by_name(const char *path, unsigned path_len,
  * frees the pid. Returns 0 / -errno. status is reserved for v0.5
  * waitpid propagation. */
 int            tm_process_terminate(pid_t target, int status);
+
+/* ----------- v0.4.2 pulses ----------- */
+
+/* Send a pulse to the channel referenced by the sender's connection
+ * slot. sender_pid is the calling pid (from badge). */
+int tm_pulse_send(pid_t sender_pid, seL4_CPtr connection_slot,
+                  int priority, int code, int value);
+
+/* Fetch the oldest pulse for the channel identified by the receiver's
+ * recv_slot in its CSpace. Returns 0 / -ENOENT (empty queue). */
+int tm_pulse_fetch(pid_t receiver_pid, seL4_CPtr recv_slot,
+                   tm_pulse_t *out_pulse, int *out_scoid);
 
 /* Register an externally-allocated endpoint as channel (pid, chid).
  * Used for taskman's primary endpoint, which is retyped at boot before

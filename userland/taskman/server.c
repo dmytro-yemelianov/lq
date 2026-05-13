@@ -243,6 +243,9 @@ int tm_channel_register_existing(pid_t pid, int chid,
     g_channels[idx].owner_pid  = pid;
     g_channels[idx].owner_chid = chid;
     g_channels[idx].flags      = 0;
+    g_channels[idx].pulse_head = 0;
+    g_channels[idx].pulse_tail = 0;
+    g_channels[idx].pulse_count = 0;
     return 0;
 }
 
@@ -344,6 +347,9 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
     g_channels[idx].owner_pid  = owner_pid;
     g_channels[idx].owner_chid = chid;
     g_channels[idx].flags      = flags;
+    g_channels[idx].pulse_head = 0;
+    g_channels[idx].pulse_tail = 0;
+    g_channels[idx].pulse_count = 0;
 
     *out_recv_slot = recv;
     return 0;
@@ -708,5 +714,65 @@ int tm_thread_alloc(pid_t caller_pid,
     *out_tid       = new_tid;
     *out_tcb_slot  = child_tcb_slot;
     *out_ntfn_slot = child_ntfn_slot;
+    return 0;
+}
+
+/* ----------- v0.4.2 pulses ----------- */
+
+int tm_pulse_send(pid_t sender_pid, seL4_CPtr connection_slot,
+                  int priority, int code, int value)
+{
+    /* Resolve the sender's connection_slot → connection record →
+     * target channel. The slot belongs to the *sender's* CSpace. */
+    tm_connection_t *cn = connection_find_by_slot(sender_pid, connection_slot);
+    if (!cn) return -EBADF;
+    if (cn->channel_idx < 0 || cn->channel_idx >= TM_MAX_CHANNELS) return -EBADF;
+    tm_channel_t *c = &g_channels[cn->channel_idx];
+    if (!c->in_use) return -EBADF;
+
+    if (c->pulse_count >= TM_PULSE_QUEUE_LEN) return -EAGAIN;
+
+    int slot = c->pulse_tail;
+    c->pulse_queue[slot].sender_pid = sender_pid;
+    c->pulse_queue[slot].priority   = priority;
+    c->pulse_queue[slot].code       = code;
+    c->pulse_queue[slot].value      = value;
+
+    c->pulse_tail = (slot + 1) % TM_PULSE_QUEUE_LEN;
+    c->pulse_count++;
+    return 0;
+}
+
+int tm_pulse_fetch(pid_t receiver_pid, seL4_CPtr recv_slot,
+                   tm_pulse_t *out_pulse, int *out_scoid)
+{
+    /* Find the channel by (receiver_pid, recv_slot). */
+    tm_channel_t *c = 0;
+    for (int i = 0; i < TM_MAX_CHANNELS; ++i) {
+        if (g_channels[i].in_use &&
+            g_channels[i].owner_pid  == receiver_pid &&
+            g_channels[i].owner_recv == recv_slot) {
+            c = &g_channels[i];
+            break;
+        }
+    }
+    if (!c) return -EBADF;
+    if (c->pulse_count == 0) return -ENOENT;
+
+    int slot = c->pulse_head;
+    *out_pulse = c->pulse_queue[slot];
+    c->pulse_head = (slot + 1) % TM_PULSE_QUEUE_LEN;
+    c->pulse_count--;
+
+    /* scoid: server's view of the sender's connection. Find it. */
+    *out_scoid = 0;
+    for (int i = 0; i < TM_MAX_CONNECTIONS; ++i) {
+        if (g_connections[i].in_use &&
+            g_connections[i].channel_idx == (int)(c - g_channels) &&
+            g_connections[i].client_pid  == out_pulse->sender_pid) {
+            *out_scoid = (int)g_connections[i].badge;
+            break;
+        }
+    }
     return 0;
 }

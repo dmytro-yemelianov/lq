@@ -475,6 +475,68 @@ deliveries at the kernel level, so taskman's dispatch loop sees one
 request at a time.  Multi-threaded taskman is v0.5+, alongside the
 first resource manager.
 
+\section{Pulses}
+\label{sec:pulses}
+
+QNX-style pulses are fixed-size (1-byte signed code + 4-byte value),
+asynchronous, queued messages.  They bridge sync IPC with async events
+(timer expiration, signal delivery, IRQ notifications, name-attach
+housekeeping).  The on-wire layout matches QNX's \texttt{struct
+\_pulse} exactly: \texttt{type}, \texttt{subtype}, \texttt{code},
+\texttt{reserved[3]}, \texttt{value}, \texttt{scoid}.
+
+\subsection{API}
+
+\begin{lstlisting}[language=C]
+int MsgSendPulse(int coid, int priority, int code, int value);
+\end{lstlisting}
+
+The receiver picks pulses up via \texttt{MsgReceive} on the target
+channel.  When a pulse is returned, \texttt{\_msg\_info.flags} has
+\texttt{QSOE\_MI\_PULSE} set and the caller's buffer holds a
+\texttt{struct \_pulse} (not application bytes).
+
+\subsection{Architecture}
+
+Pulses are queued in \texttt{taskman}, per channel.  Each
+\texttt{tm\_channel\_t} carries an 8-entry ring buffer
+(\texttt{pulse\_queue}, \texttt{pulse\_head}, \texttt{pulse\_tail},
+\texttt{pulse\_count}).  Overflow returns \texttt{EAGAIN}.
+
+Wire requests:
+
+\begin{itemize}
+    \item \texttt{TM\_REQ\_PULSE\_SEND \{connection\_slot, priority,
+          code, value\}} --- taskman resolves the sender's connection
+          slot to the target channel and appends the pulse.
+    \item \texttt{TM\_REQ\_PULSE\_FETCH \{recv\_slot\}} --- the
+          receiver polls.  Taskman pops the oldest pulse for the
+          channel identified by \texttt{(receiver\_pid, recv\_slot)}
+          and returns \texttt{code}, \texttt{value}, sender's pid, and
+          server-side scoid.  Empty queue $\to$ \texttt{ENOENT}.
+\end{itemize}
+
+\texttt{MsgReceive} polls \texttt{TM\_REQ\_PULSE\_FETCH} \emph{before}
+falling back to \texttt{seL4\_Recv} on the channel's endpoint.  If a
+pulse is available it's returned immediately; otherwise the receiver
+blocks for a regular synchronous message.
+
+\subsection{v0.4.2 limitation: poll-only}
+
+A receiver already blocked in \texttt{seL4\_Recv} when a pulse arrives
+does \emph{not} wake on the pulse alone.  It wakes only when a regular
+message also arrives on the endpoint, and at that point the
+next \texttt{MsgReceive} call will drain the queued pulse.  This is
+fine for event-driven servers that always cycle back to
+\texttt{MsgReceive}; it isn't full QNX semantics for long-running
+threads that don't poll.
+
+The real fix --- a \texttt{Notification} per channel, bound to the
+receiving TCB via \texttt{seL4\_TCB\_BindNotification}, signalled by
+taskman on pulse delivery --- is queued for v0.4.3 (Tier 2).  It will
+let pulses wake a blocked receiver in addition to the queue
+guaranteeing delivery on later poll.
+
 \section{Relationship to musl libc}
 
 Standard C/POSIX functions (\texttt{printf}, \texttt{malloc},

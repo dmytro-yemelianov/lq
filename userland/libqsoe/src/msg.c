@@ -21,6 +21,7 @@
 
 #include "../include/qsoe/qrv.h"
 #include "../include/qsoe/slots.h"
+#include "../include/qsoe/wire.h"
 #include "state.h"
 
 /* Pull in just the types and ecall wrappers we need from taskman's
@@ -28,6 +29,10 @@
  * the syscall stubs from taskman. */
 #include "sel4_types.h"
 #include "qsoe_invoke.h"
+
+#ifdef QSOE_LIBQSOE_IN_TASKMAN
+#  include "server.h"
+#endif
 
 /* The IPC buffer pointer lives in the current thread's qsoe_tcb_t.
  * For the main thread of every process that's qsoe_main_tcb, which
@@ -127,6 +132,54 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
     seL4_CPtr recv = qsoe_state_chid_to_slot(chid);
     if (!recv) { qsoe_errno = EBADF; return -1; }
 
+#ifndef QSOE_LIBQSOE_IN_TASKMAN
+    /* v0.4.2: poll for a pending pulse first. If one's queued at this
+     * channel, fill the receiver's msg buffer with a _pulse struct,
+     * mark info.flags with QSOE_MI_PULSE, and return. Otherwise fall
+     * through to the regular endpoint Recv. */
+    {
+        seL4_Word p_mr0 = (seL4_Word)recv;
+        seL4_Word p_mr1 = 0, p_mr2 = 0, p_mr3 = 0;
+        seL4_MessageInfo_t p_tag = seL4_MessageInfo_new(TM_REQ_PULSE_FETCH,
+                                                         0, 0, 1);
+        seL4_MessageInfo_t p_reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, p_tag,
+                                                    &p_mr0, &p_mr1, &p_mr2, &p_mr3);
+        seL4_Word p_err = seL4_MessageInfo_get_label(p_reply);
+        if (p_err == 0) {
+            /* Pulse present. p_mr0=code, p_mr1=value, p_mr2=sender_pid,
+             * p_mr3=scoid. */
+            int8_t  code   = (int8_t)p_mr0;
+            int32_t val    = (int32_t)p_mr1;
+            pid_t   sender = (pid_t)p_mr2;
+            int     scoid  = (int)p_mr3;
+            if (msg && bytes >= (int)sizeof(struct _pulse)) {
+                struct _pulse *p = (struct _pulse *)msg;
+                p->type    = _PULSE_TYPE;
+                p->subtype = 0;
+                p->code    = code;
+                p->reserved[0] = p->reserved[1] = p->reserved[2] = 0;
+                p->value.sival_int = val;
+                p->scoid   = scoid;
+            }
+            if (info) {
+                info->nd        = ND_LOCAL_NODE;
+                info->pid       = sender;
+                info->chid      = chid;
+                info->scoid     = scoid;
+                info->coid      = 0;
+                info->msglen    = (int)sizeof(struct _pulse);
+                info->srcmsglen = (int)sizeof(struct _pulse);
+                info->dstmsglen = bytes;
+                info->priority  = 0;
+                info->flags     = QSOE_MI_PULSE;
+            }
+            /* rcvid for a pulse: 0 — no reply expected. */
+            return 0;
+        }
+        /* No pulse (ENOENT) or other error → fall through to Recv. */
+    }
+#endif
+
     seL4_Word badge;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
     seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge,
@@ -177,4 +230,32 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes)
                                                    0, 0, nwords);
     qsoe_sys_reply(tag, mr0, mr1, mr2, mr3);
     return 0;
+}
+
+int MsgSendPulse(int coid, int priority, int code, int value)
+{
+    qsoe_cancel_point();
+    seL4_CPtr send = qsoe_state_coid_to_slot(coid);
+    if (!send) { qsoe_errno = EBADF; return -1; }
+
+#ifdef QSOE_LIBQSOE_IN_TASKMAN
+    int rc = tm_pulse_send(qsoe_self_pid, send, priority, code, value);
+    if (rc) { qsoe_errno = -rc; return -1; }
+    return 0;
+#else
+    /* MR0 = sender's coid slot, MR1 = priority, MR2 = code (8-bit
+     * signed in low byte), MR3 = value. Taskman finds the target
+     * channel via the connection registry keyed on (caller, slot). */
+    seL4_Word mr0 = (seL4_Word)send;
+    seL4_Word mr1 = (seL4_Word)priority;
+    seL4_Word mr2 = (seL4_Word)((unsigned)code & 0xffu);
+    seL4_Word mr3 = (seL4_Word)value;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_PULSE_SEND,
+                                                   0, 0, 4);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    return 0;
+#endif
 }

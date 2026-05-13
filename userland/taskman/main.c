@@ -132,6 +132,30 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         reply_len = 1;
         break;
     }
+    case TM_REQ_PULSE_SEND: {
+        /* MR0 = connection slot (in caller's CSpace), MR1 = priority,
+         * MR2 = code (signed), MR3 = value. */
+        int rc = tm_pulse_send(caller, (seL4_CPtr)mr0,
+                                (int)mr1, (int)(int8_t)mr2, (int)mr3);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_PULSE_FETCH: {
+        /* MR0 = recv_slot. Reply MR0=code, MR1=value, MR2=sender_pid,
+         * MR3=scoid. label=0 success, ENOENT empty. */
+        tm_pulse_t p;
+        int scoid = 0;
+        int rc = tm_pulse_fetch(caller, (seL4_CPtr)mr0, &p, &scoid);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else {
+            *out_mr0 = (seL4_Word)(int)p.code;
+            *out_mr1 = (seL4_Word)p.value;
+            *out_mr2 = (seL4_Word)p.sender_pid;
+            *out_mr3 = (seL4_Word)scoid;
+            reply_len = 4;
+        }
+        break;
+    }
     case TM_REQ_PROCESS_TERMINATE: {
         /* MR0 = target pid (0 = self), MR1 = exit status.
          * For self-terminate, the caller's TCB is revoked inside the
