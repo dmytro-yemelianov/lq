@@ -3,7 +3,7 @@
 \section{Role}
 
 \texttt{taskman} is the root server process in QSOE.  It is analogous
-to QNX Neutrino's \texttt{procnto}: a single user-space process that
+to QNX's \texttt{procnto}: a single user-space process that
 combines the responsibilities of a process manager, memory manager,
 path manager, and system service provider.
 
@@ -11,16 +11,29 @@ Because seL4 provides only the bare capability and IPC mechanisms,
 \texttt{taskman} is responsible for all higher-level OS policy.
 
 \section{Startup}
+\label{sec:taskman-startup}
 
 After sel4runtime hands control to \texttt{main()}, taskman:
 
 \begin{enumerate}
     \item Inspects \texttt{seL4\_BootInfo} to discover available untyped
           memory and initial capabilities.
-    \item Creates its main channel (an seL4 Endpoint) and begins
-          listening for incoming messages.
+    \item \textbf{Bootstraps its primary endpoint.}  This step is the
+          one piece of taskman that cannot use the QNX-compatible
+          \texttt{ChannelCreate} API, because the API itself
+          (Chapter~\ref{chap:libqsoe}) is implemented as an IPC to
+          taskman --- and no endpoint exists yet to send that IPC to.
+          Taskman therefore allocates one Endpoint directly with
+          \texttt{seL4\_Untyped\_Retype}, stashes the master capability,
+          and inserts an entry for itself into the channel registry
+          (\S\ref{sec:registries}) by hand, owner \texttt{pid=1},
+          \texttt{chid=1}.  From this point on, every other channel in
+          the system is created through the regular API path.
     \item Initializes internal subsystems: memory allocator, process
-          table, pathname space.
+          table, pathname space, channel and connection registries.
+    \item Enters the main loop: \texttt{seL4\_Recv} on the primary
+          endpoint, dispatch on the message label, \texttt{seL4\_ReplyRecv}
+          to reply and immediately receive the next request.
 \end{enumerate}
 
 \section{Services}
@@ -68,3 +81,78 @@ Send/Receive/Reply pattern:
 Asynchronous notifications (pulses) use \texttt{MsgSendPulse()},
 mapped to seL4 Notification objects, for interrupt delivery and
 lightweight signaling.
+
+\section{Channel and connection registries}
+\label{sec:registries}
+
+For \texttt{ConnectAttach} to translate a \texttt{(pid, chid)} pair into
+a usable capability, some component must hold the authoritative mapping
+from those identifiers to the underlying seL4 Endpoint object.  seL4
+itself has no global namespace --- every capability lives in some
+process's CSpace.  In QSOE, that authority is \texttt{taskman}.  Two
+small tables make this concrete:
+
+\begin{lstlisting}[language=C]
+struct tm_channel {
+    seL4_CPtr master;      /* master Endpoint cap in taskman's CNode */
+    pid_t    owner_pid;
+    int      owner_chid;   /* libqsoe-picked, process-local */
+    unsigned flags;
+};
+
+struct tm_connection {
+    struct tm_channel *channel;
+    seL4_Word badge;
+    pid_t     client_pid;
+    seL4_CPtr client_slot; /* slot the client received */
+};
+\end{lstlisting}
+
+For early QSOE versions both tables are flat arrays with linear scan,
+sized at compile time (currently 64 channels, 256 connections).  They
+grow to hash tables when measurement says it matters.
+
+\subsection*{Key invariant}
+
+\texttt{taskman} holds \emph{exactly one} master capability per
+channel.  Every other capability to that endpoint anywhere in the system
+--- the server's recv-side copy, every client's badged Send copy --- is
+a derived descendant of that master.  Consequently:
+
+\begin{itemize}
+    \item \texttt{seL4\_CNode\_Revoke(master)} atomically tears down
+          every reference to the channel in one call.  This is what
+          makes \texttt{ChannelDestroy} and process-exit cleanup
+          tractable.
+    \item No process can resurrect or forge a connection to a destroyed
+          channel: the underlying Endpoint object is gone.
+    \item A misbehaving server cannot starve clients of cleanup by
+          refusing to participate, because clean-up is initiated by
+          \texttt{taskman} from its own master capability.
+\end{itemize}
+
+\section{Cleanup on process exit}
+\label{sec:exit-cleanup}
+
+When a process exits --- either through \texttt{ProcessTerminate} or by
+fault --- \texttt{taskman} reclaims every resource that process owned
+or held connections to:
+
+\begin{enumerate}
+    \item Walk the channel registry for entries with
+          \texttt{owner\_pid == exited\_pid}.  For each, invoke
+          \texttt{seL4\_CNode\_Revoke} on the master capability (which
+          cascades to all clients) followed by \texttt{Delete}, then
+          remove the registry row.
+    \item Walk the connection ledger for entries with
+          \texttt{client\_pid == exited\_pid}.  For each, delete the
+          client-side Send capability and remove the row.
+    \item Free the process's TCB, VSpace, CSpace, and any other
+          per-process objects --- detailed in the future \emph{Process
+          manager} section of this chapter.
+\end{enumerate}
+
+The point of describing this here rather than under \texttt{taskman}'s
+process-manager service is that the invariant in \S\ref{sec:registries}
+is what makes step~1 a single \texttt{Revoke} per channel rather than a
+client-by-client search.

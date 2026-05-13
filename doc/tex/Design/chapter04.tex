@@ -1,18 +1,25 @@
 \chapter{QNX-Compatible C Library}
+\label{chap:libqsoe}
 
 \section{Purpose}
 
-QSOE provides a C library layer that exposes QNX Neutrino-compatible
-IPC and threading primitives.  This library is linked by all user-space
-programs (including taskman itself) and translates QNX API calls into
-the appropriate seL4 system calls and capability operations.
+QSOE provides a C library layer --- \emph{libqsoe} --- that exposes
+QNX-compatible IPC and threading primitives.  This library is
+linked by all user-space programs (including taskman itself, with a
+build-time flag that bypasses self-IPC) and translates QNX API calls
+into the appropriate seL4 system calls and capability operations.
 
-It is built on top of musl libc, which provides standard POSIX/C
-functions, and extends it with the QNX-specific interfaces.
+\emph{libqsoe} lives at \texttt{userland/libqsoe/} as a standalone
+static library.  It is built on top of musl libc, which provides
+standard POSIX/C functions, and extends it with the QNX-specific
+interfaces.  The two libraries are independent build artefacts: musl
+patches are confined to \texttt{userland/libc/}, libqsoe does not
+modify musl source.
 
 \section{Core IPC functions}
 
 \subsection{Channels}
+\label{sec:channels}
 
 \begin{lstlisting}[language=C]
 int ChannelCreate(unsigned flags);
@@ -20,10 +27,46 @@ int ChannelDestroy(int chid);
 \end{lstlisting}
 
 A \emph{channel} is the server-side IPC endpoint.  Creating a channel
-allocates an seL4 Endpoint capability and registers it in the process's
+allocates an seL4 Endpoint object and registers it in the process's
 channel table.
 
+\paragraph{\texttt{ChannelCreate(flags)}}
+Creates a fresh, empty channel owned by the caller.  Returns a
+non-negative \texttt{chid} on success, or \texttt{-1} with \texttt{errno}
+set on failure.  The \texttt{flags} argument is stored in the channel's
+registry entry for future interpretation by \texttt{MsgReceive} and
+related calls; v0.x accepts any value.  Internally:
+
+\begin{itemize}
+    \item \emph{libqsoe} sends a \texttt{CHANNEL\_CREATE} request to
+          \texttt{taskman}.  The request carries the caller's choice of
+          \texttt{chid} (libqsoe owns the chid namespace per process,
+          monotonically incrementing).
+    \item \texttt{taskman} retypes one Endpoint object from its untyped
+          pool, copies the master capability into a fresh slot in the
+          caller's CSpace (the \emph{recv slot}), and inserts a row
+          into the channel registry (\S\ref{sec:registries}).
+    \item \emph{libqsoe} records \texttt{(chid $\to$ recv slot)} in its
+          per-process table and returns the chid.
+\end{itemize}
+
+\paragraph{\texttt{ChannelDestroy(chid)}}
+Atomically tears down a channel the caller owns.  After this call
+returns, every client's connection to this channel is invalidated, any
+blocked \texttt{MsgReceive} on the channel returns, and any blocked
+\texttt{MsgSend} on the client side returns \texttt{EBADF}.  Errors:
+\texttt{EBADF} if the chid is unknown to the caller's libqsoe, or
+\texttt{ESRCH} if taskman's registry has no matching entry (which
+indicates a corruption and is treated as a fatal assertion in debug
+builds).
+
+Internally, taskman performs one \texttt{seL4\_CNode\_Revoke} on the
+master capability.  By the invariant in \S\ref{sec:registries} that
+single call removes the server's recv copy and every client's Send
+copy in one step.
+
 \subsection{Connections}
+\label{sec:connections}
 
 \begin{lstlisting}[language=C]
 int ConnectAttach(uint32_t nd, pid_t pid, int chid,
@@ -31,9 +74,48 @@ int ConnectAttach(uint32_t nd, pid_t pid, int chid,
 int ConnectDetach(int coid);
 \end{lstlisting}
 
-A \emph{connection} is the client-side handle.  \texttt{ConnectAttach}
-obtains a badged copy of the target channel's Endpoint capability,
-enabling the client to send messages.
+A \emph{connection} is the client-side handle to another process's
+channel.  Each connection corresponds to a distinct badged copy of the
+target channel's Endpoint capability.
+
+\paragraph{\texttt{ConnectAttach(nd, pid, chid, index, flags)}}
+Obtains a connection to channel \texttt{chid} owned by process
+\texttt{pid}.  Returns a non-negative \texttt{coid} on success.
+Parameter semantics:
+
+\begin{itemize}
+    \item \texttt{nd} (node descriptor): must be \texttt{ND\_LOCAL\_NODE}
+          ($=0$) in v0.x.  Non-zero values are reserved for future
+          networked QSOE and return \texttt{EHOSTUNREACH}.
+    \item \texttt{pid}: the target server's process ID.  Returns
+          \texttt{ESRCH} if no such process or no channel \texttt{chid}
+          exists.
+    \item \texttt{chid}: the server-local channel identifier.
+    \item \texttt{index}: QNX reserves slot 0 for system use; otherwise
+          this is informational.  v0.x accepts any value and ignores.
+    \item \texttt{flags}: stored in the connection ledger for future
+          \texttt{MsgSend} behavior.  v0.x accepts any value.
+\end{itemize}
+
+Internally, taskman locates the channel via its
+\texttt{(pid, chid) $\to$ master cap} lookup, picks a fresh badge
+(monotonic per channel), mints a Send-rights capability with that
+badge into a fresh slot in the caller's CSpace, and inserts an entry
+into the connection ledger.  The badge is what the server reads on
+\texttt{MsgReceive} to identify which client sent the message; in QNX
+terms it is the foundation of the \texttt{rcvid}.
+
+\paragraph{\texttt{ConnectDetach(coid)}}
+Tears down a single connection.  Returns 0 on success, \texttt{-1} with
+\texttt{errno} on failure.  After this call returns, future
+\texttt{MsgSend} on this coid returns \texttt{EBADF}.
+
+ConnectDetach is implemented as a round-trip IPC to taskman rather than
+a purely local capability delete.  The cost is one extra IPC per
+detach; the benefit is that taskman's connection ledger remains an
+accurate global record, which simplifies \texttt{ChannelDestroy}
+accounting, process-exit cleanup (\S\ref{sec:exit-cleanup}), and
+future diagnostics.
 
 \subsection{Messages}
 
@@ -51,6 +133,135 @@ int MsgSendPulse(int coid, int priority,
 These form the fundamental Send/Receive/Reply triad.  The synchronous
 variants map directly to \texttt{seL4\_Call}, \texttt{seL4\_Recv}, and
 \texttt{seL4\_Reply}.  Pulses use seL4 Notification objects.
+
+\section{State split: libqsoe vs taskman}
+\label{sec:state-split}
+
+For every piece of IPC-related state QSOE tracks, exactly one component
+owns it: either \emph{libqsoe} (per process, linked into every program)
+or \emph{taskman} (a single central registry).  The split is governed
+by one principle:
+
+\begin{quote}
+A datum lives in \texttt{taskman} iff \emph{any} of the following holds:
+(1) it must be visible across processes; (2) it must survive a crash of
+the process that registered it; (3) it is the sole authority for
+issuing or destroying a kernel object.  Everything else lives in
+libqsoe.
+\end{quote}
+
+Table~\ref{tab:state-split} applies that principle to the IPC state
+introduced by Chapter~\ref{chap:libqsoe}'s four core functions.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}p{6.5cm}lp{5cm}@{}}
+    \toprule
+    \textbf{State}                                & \textbf{Owner} & \textbf{Notes} \\
+    \midrule
+    Master Endpoint cap for a channel             & taskman & needed to mint Send caps and revoke on destroy \\
+    Channel registry $(pid, chid) \to$ master cap & taskman & consulted by every \texttt{ConnectAttach} \\
+    Connection ledger $(channel, badge) \to$ client pid & taskman & enables destroy and exit cleanup \\
+    Server's recv cap for its own channel         & libqsoe & derived copy in process CSpace \\
+    $chid \to$ recv-cap slot table                & libqsoe & per-process; chid is an opaque handle \\
+    $coid \to$ send-cap slot table                & libqsoe & per-process; coid is an opaque handle \\
+    Next free chid / coid counter                 & libqsoe & monotonic, per process \\
+    Process table $pid \to$ TCB/VSpace/CSpace     & taskman & populated by future \texttt{ProcessCreate} \\
+    \bottomrule
+\end{tabular}
+\caption{State ownership for the core IPC functions}
+\label{tab:state-split}
+\end{table}
+
+Two consequences are worth highlighting:
+
+\begin{enumerate}
+    \item \emph{chid and coid are process-local handles}, not kernel
+          identifiers.  They are libqsoe's index into its own slot
+          tables; taskman keys its registry by the underlying
+          capability slot, not by the chid value.  This matches QNX
+          semantics exactly: a chid is meaningful only to its owning
+          process.
+    \item \emph{The master capability is the single point of truth} for
+          a channel's existence.  Holding it in taskman --- and nowhere
+          else --- is what makes the destroy and process-exit paths
+          single-call operations rather than searches.
+\end{enumerate}
+
+\section{Wire protocol}
+\label{sec:wire-protocol}
+
+Each of the four core functions is a \texttt{seL4\_Call} from libqsoe
+to taskman's primary endpoint.  The message info \emph{label} encodes
+the request kind; the message registers (MR0--MR3) carry arguments.
+Each reply uses label \texttt{0} for success or a negative
+errno-style code for failure.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    \textbf{Request}      & \textbf{Label} & \textbf{MR0} & \textbf{MR1} & \textbf{MR2} & \textbf{MR3} & \textbf{Reply MR0} \\
+    \midrule
+    \texttt{CHANNEL\_CREATE}  & 0x01 & chid           & flags   & ---     & --- & recv slot \\
+    \texttt{CHANNEL\_DESTROY} & 0x02 & recv slot      & ---     & ---     & --- & ---       \\
+    \texttt{CONNECT\_ATTACH}  & 0x03 & target pid     & chid    & flags   & --- & send slot \\
+    \texttt{CONNECT\_DETACH}  & 0x04 & send slot      & ---     & ---     & --- & ---       \\
+    \bottomrule
+\end{tabular}
+\caption{libqsoe$\leftrightarrow$taskman wire format (v0.x)}
+\label{tab:wire}
+\end{table}
+
+The slot numbers exchanged across the wire are CNode-slot indices in
+the caller's own CSpace --- taskman holds the caller's root CNode
+capability (populated by \texttt{ProcessCreate}) and uses it to copy,
+mint, and delete capabilities in the caller's slots directly.  No
+capability is transferred \emph{in the message} (\texttt{extraCaps=0}
+on all four calls); instead taskman writes capabilities into the
+caller's CSpace using \texttt{seL4\_CNode\_Copy} and
+\texttt{seL4\_CNode\_Mint}.  This avoids the per-message capability-
+unwrapping overhead and makes the wire format a flat integer-only
+protocol.
+
+\section{CSpace conventions}
+\label{sec:cspace-conventions}
+
+Every QSOE process has a CNode large enough to hold the well-known
+caps, the dynamic capabilities allocated by libqsoe (one slot per chid
+and per coid), and headroom.  Currently \texttt{ProcessCreate} (when
+implemented) sizes process CNodes at $2^{12}$ slots; this is
+provisional and will be revisited when real workloads exist.
+
+The reserved-slot layout below is fixed across QSOE.  Constants live
+in the header \texttt{qsoe/slots.h} (under
+\texttt{userland/libqsoe/include/}) and are included by both libqsoe
+and taskman.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Slot} & \textbf{Symbol}              & \textbf{Contents} \\
+    \midrule
+    0    & ---                                   & null / reserved \\
+    1    & \texttt{QSOE\_CAP\_TASKMAN\_EP}        & Send cap to taskman's primary endpoint \\
+    2--15 & ---                                  & reserved for future well-known caps \\
+    16+  & ---                                   & dynamic allocations (chid recv slots, coid send slots) \\
+    \bottomrule
+\end{tabular}
+\caption{Reserved CSpace slots in every QSOE process}
+\label{tab:cspace}
+\end{table}
+
+The taskman process itself is the only exception: its CSpace is the
+initial root-task CNode from \texttt{seL4\_BootInfo}, populated
+according to seL4's conventions rather than QSOE's.  Taskman maintains
+its own internal mapping from QSOE slot semantics to the actual
+BootInfo slot numbers.
 
 \section{Threading}
 

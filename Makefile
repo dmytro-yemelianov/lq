@@ -48,6 +48,7 @@ ELFSRC      := $(CORE)/kernel/startup
 LIBCPIO     := $(CORE)/lib/cpio
 
 TASKMAN_DIR := $(TOP)/userland/taskman
+LIBQSOE_DIR := $(TOP)/userland/libqsoe
 
 SEL4TEST    := $(TOP)/sel4test-full
 SEL4BUILD   := $(SEL4TEST)/build-qsoe-riscv64
@@ -93,7 +94,8 @@ EL_INCLUDES := \
 TM_CFLAGS := $(ARCH_CFLAGS) \
     -ffreestanding -nostdlib -nostdinc \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
-    -fno-builtin -Wall -Wextra
+    -fno-builtin -Wall -Wextra \
+    -I$(GEN)
 
 # ----------------------------------------------------------------------------
 # Source lists
@@ -210,15 +212,74 @@ $(ELFBUILD)/linker.lds_pp: $(ELFSRC)/linker.lds $(GEN_HEADERS)
 # Taskman (rootserver — currently just spins)
 # ----------------------------------------------------------------------------
 
+# Headers shared across taskman/libqsoe TUs.
+TM_HEADERS := \
+    $(TASKMAN_DIR)/sel4_syscalls.h \
+    $(TASKMAN_DIR)/sel4_types.h \
+    $(TASKMAN_DIR)/qsoe_invoke.h \
+    $(TASKMAN_DIR)/server.h \
+    $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+    $(LIBQSOE_DIR)/include/qsoe/slots.h \
+    $(LIBQSOE_DIR)/src/state.h \
+    $(GEN)/qsoe/sys_version.h
+
+# Auto-generated version header. Pulls the latest git tag (vMAJOR.MINOR[.PATCH])
+# and emits the numeric components + a build date. Regenerates whenever
+# .git/HEAD or .git/index changes (new commit, branch switch, tag bump).
+$(GEN)/qsoe/sys_version.h: $(wildcard .git/HEAD .git/index)
+	@mkdir -p $(@D)
+	@VERSION=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
+	 VERSION="$${VERSION#v}"; \
+	 MAJOR="$${VERSION%%.*}"; \
+	 TEMP="$${VERSION#*.}"; \
+	 MINOR="$${TEMP%%[!0-9]*}"; \
+	 case "$$TEMP" in *.*) PATCH="$${TEMP#*.}";; *) PATCH=0;; esac; \
+	 printf '/* Auto-generated from `git describe --tags --abbrev=0`. Do not edit. */\n' > $@; \
+	 printf '#ifndef QSOE_SYS_VERSION_H\n#define QSOE_SYS_VERSION_H\n\n' >> $@; \
+	 printf '#define QSOE_VERSION_STRING "%s"\n' "$$VERSION" >> $@; \
+	 printf '#define QSOE_VERSION_MAJOR %s\n' "$$MAJOR" >> $@; \
+	 printf '#define QSOE_VERSION_MINOR %s\n' "$$MINOR" >> $@; \
+	 printf '#define QSOE_VERSION_PATCH %s\n' "$$PATCH" >> $@; \
+	 printf '#define QSOE_BUILD_DATE "%s"\n\n' "$$(date +%Y-%m-%d)" >> $@; \
+	 printf '#endif\n' >> $@
+
+# libqsoe is compiled into taskman with -DQSOE_LIBQSOE_IN_TASKMAN so its
+# entrypoints call tm_* handlers directly instead of doing self-IPC.
+LIBQSOE_CFLAGS := $(TM_CFLAGS) -DQSOE_LIBQSOE_IN_TASKMAN -I$(TASKMAN_DIR)
+
 $(TASKBUILD)/start.o: $(TASKMAN_DIR)/start.S
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-$(TASKBUILD)/main.o: $(TASKMAN_DIR)/main.c
+$(TASKBUILD)/main.o: $(TASKMAN_DIR)/main.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-$(TASKMAN_ELF): $(TASKBUILD)/start.o $(TASKBUILD)/main.o
+$(TASKBUILD)/server.o: $(TASKMAN_DIR)/server.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(TASKBUILD)/libqsoe/channel.o: $(LIBQSOE_DIR)/src/channel.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(TASKBUILD)/libqsoe/connect.o: $(LIBQSOE_DIR)/src/connect.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(TASKBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
+
+TASKMAN_OBJS := \
+    $(TASKBUILD)/start.o \
+    $(TASKBUILD)/main.o \
+    $(TASKBUILD)/server.o \
+    $(TASKBUILD)/libqsoe/channel.o \
+    $(TASKBUILD)/libqsoe/connect.o \
+    $(TASKBUILD)/libqsoe/state.o
+
+$(TASKMAN_ELF): $(TASKMAN_OBJS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \

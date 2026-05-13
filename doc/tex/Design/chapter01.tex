@@ -3,8 +3,8 @@
 \section{What is QSOE?}
 
 QSOE (Quick and Secure Operating Environment) is an operating environment
-that combines the formally verified seL4 microkernel with a QNX
-Neutrino-style programming model.  The result is a system that provides
+that combines the formally verified seL4 microkernel with a
+QNX-style programming model.  The result is a system that provides
 the proven, elegant synchronous message-passing API of QNX on top of the
 strongest isolation and capability-security guarantees available in any
 production microkernel.
@@ -77,9 +77,19 @@ low-level mechanisms that correspond closely to QNX's IPC model:
     \texttt{MsgSend}/\texttt{MsgReceive}/\texttt{MsgReply} & seL4 synchronous IPC (\texttt{seL4\_Call}/\texttt{seL4\_Recv}/\texttt{seL4\_Reply}) \\
     Pulse (\texttt{MsgSendPulse})    & seL4 Notification \\
     Connection ID (coid)             & Capability badge \\
+    Receive ID (rcvid)               & Badge value on incoming message \\
+    Channel ownership token          & Master Endpoint capability held by \texttt{taskman} \\
     Resource Manager                 & User-space server with capabilities \\
     \bottomrule
 \end{tabular}
 \caption{QNX--seL4 concept mapping}
 \label{tab:mapping}
 \end{table}
+
+Table~\ref{tab:mapping} describes the \emph{mechanism}: which seL4
+primitive realises each QNX concept.  It does not describe the
+\emph{policy}: who holds which capability, who allocates, who revokes.
+That separation is deliberate.  The policy --- in particular, the split
+of state between the per-process QSOE C library and the central
+\texttt{taskman} server --- is the subject of Chapter~\ref{chap:libqsoe},
+\S\ref{sec:state-split}.
