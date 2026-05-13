@@ -264,6 +264,20 @@ qsoe_tcb_set_priority(seL4_CPtr tcb, seL4_CPtr authority_tcb, seL4_Word prio)
     return seL4_MessageInfo_get_label(reply);
 }
 
+/* seL4_TCB_SetAffinity (SMP only). Pins the given TCB to logical CPU
+ * `affinity` (0..CONFIG_MAX_NUM_NODES-1). New TCBs default to CPU 0;
+ * call this right after Configure (and before Resume) to spread work
+ * across harts. v0.4's ThreadCreate uses _thread_attr.runmask as the
+ * affinity hint. */
+static inline seL4_Word
+qsoe_tcb_set_affinity(seL4_CPtr tcb, seL4_Word affinity)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBSetAffinity, 0, 0, 1);
+    seL4_Word mr0 = affinity, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
 static inline seL4_Word
 qsoe_tcb_resume(seL4_CPtr tcb)
 {

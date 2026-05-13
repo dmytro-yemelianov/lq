@@ -58,22 +58,27 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 
 /* Invocation method labels, derived by counting the enum in
  * sel4test-full/build-qsoe-riscv64/kernel/gen_headers/api/invocation.h
- * with our config (non-MCS, non-SMP, non-HW_DEBUG_API, etc). */
+ * with our config (non-MCS, SMP=ON with NUM_NODES=4, non-HW_DEBUG_API).
+ *
+ * v0.3.4: SMP inserts TCBSetAffinity at position 15, shifting every
+ * later label by +1. nInvocationLabels = 34 (was 33), so arch-
+ * specific labels start at 34. */
 #define INV_UntypedRetype            1
 #define INV_TCBWriteRegisters        3
 #define INV_TCBConfigure             5   /* non-MCS variant */
 #define INV_TCBSetPriority           6
+#define INV_TCBSetAffinity          15   /* SMP-only — v0.4 uses */
 #define INV_TCBResume               12
-#define INV_CNodeRevoke             17
-#define INV_CNodeDelete             18
-#define INV_CNodeCopy               20
-#define INV_CNodeMint               21
-/* Arch-specific labels start at nInvocationLabels (33 in our config). */
-#define INV_RISCVPageTableMap       33
-#define INV_RISCVPageTableUnmap     34
-#define INV_RISCVPageMap            35
-#define INV_RISCVPageUnmap          36
-#define INV_RISCVASIDPoolAssign     39
+#define INV_CNodeRevoke             18
+#define INV_CNodeDelete             19
+#define INV_CNodeCopy               21
+#define INV_CNodeMint               22
+/* Arch-specific labels start at nInvocationLabels (34 with SMP). */
+#define INV_RISCVPageTableMap       34
+#define INV_RISCVPageTableUnmap     35
+#define INV_RISCVPageMap            36
+#define INV_RISCVPageUnmap          37
+#define INV_RISCVASIDPoolAssign     40
 
 /* Fast-path syscall numbers (negative; see arch/api/syscall.h). */
 #define SYS_Call                (-1)

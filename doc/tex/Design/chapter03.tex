@@ -36,6 +36,46 @@ After sel4runtime hands control to \texttt{main()}, taskman:
           to reply and immediately receive the next request.
 \end{enumerate}
 
+\section{SMP boot}
+\label{sec:smp-boot}
+
+QSOE is built for SMP from v0.3.4 onward.  The reference target is
+\textbf{4 harts on qemu-riscv-virt}; the SiFive Unmatched (5 harts:
+4$\times$U74 + 1$\times$S7) and the SpaceMit K3 (8 cores) are
+configuration-time changes to \texttt{CONFIG\_MAX\_NUM\_NODES}.
+
+The seL4 kernel is built with \texttt{KernelMaxNumNodes=N},
+\texttt{KernelEnableSMPSupport=ON} (auto-enabled by sel4test's
+\texttt{settings.cmake} when \texttt{SMP=TRUE}).  The elfloader
+(\texttt{core/kernel/startup/}) is built with our own Makefile rules,
+which emit a tiny \texttt{autoconf.h} containing the matching
+\texttt{CONFIG\_MAX\_NUM\_NODES} and \texttt{CONFIG\_ENABLE\_SMP\_SUPPORT}
+defines; the elfloader's secondary-hart bringup code paths
+(\texttt{boot.c}, \texttt{crt0.S}) compile in when those defines are
+present.
+
+At boot, hart 0 runs the elfloader's \texttt{run\_elfloader} sequence
+to completion, then secondary harts are released via the OpenSBI HSM
+extension.  Each secondary enters \texttt{secondary\_entry}, joins a
+ready-flag barrier, and enables paging before jumping into the kernel.
+The kernel then constructs its per-CPU state and starts the rootserver
+(taskman) on hart 0.
+
+In v0.3.4 taskman remains a single-threaded server pinned to hart 0
+--- the v0.3.3 transcript replays unchanged.  Secondary harts are
+present and idle; they only come alive when user threads are pinned
+to them via \texttt{seL4\_TCB\_SetAffinity}.  v0.4 layers the QNX
+\texttt{Thread*} API on top, exposing affinity through
+\texttt{\_thread\_attr.runmask}.  Multi-threading taskman itself is
+deferred to v0.5+, when the first resource manager arrives and the
+single-server dispatch bottleneck becomes meaningful.
+
+The invocation-label enum shifts under SMP: \texttt{TCBSetAffinity}
+is inserted at slot 15, pushing every later label up by one.
+QSOE re-derives the \texttt{INV\_*} constants in
+\texttt{userland/taskman/sel4\_types.h} from the kernel's generated
+\texttt{invocation.h} after every kernel rebuild.
+
 \section{Services}
 
 \texttt{taskman} multiplexes several service domains over a single
