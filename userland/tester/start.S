@@ -17,6 +17,9 @@ _start:
     la gp, __global_pointer$
     .option pop
 
+    /* Plant tp = &qsoe_main_tcb (see taskman/start.S for rationale). */
+    la tp, qsoe_main_tcb
+
     /* Set up stack pointer. */
     la sp, _stack_top
 

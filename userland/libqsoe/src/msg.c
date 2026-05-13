@@ -29,11 +29,9 @@
 #include "sel4_types.h"
 #include "qsoe_invoke.h"
 
-/* The IPC buffer pointer lives in libqsoe-managed state. For
- * QSOE_LIBQSOE_IN_TASKMAN builds (taskman) it's set by main(); for
- * spawned processes (tester), the kernel maps the IPC buffer at
- * CHILD_IPC_BUFFER (0x1fe000) per spawn.c. The latter case writes
- * qsoe_ipcbuf in the process's libqsoe init hook (added below). */
+/* The IPC buffer pointer lives in the current thread's qsoe_tcb_t.
+ * For the main thread of every process that's qsoe_main_tcb, which
+ * the crt0 already pointed `tp` at before this runs. */
 
 /* The libqsoe init hook gets called from each process's crt0 / first
  * libqsoe call. Idempotent.
@@ -47,8 +45,8 @@
  * libqsoe's coid table about it. */
 void qsoe_libqsoe_init(void *ipcbuf, pid_t self_pid)
 {
-    qsoe_ipcbuf = (seL4_IPCBuffer *)ipcbuf;
-    qsoe_self_pid = self_pid;
+    qsoe_curthr()->ipcbuf   = ipcbuf;
+    qsoe_curthr()->self_pid = self_pid;
     if (self_pid != QSOE_PID_TASKMAN) {
         qsoe_state_bind_coid(SYSMGR_COID, QSOE_CAP_TASKMAN_EP);
     }
@@ -56,6 +54,16 @@ void qsoe_libqsoe_init(void *ipcbuf, pid_t self_pid)
 
 /* IPC-buffer byte capacity: 120 words × 8 bytes. */
 #define QSOE_MSG_MAX_BYTES (seL4_MsgMaxLength * 8)
+
+/* v0.4 deferred cancellation point. Each libqsoe IPC entry checks
+ * the current thread's cancel_pending flag and, if set, terminates
+ * the thread with status (void *)-1 — QNX's PTHREAD_CANCELED. */
+static inline void qsoe_cancel_point(void)
+{
+    if (qsoe_curthr()->cancel_pending) {
+        ThreadDestroy(0, 0, (void *)(unsigned long)-1L);
+    }
+}
 
 /* Pack `nbytes` from `src` into the IPC buffer's msg[] view. Returns
  * the number of seL4 words occupied (= ceil(nbytes/8)). */
@@ -87,6 +95,7 @@ static void unpack_bytes(void *dst, unsigned avail, unsigned want)
 int MsgSend(int coid, const void *smsg, int sbytes,
             void *rmsg, int rbytes)
 {
+    qsoe_cancel_point();
     if (sbytes < 0 || rbytes < 0) { qsoe_errno = EINVAL; return -1; }
     seL4_CPtr send = qsoe_state_coid_to_slot(coid);
     if (!send) { qsoe_errno = EBADF; return -1; }
@@ -113,6 +122,7 @@ int MsgSend(int coid, const void *smsg, int sbytes,
 
 int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
 {
+    qsoe_cancel_point();
     if (bytes < 0) { qsoe_errno = EINVAL; return -1; }
     seL4_CPtr recv = qsoe_state_chid_to_slot(chid);
     if (!recv) { qsoe_errno = EBADF; return -1; }
@@ -154,6 +164,7 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
 int MsgReply(int rcvid, int status, const void *msg, int bytes)
 {
     (void)rcvid;  /* non-MCS: implicit reply cap, not addressed by rcvid */
+    qsoe_cancel_point();
     if (bytes < 0) { qsoe_errno = EINVAL; return -1; }
 
     unsigned nwords = pack_bytes(msg, (unsigned)bytes);

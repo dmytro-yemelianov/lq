@@ -5,21 +5,16 @@
  * `python3 syscall_stub_gen.py -a riscv64 ...` output, methods we use:
  *   UntypedRetype, CNodeRevoke, CNodeDelete, CNodeCopy, CNodeMint).
  *
- * The IPC buffer pointer must be initialised once via qsoe_invoke_init()
- * before any call below. For taskman (single-threaded in v0.x) we keep
- * it as a plain global; when threads land we'll move to TLS.
+ * The IPC buffer pointer lives in the current thread's qsoe_tcb_t
+ * (see <qsoe/tls.h>) — the crt0 plants &qsoe_main_tcb in tp before
+ * any call below, and qsoe_libqsoe_init() then writes the buffer
+ * address into that struct.
  */
 #ifndef QSOE_INVOKE_H
 #define QSOE_INVOKE_H
 
 #include "sel4_types.h"
-
-extern seL4_IPCBuffer *qsoe_ipcbuf;
-
-static inline void qsoe_invoke_init(seL4_IPCBuffer *buf)
-{
-    qsoe_ipcbuf = buf;
-}
+#include <qsoe/tls.h>   /* qsoe_ipcbuf macro */
 
 /* Low-level ecall: dest in a0, info in a1, first four MRs in a2-a5,
  * syscall number in a7. Returns the reply MessageInfo word. */
@@ -285,6 +280,49 @@ qsoe_tcb_resume(seL4_CPtr tcb)
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
     seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
     return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_tcb_suspend(seL4_CPtr tcb)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBSuspend, 0, 0, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+/* seL4_Signal — empty Send to a Notification cap (kernel checks cap
+ * type). No reply, no MRs. */
+static inline void
+qsoe_sys_signal(seL4_CPtr ntfn)
+{
+    register seL4_Word a0 asm("a0") = ntfn;
+    register seL4_Word a1 asm("a1") = 0;  /* tag: label=0, length=0 */
+    register seL4_Word a7 asm("a7") = (seL4_Word)SYS_Send;
+    asm volatile("ecall"
+                 : "+r"(a0), "+r"(a1)
+                 : "r"(a7)
+                 : "memory");
+}
+
+/* seL4_Wait — same syscall as Recv; kernel distinguishes by cap type.
+ * Returns the badge (or 0 if the Notification cap is unbadged). */
+static inline seL4_Word
+qsoe_sys_wait(seL4_CPtr ntfn)
+{
+    register seL4_Word a0 asm("a0") = ntfn;
+    register seL4_Word a1 asm("a1");
+    register seL4_Word a2 asm("a2");
+    register seL4_Word a3 asm("a3");
+    register seL4_Word a4 asm("a4");
+    register seL4_Word a5 asm("a5");
+    register seL4_Word a7 asm("a7") = (seL4_Word)SYS_Recv;
+    asm volatile("ecall"
+                 : "+r"(a0), "=r"(a1), "=r"(a2), "=r"(a3), "=r"(a4), "=r"(a5)
+                 : "r"(a7)
+                 : "memory");
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return a0;
 }
 
 /* RISC-V VM attributes. Bit 0 = ExecuteNever; we leave it 0 for code. */

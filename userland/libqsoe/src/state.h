@@ -27,11 +27,9 @@
 
 #define QSOE_SLOT_RESERVED  (~(unsigned long)0)
 
-/* The libqsoe init hook records this — used by ConnectServerInfo's
- * "pid==0 means caller" shortcut and by any future entrypoint that
- * needs to identify "us". For taskman it's QSOE_PID_TASKMAN; for a
- * spawned child it's the pid spawn.c passed in a0. */
-extern pid_t qsoe_self_pid;
+/* qsoe_self_pid is now a macro that reads from per-thread state —
+ * see <qsoe/tls.h>. Still the same name and semantics; just stored in
+ * the qsoe_tcb_t instead of a global. */
 
 /* `flags` selects pool: bit QSOE_SIDE_CHANNEL → side pool, else FD. */
 int           qsoe_state_alloc_chid(unsigned flags);
@@ -41,5 +39,11 @@ unsigned long qsoe_state_chid_to_slot(int chid);
 int           qsoe_state_alloc_coid(unsigned flags);
 void          qsoe_state_bind_coid(int coid, unsigned long slot);
 unsigned long qsoe_state_coid_to_slot(int coid);
+
+/* v0.4 thread pool accessors. */
+qsoe_tcb_t   *qsoe_tcb_of_tid(int tid);
+qsoe_tcb_t   *qsoe_worker_alloc(void);
+
+extern qsoe_tcb_t qsoe_worker_tcbs[31];
 
 #endif /* QSOE_LIBQSOE_STATE_H */

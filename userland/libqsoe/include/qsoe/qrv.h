@@ -10,7 +10,8 @@
 #ifndef QSOE_QRV_H
 #define QSOE_QRV_H
 
-typedef int           pid_t;
+#include <qsoe/tls.h>   /* qsoe_errno, qsoe_self_pid, qsoe_ipcbuf, pid_t */
+
 typedef unsigned int  uint32_t;
 typedef unsigned int  uid_t;
 typedef unsigned int  gid_t;
@@ -56,8 +57,6 @@ typedef unsigned int  gid_t;
 #define EINVAL        22
 #define ENOSYS        89
 #define EHOSTUNREACH 113
-
-extern int qsoe_errno;
 
 int ChannelCreate(unsigned flags);
 int ChannelDestroy(int chid);
@@ -144,6 +143,61 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes);
 int ConnectServerInfo(pid_t pid, int coid, struct _server_info *info);
 int ConnectClientInfo(int scoid, struct _client_info *info, int ngroups);
 int ConnectFlags(pid_t pid, int coid, unsigned mask, unsigned bits);
+
+/*
+ * Threading (v0.4). QNX/QRV-compatible surface.
+ *
+ *   ThreadCreate(pid, func, arg, attr) — spawn a new thread in the
+ *     given process. pid==0 means "this process"; cross-process
+ *     ThreadCreate returns ENOSYS in v0.4. Returns the new tid (>= 2)
+ *     or -1.
+ *
+ *   ThreadDestroy(tid, prio, status) — terminate a thread, set its
+ *     exit_status (read by ThreadJoin), revoke its TCB. Calling with
+ *     tid==0 means "current thread"; the trampoline does this on
+ *     return from the user func.
+ *
+ *   ThreadDetach(tid) — set the detached flag; once set, the thread's
+ *     resources are reclaimed when it exits and ThreadJoin fails.
+ *
+ *   ThreadJoin(tid, *status) — block until the thread exits; receive
+ *     its exit_status.
+ *
+ *   ThreadCancel(tid, canstub) — request termination. v0.4 supports
+ *     only deferred cancellation: the target observes cancel_pending
+ *     at the next libqsoe entry point (MsgSend / MsgReceive / etc).
+ *     `canstub` is stored but unused in v0.4.
+ *
+ *   ThreadCtl(cmd, data) — control op. v0.4 supports QSOE_TCTL_NAME
+ *     and QSOE_TCTL_RUNMASK; others return ENOSYS.
+ */
+typedef unsigned long size_t;
+
+#define QSOE_PTHREAD_CREATE_JOINABLE  0
+#define QSOE_PTHREAD_CREATE_DETACHED  1
+
+struct _thread_attr {
+    int        flags;       /* QSOE_PTHREAD_CREATE_DETACHED bit */
+    size_t     stacksize;   /* if 0 → libqsoe default (56 KiB) */
+    void      *stackaddr;   /* if NULL → libqsoe allocates */
+    void     (*exitfunc)(void *status);   /* stored, not yet wired in v0.4 */
+    int        policy;
+    int        prio;        /* 1..255; 0 → default 254 */
+    unsigned   runmask;     /* SMP affinity bitmask; 0 → CPU 0 */
+    unsigned   guardsize;
+    unsigned   prealloc;
+};
+
+#define QSOE_TCTL_NAME     11
+#define QSOE_TCTL_RUNMASK   4
+
+int ThreadCreate(pid_t pid, void *(*func)(void *), void *arg,
+                 const struct _thread_attr *attr);
+int ThreadDestroy(int tid, int priority, void *status);
+int ThreadDetach(int tid);
+int ThreadJoin(int tid, void **status);
+int ThreadCancel(int tid, void (*canstub)(void));
+int ThreadCtl(int cmd, void *data);
 
 /*
  * libqsoe init hook. Each spawned process calls this exactly once at

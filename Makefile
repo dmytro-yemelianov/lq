@@ -98,7 +98,8 @@ TM_CFLAGS := $(ARCH_CFLAGS) \
     -ffreestanding -nostdlib -nostdinc \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
     -fno-builtin -Wall -Wextra \
-    -I$(GEN)
+    -I$(GEN) \
+    -I$(LIBQSOE_DIR)/include
 
 # ----------------------------------------------------------------------------
 # Source lists
@@ -225,6 +226,8 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/spawn.h \
     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
+    $(LIBQSOE_DIR)/include/qsoe/tls.h \
+    $(LIBQSOE_DIR)/include/qsoe/wire.h \
     $(LIBQSOE_DIR)/src/state.h \
     $(GEN)/qsoe/sys_version.h
 
@@ -291,6 +294,10 @@ $(TASKBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TASKBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
+
 TASKMAN_OBJS := \
     $(TASKBUILD)/start.o \
     $(TASKBUILD)/main.o \
@@ -301,7 +308,8 @@ TASKMAN_OBJS := \
     $(TASKBUILD)/libqsoe/channel.o \
     $(TASKBUILD)/libqsoe/connect.o \
     $(TASKBUILD)/libqsoe/state.o \
-    $(TASKBUILD)/libqsoe/msg.o
+    $(TASKBUILD)/libqsoe/msg.o \
+    $(TASKBUILD)/libqsoe/thread.o
 
 $(TASKMAN_ELF): $(TASKMAN_OBJS)
 	@mkdir -p $(@D)
@@ -347,13 +355,18 @@ $(TESTBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TESTBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 TESTER_OBJS := \
     $(TESTBUILD)/start.o \
     $(TESTBUILD)/main.o \
     $(TESTBUILD)/libqsoe/channel.o \
     $(TESTBUILD)/libqsoe/connect.o \
     $(TESTBUILD)/libqsoe/state.o \
-    $(TESTBUILD)/libqsoe/msg.o
+    $(TESTBUILD)/libqsoe/msg.o \
+    $(TESTBUILD)/libqsoe/thread.o
 
 $(TESTER_ELF): $(TESTER_OBJS)
 	@mkdir -p $(@D)

@@ -22,6 +22,12 @@ _start:
     la gp, __global_pointer$
     .option pop
 
+    /* Plant tp = &qsoe_main_tcb so libqsoe's per-thread state
+     * accessors (qsoe_curthr() in <qsoe/tls.h>) resolve. qsoe_main_tcb
+     * is BSS, so any .ipcbuf/.qerrno reads before qsoe_libqsoe_init()
+     * see zeros, which is the correct uninitialised state. */
+    la tp, qsoe_main_tcb
+
     /* Set up stack pointer. */
     la sp, _stack_top
 

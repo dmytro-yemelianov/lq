@@ -111,6 +111,26 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         else    { *out_mr0 = (seL4_Word)old; reply_len = 1; }
         break;
     }
+    case TM_REQ_THREAD_ALLOC: {
+        int new_tid = 0;
+        seL4_CPtr tcb_slot = 0, ntfn_slot = 0;
+        /* MR3 packs prio (low 8 bits) + affinity (next 8 bits). */
+        unsigned prio_byte    = (unsigned)(mr3 & 0xffu);
+        unsigned affinity     = (unsigned)((mr3 >> 8) & 0xffu);
+        int rc = tm_thread_alloc(caller,
+                                  (unsigned long)mr0, (unsigned)mr1,
+                                  (unsigned long)mr2,
+                                  prio_byte, affinity,
+                                  &new_tid, &tcb_slot, &ntfn_slot);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else {
+            *out_mr0 = (seL4_Word)tcb_slot;
+            *out_mr1 = (seL4_Word)ntfn_slot;
+            *out_mr2 = (seL4_Word)new_tid;
+            reply_len = 3;
+        }
+        break;
+    }
     case TM_REQ_PING_CLIENTINFO: {
         /* Demo: exercise ConnectClientInfo from inside the dispatch
          * loop. The badge attached to this incoming message IS the
@@ -136,9 +156,6 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
 #define QSOE_STR_(x) #x
 #define QSOE_STR(x)  QSOE_STR_(x)
 #define QSOE_VSHORT  "v" QSOE_STR(QSOE_VERSION_MAJOR) "." QSOE_STR(QSOE_VERSION_MINOR)
-
-/* Single-threaded taskman in v0.x: a plain global suffices. */
-seL4_IPCBuffer *qsoe_ipcbuf;
 
 static unsigned cstrlen(const char *s)
 {
@@ -189,7 +206,6 @@ static seL4_CPtr find_largest_ram_untyped(seL4_BootInfo *bi)
 int main(seL4_BootInfo *bi)
 {
     print_banner();
-    qsoe_invoke_init(bi->ipcBuffer);
     qsoe_libqsoe_init(bi->ipcBuffer, QSOE_PID_TASKMAN);
 
     seL4_CPtr ut = find_largest_ram_untyped(bi);

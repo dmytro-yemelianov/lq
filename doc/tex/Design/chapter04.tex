@@ -359,16 +359,121 @@ first \texttt{ConnectServerInfo} or \texttt{ConnectFlags} call would
 to look up.
 
 \section{Threading}
+\label{sec:threading}
+
+\subsection{API surface (v0.4)}
 
 \begin{lstlisting}[language=C]
 int ThreadCreate(pid_t pid, void *(*func)(void *),
                  void *arg, const struct _thread_attr *attr);
 int ThreadDestroy(int tid, int priority, void *status);
+int ThreadDetach(int tid);
+int ThreadJoin(int tid, void **status);
+int ThreadCancel(int tid, void (*canstub)(void));
+int ThreadCtl(int cmd, void *data);
 \end{lstlisting}
 
-Thread creation allocates a new seL4 TCB (Thread Control Block),
-configures its scheduling parameters, and starts execution at the
-specified function.
+A thread is a seL4 TCB sharing the parent process's CSpace and VSpace.
+taskman allocates the kernel objects (TCB, IPC frame, stack frames,
+join Notification); libqsoe owns the policy: stack and IPC vaddr
+layout, per-thread state in \texttt{qsoe\_tcb\_t}, register setup,
+trampoline, join sync, deferred cancellation, and SMP affinity.
+
+\subsection{Per-thread state via TLS}
+
+The RISC-V \texttt{tp} register points at this thread's
+\texttt{qsoe\_tcb\_t}.  The crt0 of every process plants the address
+of the static \texttt{qsoe\_main\_tcb} into \texttt{tp};
+\texttt{ThreadCreate} allocates a fresh \texttt{qsoe\_tcb\_t} from a
+pool and writes its address into the new TCB's \texttt{tp} via
+\texttt{TCB\_WriteRegisters}.  The previously-global
+\texttt{qsoe\_errno} / \texttt{qsoe\_ipcbuf} / \texttt{qsoe\_self\_pid}
+are now macros that dereference \texttt{tp} --- per-thread by
+construction.
+
+\subsection{Per-process worker layout}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}llp{6cm}@{}}
+    \toprule
+    \textbf{Vaddr range} & \textbf{Owner} & \textbf{Contents} \\
+    \midrule
+    \texttt{[0, 0x10000)}            & --- & null page (unmapped) \\
+    \texttt{[0x10000, 0x20000)}      & main & ELF code/data \\
+    \texttt{[0x1FE000, 0x1FF000)}    & main & main thread's IPC buffer \\
+    \texttt{[0x1FF000, 0x200000)}    & main & main thread's initial stack \\
+    \texttt{[0x200000, 0x400000)}    & workers (L0 PT) & up to 32 worker slots \\
+    \quad slot $N$: \texttt{base = 0x200000 + (N-2)*0x10000} & tid $N \ge 2$ & 64 KiB per slot \\
+    \quad\quad \texttt{base + 0x0000..0xE000}    & & stack (56 KiB; sp $\downarrow$) \\
+    \quad\quad \texttt{base + 0xE000..0xF000}    & & pad \\
+    \quad\quad \texttt{base + 0xF000..0x10000}   & & IPC buffer \\
+    \bottomrule
+\end{tabular}
+\caption{Per-process VSpace layout (v0.4)}
+\end{table}
+
+The L0 page table for \texttt{[0x200000, 0x400000)} is lazily
+allocated by taskman on the first \texttt{ThreadCreate} of a given
+process; subsequent workers map their frames into the same L0 PT.
+
+\subsection{Trampoline and join sync}
+
+Every new thread enters \texttt{thread\_trampoline(func, arg)} (set as
+the TCB's \texttt{pc} with \texttt{a0=func}, \texttt{a1=arg}).  On
+return from \texttt{func}, the trampoline calls
+\texttt{ThreadDestroy(0, ...)} with the return value: this signals the
+per-thread join Notification (so a joiner observing the signal can
+read \texttt{exit\_status}) and \texttt{TCB\_Suspend}s the thread.
+
+\texttt{ThreadJoin} does \texttt{seL4\_Wait} on the join Notification
+and then reads the exiting thread's \texttt{exit\_status} field.
+\texttt{ThreadDetach} sets a flag that tells the trampoline to skip
+the Notification signal (no one's waiting) and that hides the slot
+from future \texttt{ThreadJoin} calls.
+
+\texttt{ThreadCancel} sets a per-thread \texttt{cancel\_pending} flag.
+Each libqsoe IPC entry point (\texttt{MsgSend}, \texttt{MsgReceive},
+\texttt{MsgReply}) polls it and, if set, calls
+\texttt{ThreadDestroy(0, 0, (void *)-1)} --- QNX's
+\texttt{PTHREAD\_CANCELED} value.  This is \emph{deferred}
+cancellation only: a thread already blocked in the kernel doesn't
+observe the cancel until it returns to userspace and hits its next
+libqsoe entry.  Asynchronous (signal-based) cancellation is v0.5+.
+
+\subsection{SMP affinity}
+
+\texttt{\_thread\_attr.runmask} is a bitmask of permitted CPUs.  In
+v0.4, libqsoe picks the lowest set bit as the thread's affinity and
+asks taskman to pin the new TCB there via
+\texttt{seL4\_TCB\_SetAffinity}.  Without this, every new TCB defaults
+to CPU 0 (the seL4 default), so all workers would pile onto hart 0
+and never see actual parallelism.
+
+Wire-protocol detail: MR3 of \texttt{TM\_REQ\_THREAD\_ALLOC} packs the
+priority in its low byte and the affinity in the next byte, so the
+single 64-bit MR carries both fields without spilling into the IPC
+buffer.
+
+\subsection{SMP locking}
+
+Worker threads on different harts can call libqsoe state-mutating
+operations (\texttt{ChannelCreate}, \texttt{ConnectAttach},
+\texttt{ThreadCreate}, \ldots) concurrently.  libqsoe's
+\texttt{state.c} therefore acquires a single per-process spinlock
+(\texttt{g\_state\_lock}) around every public function.  Lock and
+unlock compile down to a single \texttt{amoswap.w.aq} and a
+release-ordered store via the RISC-V \texttt{a} extension.
+
+Coarse-grained for v0.4; refined to per-pool locks if profiling shows
+contention.
+
+Taskman itself stays single-threaded on hart 0 in v0.4: workers
+\texttt{MsgSend} to its primary endpoint and seL4 serialises the
+deliveries at the kernel level, so taskman's dispatch loop sees one
+request at a time.  Multi-threaded taskman is v0.5+, alongside the
+first resource manager.
 
 \section{Relationship to musl libc}
 

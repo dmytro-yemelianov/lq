@@ -19,6 +19,7 @@
 static tm_channel_t    g_channels[TM_MAX_CHANNELS];
 static tm_connection_t g_connections[TM_MAX_CONNECTIONS];
 static tm_process_t    g_processes[TM_MAX_PROCESSES];
+static tm_thread_t     g_threads[TM_MAX_THREADS];
 
 /* Shared with spawn.c — kept non-static for v0.3.0 simplicity; v0.4
  * wraps these in a proper accessor API. */
@@ -42,12 +43,14 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     s_next_slot  = first_free;
 
     /* Register taskman itself as pid 1. */
-    g_processes[0].in_use    = 1;
-    g_processes[0].pid       = QSOE_PID_TASKMAN;
-    g_processes[0].cnode     = cnode_root;
-    g_processes[0].next_slot = first_free;  /* shares s_next_slot's view */
-    g_processes[0].tcb       = seL4_CapInitThreadTCB;
-    g_processes[0].vspace    = seL4_CapInitThreadVSpace;
+    g_processes[0].in_use       = 1;
+    g_processes[0].pid          = QSOE_PID_TASKMAN;
+    g_processes[0].cnode        = cnode_root;
+    g_processes[0].next_slot    = first_free;  /* shares s_next_slot's view */
+    g_processes[0].tcb          = seL4_CapInitThreadTCB;
+    g_processes[0].vspace       = seL4_CapInitThreadVSpace;
+    g_processes[0].workers_l0_pt = 0;
+    g_processes[0].next_tid     = 2;
 }
 
 int tm_process_register(pid_t pid, seL4_CPtr cnode,
@@ -57,12 +60,14 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
     if (tm_process_lookup(pid)) return -EINVAL;
     for (int i = 0; i < TM_MAX_PROCESSES; ++i) {
         if (g_processes[i].in_use) continue;
-        g_processes[i].in_use    = 1;
-        g_processes[i].pid       = pid;
-        g_processes[i].cnode     = cnode;
-        g_processes[i].next_slot = first_free_slot;
-        g_processes[i].tcb       = tcb;
-        g_processes[i].vspace    = vspace;
+        g_processes[i].in_use        = 1;
+        g_processes[i].pid           = pid;
+        g_processes[i].cnode         = cnode;
+        g_processes[i].next_slot     = first_free_slot;
+        g_processes[i].tcb           = tcb;
+        g_processes[i].vspace        = vspace;
+        g_processes[i].workers_l0_pt = 0;
+        g_processes[i].next_tid      = 2;  /* main thread is tid 1 */
         return 0;
     }
     return -ENOMEM;
@@ -366,5 +371,129 @@ int tm_connect_flags(pid_t caller_pid, seL4_CPtr client_slot,
         cn->flags = (old & ~mask) | (bits & mask);
     }
     *out_old = old;
+    return 0;
+}
+
+/* ----------- v0.4 thread allocator ----------- */
+
+static int thread_alloc_slot_idx(void)
+{
+    for (int i = 0; i < TM_MAX_THREADS; ++i) {
+        if (!g_threads[i].in_use) return i;
+    }
+    return -1;
+}
+
+/* Ensure the caller's VSpace has an L0 page table covering the worker
+ * thread region [0x200000, 0x400000). Allocated once per process on
+ * the first ThreadCreate. */
+static int ensure_workers_l0_pt(tm_process_t *p)
+{
+    if (p->workers_l0_pt) return 0;
+    seL4_CPtr pt = taskman_alloc_and_retype(seL4_RISCV_PageTableObject, 0);
+    if (!pt) return -ENOMEM;
+    seL4_Word err = qsoe_riscv_pagetable_map(pt, p->vspace,
+                                              0x200000UL,
+                                              QSOE_VM_ATTR_DEFAULT);
+    if (err) return -ENOMEM;
+    p->workers_l0_pt = pt;
+    return 0;
+}
+
+int tm_thread_alloc(pid_t caller_pid,
+                    unsigned long stack_top_vaddr, unsigned stack_pages,
+                    unsigned long ipc_vaddr,
+                    unsigned prio, unsigned affinity,
+                    int *out_tid,
+                    seL4_CPtr *out_tcb_slot,
+                    seL4_CPtr *out_ntfn_slot)
+{
+    if (caller_pid == QSOE_PID_TASKMAN) {
+        /* taskman is single-threaded in v0.4; ThreadCreate inside
+         * taskman is unimplemented. */
+        return -ENOSYS;
+    }
+    tm_process_t *p = tm_process_lookup(caller_pid);
+    if (!p) return -ESRCH;
+    if (p->next_tid >= TM_MAX_TID_PER_PROC + 1) return -ENOMEM;
+    if (stack_pages == 0 || stack_pages > 16) return -EINVAL;
+
+    int gidx = thread_alloc_slot_idx();
+    if (gidx < 0) return -ENOMEM;
+
+    int new_tid = p->next_tid++;
+
+    /* Make sure the page-table tree covers [0x200000, 0x400000). */
+    int pterr = ensure_workers_l0_pt(p);
+    if (pterr) return pterr;
+
+    /* Allocate kernel objects (master caps in taskman's CSpace). */
+    seL4_CPtr tcb       = taskman_alloc_and_retype(seL4_TCBObject, 0);
+    if (!tcb) return -ENOMEM;
+    seL4_CPtr ntfn      = taskman_alloc_and_retype(seL4_NotificationObject, 0);
+    if (!ntfn) return -ENOMEM;
+    seL4_CPtr ipc_frame = taskman_alloc_and_retype(seL4_RISCV_4K_Page, 0);
+    if (!ipc_frame) return -ENOMEM;
+
+    /* Map IPC buffer into caller's VSpace. */
+    seL4_Word err = qsoe_riscv_page_map(ipc_frame, p->vspace, ipc_vaddr,
+                                         QSOE_RIGHTS_ALL,
+                                         QSOE_VM_ATTR_DEFAULT);
+    if (err) return -ENOMEM;
+
+    /* Map stack frames. Stack grows down — frame i covers vaddr
+     * [stack_top - (i+1)*4K, stack_top - i*4K). The frames are leaked
+     * on destroy in v0.4 (v0.4.1+ records them for cleanup). */
+    for (unsigned i = 0; i < stack_pages; ++i) {
+        seL4_CPtr f = taskman_alloc_and_retype(seL4_RISCV_4K_Page, 0);
+        if (!f) return -ENOMEM;
+        unsigned long va = stack_top_vaddr - (unsigned long)(i + 1) * 4096UL;
+        err = qsoe_riscv_page_map(f, p->vspace, va,
+                                   QSOE_RIGHTS_ALL,
+                                   QSOE_VM_ATTR_DEFAULT);
+        if (err) return -ENOMEM;
+    }
+
+    /* Configure the TCB. The new thread shares the caller's CSpace
+     * (guard 52, 12-bit radix) and VSpace, exactly as the caller's
+     * main thread was configured at spawn time. */
+    err = qsoe_tcb_configure(tcb, 0 /*fault_ep*/,
+                              p->cnode, 52UL,
+                              p->vspace, 0,
+                              ipc_vaddr, ipc_frame);
+    if (err) return -ENOMEM;
+
+    err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB, prio);
+    if (err) return -ENOMEM;
+
+    /* Pin the new TCB to the requested CPU. seL4 defaults new TCBs to
+     * CPU 0; without SetAffinity every worker piles onto hart 0. */
+    err = qsoe_tcb_set_affinity(tcb, affinity);
+    if (err) return -ENOMEM;
+
+    /* Copy TCB and Notification caps into the caller's CSpace so the
+     * caller can WriteRegisters / Resume / Signal / Wait on them. */
+    seL4_CPtr child_tcb_slot  = tm_process_alloc_slot(caller_pid);
+    seL4_CPtr child_ntfn_slot = tm_process_alloc_slot(caller_pid);
+    seL4_Uint8 ddepth = cnode_depth_for(caller_pid);
+
+    if (qsoe_cnode_copy(p->cnode, child_tcb_slot, ddepth,
+                        s_cnode_root, tcb, TM_DEPTH_TASKMAN,
+                        QSOE_RIGHTS_ALL) != 0) return -ENOMEM;
+    if (qsoe_cnode_copy(p->cnode, child_ntfn_slot, ddepth,
+                        s_cnode_root, ntfn, TM_DEPTH_TASKMAN,
+                        QSOE_RIGHTS_ALL) != 0) return -ENOMEM;
+
+    g_threads[gidx].in_use         = 1;
+    g_threads[gidx].pid            = caller_pid;
+    g_threads[gidx].tid            = new_tid;
+    g_threads[gidx].tcb_master     = tcb;
+    g_threads[gidx].ntfn_master    = ntfn;
+    g_threads[gidx].tcb_in_caller  = child_tcb_slot;
+    g_threads[gidx].ntfn_in_caller = child_ntfn_slot;
+
+    *out_tid       = new_tid;
+    *out_tcb_slot  = child_tcb_slot;
+    *out_ntfn_slot = child_ntfn_slot;
     return 0;
 }

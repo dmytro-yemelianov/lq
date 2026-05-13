@@ -39,6 +39,7 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 /* Object size bits — for retype size_bits argument. */
 #define seL4_TCBBits             10  /* TCB is 2^10 = 1024 bytes (non-MCS) */
 #define seL4_EndpointBits         4
+#define seL4_NotificationBits     5  /* notification_t is 2^5 = 32 bytes (non-MCS) */
 #define seL4_PageBits            12  /* 4 KiB */
 #define seL4_PageTableBits       12  /* one PT level on Sv39 */
 #define seL4_VSpaceBits          seL4_PageTableBits
@@ -67,8 +68,9 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 #define INV_TCBWriteRegisters        3
 #define INV_TCBConfigure             5   /* non-MCS variant */
 #define INV_TCBSetPriority           6
-#define INV_TCBSetAffinity          15   /* SMP-only — v0.4 uses */
+#define INV_TCBSuspend              11
 #define INV_TCBResume               12
+#define INV_TCBSetAffinity          15   /* SMP-only — v0.4 uses */
 #define INV_CNodeRevoke             18
 #define INV_CNodeDelete             19
 #define INV_CNodeCopy               21

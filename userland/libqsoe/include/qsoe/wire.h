@@ -19,6 +19,9 @@ enum {
     TM_REQ_CONNECT_SERVER_INFO  = 0x05,
     TM_REQ_CONNECT_CLIENT_INFO  = 0x06,
     TM_REQ_CONNECT_FLAGS        = 0x07,
+    /* v0.4 */
+    TM_REQ_THREAD_ALLOC         = 0x08,
+    TM_REQ_THREAD_DESTROY       = 0x09,
     /* Demo / smoke-test label used by tester to trigger taskman's
      * server-side ConnectClientInfo print. Echoes MR0+1 like the
      * default v0.3.2 echo, but additionally fills MR1 with the

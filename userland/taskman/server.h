@@ -19,6 +19,8 @@
 #define TM_MAX_CHANNELS    64
 #define TM_MAX_CONNECTIONS 256
 #define TM_MAX_PROCESSES    8
+#define TM_MAX_THREADS    256   /* across all processes */
+#define TM_MAX_TID_PER_PROC 32  /* matches libqsoe's thread pool size */
 
 typedef struct {
     int       in_use;
@@ -27,7 +29,23 @@ typedef struct {
     seL4_CPtr next_slot;    /* next free slot in caller's CSpace */
     seL4_CPtr tcb;          /* (kept for v0.4 cleanup; unused in v0.3.x) */
     seL4_CPtr vspace;
+    /* v0.4: lazily-allocated L0 page table covering [0x200000, 0x400000)
+     * for this process's worker threads. 0 until first ThreadCreate. */
+    seL4_CPtr workers_l0_pt;
+    int       next_tid;     /* next free tid for this process (starts at 2) */
 } tm_process_t;
+
+/* v0.4: per-thread registry entry. Master caps live in taskman's CSpace
+ * so destroy/exit can revoke; the child gets copies via CNode_Copy. */
+typedef struct {
+    int       in_use;
+    pid_t     pid;
+    int       tid;
+    seL4_CPtr tcb_master;       /* taskman-side TCB cap */
+    seL4_CPtr ntfn_master;      /* taskman-side join Notification */
+    seL4_CPtr tcb_in_caller;    /* slot the child got the TCB cap in */
+    seL4_CPtr ntfn_in_caller;   /* slot the child got the Notification cap in */
+} tm_thread_t;
 
 typedef struct {
     int       in_use;
@@ -113,5 +131,29 @@ int tm_connect_client_info(seL4_Word scoid,
 int tm_connect_flags(pid_t caller_pid, seL4_CPtr client_slot,
                      unsigned mask, unsigned bits,
                      unsigned *out_old);
+
+/* ----------- v0.4 thread allocator ----------- */
+
+/* tm_thread_alloc — retype TCB + Notification + IPC frame + N stack frames,
+ * map IPC and stack into the caller's VSpace, configure the TCB (same
+ * CSpace+VSpace as the caller), copy TCB and Notification caps into the
+ * caller's CSpace at fresh slots. The caller will WriteRegisters + Resume
+ * itself.
+ *
+ *   stack_top_vaddr — top of stack range (sp starts here). Must be
+ *                     page-aligned. Stack range is
+ *                     [stack_top - stack_pages*4K, stack_top).
+ *   ipc_vaddr       — where to map the IPC buffer page (page-aligned).
+ *   prio            — initial priority (0..255).
+ *
+ * Returns 0 on success and fills *out_tid (assigned by taskman),
+ * *out_tcb_slot, *out_ntfn_slot (slots in caller's CSpace). */
+int tm_thread_alloc(pid_t caller_pid,
+                    unsigned long stack_top_vaddr, unsigned stack_pages,
+                    unsigned long ipc_vaddr,
+                    unsigned prio, unsigned affinity,
+                    int *out_tid,
+                    seL4_CPtr *out_tcb_slot,
+                    seL4_CPtr *out_ntfn_slot);
 
 #endif /* QSOE_TASKMAN_SERVER_H */
