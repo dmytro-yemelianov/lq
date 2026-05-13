@@ -20,7 +20,7 @@
 
 int ChannelCreate(unsigned flags)
 {
-    int chid = qsoe_state_alloc_chid();
+    int chid = qsoe_state_alloc_chid(flags);
     if (chid < 0) { qsoe_errno = ENOMEM; return -1; }
 
 #ifdef QSOE_LIBQSOE_IN_TASKMAN

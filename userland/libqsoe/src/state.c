@@ -1,23 +1,43 @@
 /*
  * libqsoe/src/state.c — per-process chid and coid bookkeeping.
  *
- * Flat arrays for v0.x. chid/coid are 1-based handles. Slot value 0
- * means "free", QSOE_SLOT_RESERVED means "allocated but not yet bound
- * to a real slot", anything else is a live cap slot.
+ * v0.3.3: split each pool into an FD-range table (1..N) and a
+ * side-channel table indexed by (handle & ~QSOE_SIDE_CHANNEL).
  */
 
 #include "state.h"
 
-static unsigned long g_chid_slot[QSOE_MAX_CHANNELS];
-static unsigned long g_coid_slot[QSOE_MAX_CONNECTIONS];
+static unsigned long g_fd_chid_slot   [QSOE_MAX_FD_CHANNELS];
+static unsigned long g_side_chid_slot [QSOE_MAX_SIDE_CHANNELS];
+static unsigned long g_fd_coid_slot   [QSOE_MAX_FD_CONNECTIONS];
+static unsigned long g_side_coid_slot [QSOE_MAX_SIDE_CONNECTIONS];
 
 int qsoe_errno;
+pid_t qsoe_self_pid;
 
-int qsoe_state_alloc_chid(void)
+static inline int is_side(int handle) {
+    return ((unsigned)handle & QSOE_SIDE_CHANNEL) != 0;
+}
+static inline int side_index(int handle) {
+    return (int)((unsigned)handle & ~QSOE_SIDE_CHANNEL);
+}
+
+/* ---------------- chid ---------------- */
+
+int qsoe_state_alloc_chid(unsigned flags)
 {
-    for (int i = 1; i < QSOE_MAX_CHANNELS; ++i) {
-        if (g_chid_slot[i] == 0) {
-            g_chid_slot[i] = QSOE_SLOT_RESERVED;
+    if (flags & QSOE_SIDE_CHANNEL) {
+        for (int i = 0; i < QSOE_MAX_SIDE_CHANNELS; ++i) {
+            if (g_side_chid_slot[i] == 0) {
+                g_side_chid_slot[i] = QSOE_SLOT_RESERVED;
+                return (int)(QSOE_SIDE_CHANNEL | (unsigned)i);
+            }
+        }
+        return -1;
+    }
+    for (int i = 1; i < QSOE_MAX_FD_CHANNELS; ++i) {
+        if (g_fd_chid_slot[i] == 0) {
+            g_fd_chid_slot[i] = QSOE_SLOT_RESERVED;
             return i;
         }
     }
@@ -26,21 +46,42 @@ int qsoe_state_alloc_chid(void)
 
 void qsoe_state_bind_chid(int chid, unsigned long slot)
 {
-    if (chid >= 1 && chid < QSOE_MAX_CHANNELS) g_chid_slot[chid] = slot;
+    if (is_side(chid)) {
+        int i = side_index(chid);
+        if (i >= 0 && i < QSOE_MAX_SIDE_CHANNELS) g_side_chid_slot[i] = slot;
+    } else {
+        if (chid >= 1 && chid < QSOE_MAX_FD_CHANNELS) g_fd_chid_slot[chid] = slot;
+    }
 }
 
 unsigned long qsoe_state_chid_to_slot(int chid)
 {
-    if (chid < 1 || chid >= QSOE_MAX_CHANNELS) return 0;
-    unsigned long s = g_chid_slot[chid];
+    unsigned long s = 0;
+    if (is_side(chid)) {
+        int i = side_index(chid);
+        if (i >= 0 && i < QSOE_MAX_SIDE_CHANNELS) s = g_side_chid_slot[i];
+    } else {
+        if (chid >= 1 && chid < QSOE_MAX_FD_CHANNELS) s = g_fd_chid_slot[chid];
+    }
     return (s == QSOE_SLOT_RESERVED) ? 0 : s;
 }
 
-int qsoe_state_alloc_coid(void)
+/* ---------------- coid ---------------- */
+
+int qsoe_state_alloc_coid(unsigned flags)
 {
-    for (int i = 1; i < QSOE_MAX_CONNECTIONS; ++i) {
-        if (g_coid_slot[i] == 0) {
-            g_coid_slot[i] = QSOE_SLOT_RESERVED;
+    if (flags & QSOE_SIDE_CHANNEL) {
+        for (int i = 0; i < QSOE_MAX_SIDE_CONNECTIONS; ++i) {
+            if (g_side_coid_slot[i] == 0) {
+                g_side_coid_slot[i] = QSOE_SLOT_RESERVED;
+                return (int)(QSOE_SIDE_CHANNEL | (unsigned)i);
+            }
+        }
+        return -1;
+    }
+    for (int i = 1; i < QSOE_MAX_FD_CONNECTIONS; ++i) {
+        if (g_fd_coid_slot[i] == 0) {
+            g_fd_coid_slot[i] = QSOE_SLOT_RESERVED;
             return i;
         }
     }
@@ -49,12 +90,22 @@ int qsoe_state_alloc_coid(void)
 
 void qsoe_state_bind_coid(int coid, unsigned long slot)
 {
-    if (coid >= 1 && coid < QSOE_MAX_CONNECTIONS) g_coid_slot[coid] = slot;
+    if (is_side(coid)) {
+        int i = side_index(coid);
+        if (i >= 0 && i < QSOE_MAX_SIDE_CONNECTIONS) g_side_coid_slot[i] = slot;
+    } else {
+        if (coid >= 1 && coid < QSOE_MAX_FD_CONNECTIONS) g_fd_coid_slot[coid] = slot;
+    }
 }
 
 unsigned long qsoe_state_coid_to_slot(int coid)
 {
-    if (coid < 1 || coid >= QSOE_MAX_CONNECTIONS) return 0;
-    unsigned long s = g_coid_slot[coid];
+    unsigned long s = 0;
+    if (is_side(coid)) {
+        int i = side_index(coid);
+        if (i >= 0 && i < QSOE_MAX_SIDE_CONNECTIONS) s = g_side_coid_slot[i];
+    } else {
+        if (coid >= 1 && coid < QSOE_MAX_FD_CONNECTIONS) s = g_fd_coid_slot[coid];
+    }
     return (s == QSOE_SLOT_RESERVED) ? 0 : s;
 }

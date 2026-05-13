@@ -166,8 +166,9 @@ introduced by Chapter~\ref{chap:libqsoe}'s four core functions.
     Server's recv cap for its own channel         & libqsoe & derived copy in process CSpace \\
     $chid \to$ recv-cap slot table                & libqsoe & per-process; chid is an opaque handle \\
     $coid \to$ send-cap slot table                & libqsoe & per-process; coid is an opaque handle \\
-    Next free chid / coid counter                 & libqsoe & monotonic, per process \\
-    Process table $pid \to$ TCB/VSpace/CSpace     & taskman & populated by future \texttt{ProcessCreate} \\
+    Next free chid / coid counter                 & libqsoe & two pools per type --- FD and side-channel (see \S\ref{sec:coid-namespace}) \\
+    Process table $pid \to$ TCB/VSpace/CSpace     & taskman & populated by \texttt{tm\_spawn} (v0.3) or future \texttt{ProcessCreate} \\
+    Per-connection flags (\texttt{COF\_CLOEXEC}, \ldots) & taskman & mutated by \texttt{ConnectFlags}; read by exec/exit cleanup (v0.4+) \\
     \bottomrule
 \end{tabular}
 \caption{State ownership for the core IPC functions}
@@ -189,6 +190,88 @@ Two consequences are worth highlighting:
           single-call operations rather than searches.
 \end{enumerate}
 
+\section{The coid namespace and SYSMGR\_COID}
+\label{sec:coid-namespace}
+
+In QNX, the integer returned by \texttt{open()} is the same value as
+the \emph{connection-id} (\emph{coid}) the kernel uses for IPC.  In
+other words, \texttt{fd} and \texttt{coid} share a single per-process
+namespace.  Standard fds 0/1/2 (stdin/stdout/stderr) are coids 0/1/2;
+\texttt{read(fd, ...)} is internally a \texttt{MsgSend(coid, ...)} with
+an IO-protocol header.  This is a feature, not a coincidence: the same
+code path serves both ``send a message'' and ``read from a file''.
+
+The QNX-style design therefore needs a way to make the implicit
+connection to the system process (\texttt{taskman}) coexist with the
+FD namespace without colliding with stdio.  QNX solves this by
+allocating that connection out of a separate \emph{side-channel}
+sub-namespace, marked by bit~30 of the coid:
+
+\begin{quote}
+\texttt{QSOE\_SIDE\_CHANNEL} $= 0x4000{,}0000$ \quad
+\texttt{SYSMGR\_COID} $= $ \texttt{QSOE\_SIDE\_CHANNEL}
+\end{quote}
+
+Every QSOE process is born with this pre-bound side-channel coid;
+\texttt{spawn.c} mints the underlying Send capability into the child's
+\texttt{QSOE\_CAP\_TASKMAN\_EP} slot (CSpace slot 1, badged with the
+child's pid) and the libqsoe init hook records the slot in the
+side-coid pool at index 0.  No explicit \texttt{ConnectAttach} is
+required to talk to taskman --- the connection is part of the process's
+birth certificate.
+
+libqsoe maintains two disjoint pools for each of $chid$ and $coid$:
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Pool}                & \textbf{Value range}                        & \textbf{Use} \\
+    \midrule
+    FD-range chid                & $1 \ldots N_{\mathrm{ch}}-1$                & user-allocated channels (\texttt{ChannelCreate}) \\
+    Side-channel chid            & \texttt{QSOE\_SIDE\_CHANNEL} $|\, i$         & library-internal channels (timers, signals) \\
+    FD-range coid                & $1 \ldots N_{\mathrm{co}}-1$                & shares namespace with future libc file descriptors \\
+    Side-channel coid            & \texttt{QSOE\_SIDE\_CHANNEL} $|\, i$         & SYSMGR\_COID (index 0) + future library connections \\
+    \bottomrule
+\end{tabular}
+\caption{The four libqsoe handle pools (v0.3.3)}
+\label{tab:pools}
+\end{table}
+
+The pool is selected at allocation time by inspecting bit~30 of the
+\texttt{flags} argument: \texttt{ChannelCreate(QSOE\_SIDE\_CHANNEL)} or
+\texttt{ConnectAttach(... flags=QSOE\_SIDE\_CHANNEL)} returns a
+side-channel handle; flag~0 returns an FD-range handle.
+
+\subsection{Connection introspection}
+\label{sec:connect-info}
+
+Three QNX-compatible calls expose connection state:
+
+\begin{itemize}
+    \item \texttt{ConnectServerInfo(pid, coid, *info)} --- client side:
+          fills \emph{server's} pid/chid/scoid for the connection.
+    \item \texttt{ConnectClientInfo(scoid, *info, ngroups)} --- server
+          side: fills \emph{client's} pid (and uid/gid/sid stubs).
+          The \texttt{scoid} the server passes is the value
+          \texttt{MsgReceive} wrote into \texttt{info->scoid} for that
+          message.
+    \item \texttt{ConnectFlags(pid, coid, mask, bits)} --- atomic flag
+          mutation on a connection (\texttt{COF\_CLOEXEC},
+          \texttt{COF\_NONBLOCK}, \ldots).  Returns the previous value;
+          \texttt{mask==0} performs a pure query.
+\end{itemize}
+
+In v0.3.3, \texttt{scoid} is defined to equal the seL4 \emph{badge}
+that taskman minted for the connection: a one-to-one mapping with the
+connection registry.  Once QSOE has multiple server processes (v0.4+),
+each server will get its own scoid namespace and an explicit
+badge$\to$scoid translation table.  The \texttt{pid} argument of
+\texttt{ConnectServerInfo} and \texttt{ConnectFlags} must currently be
+0 (caller's own process) or \texttt{qsoe\_self\_pid}; any other value
+returns \texttt{ENOSYS}.
+
 \section{Wire protocol}
 \label{sec:wire-protocol}
 
@@ -205,10 +288,13 @@ errno-style code for failure.
     \toprule
     \textbf{Request}      & \textbf{Label} & \textbf{MR0} & \textbf{MR1} & \textbf{MR2} & \textbf{MR3} & \textbf{Reply MR0} \\
     \midrule
-    \texttt{CHANNEL\_CREATE}  & 0x01 & chid           & flags   & ---     & --- & recv slot \\
-    \texttt{CHANNEL\_DESTROY} & 0x02 & recv slot      & ---     & ---     & --- & ---       \\
-    \texttt{CONNECT\_ATTACH}  & 0x03 & target pid     & chid    & flags   & --- & send slot \\
-    \texttt{CONNECT\_DETACH}  & 0x04 & send slot      & ---     & ---     & --- & ---       \\
+    \texttt{CHANNEL\_CREATE}        & 0x01 & chid           & flags   & ---     & --- & recv slot \\
+    \texttt{CHANNEL\_DESTROY}       & 0x02 & recv slot      & ---     & ---     & --- & ---       \\
+    \texttt{CONNECT\_ATTACH}        & 0x03 & target pid     & chid    & flags   & --- & send slot \\
+    \texttt{CONNECT\_DETACH}        & 0x04 & send slot      & ---     & ---     & --- & ---       \\
+    \texttt{CONNECT\_SERVER\_INFO}  & 0x05 & send slot      & ---     & ---     & --- & server pid; MR1: chid; MR2: scoid \\
+    \texttt{CONNECT\_CLIENT\_INFO}  & 0x06 & scoid          & ---     & ---     & --- & client pid; MR1: sid; MR2: flags \\
+    \texttt{CONNECT\_FLAGS}         & 0x07 & send slot      & mask    & bits    & --- & previous flags \\
     \bottomrule
 \end{tabular}
 \caption{libqsoe$\leftrightarrow$taskman wire format (v0.x)}
@@ -262,6 +348,15 @@ initial root-task CNode from \texttt{seL4\_BootInfo}, populated
 according to seL4's conventions rather than QSOE's.  Taskman maintains
 its own internal mapping from QSOE slot semantics to the actual
 BootInfo slot numbers.
+
+When \texttt{tm\_spawn} mints \texttt{QSOE\_CAP\_TASKMAN\_EP} into a
+new child's slot 1, it also registers a connection record in taskman's
+connection registry, keyed by (\texttt{client\_pid}, slot 1)
+and badged with the child's pid.  Without this record, the child's
+first \texttt{ConnectServerInfo} or \texttt{ConnectFlags} call would
+\texttt{EBADF}: SYSMGR\_COID is established by minting, not by
+\texttt{ConnectAttach}, so the registry would otherwise have nothing
+to look up.
 
 \section{Threading}
 

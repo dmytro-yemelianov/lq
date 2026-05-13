@@ -289,6 +289,24 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         return reg_err;
     }
 
+    /* 8b. Register the connection record for the SYSMGR_COID cap we
+     *     minted in step 5. The badge we used was `pid` itself, so the
+     *     server-side ConnectClientInfo(scoid==pid) will resolve to
+     *     this connection. Without this record, ConnectServerInfo /
+     *     ConnectFlags on SYSMGR_COID would EBADF in the child. */
+    int primary_idx = tm_channel_index(QSOE_PID_TASKMAN, SYSMGR_CHID);
+    if (primary_idx < 0) {
+        sel4_debug_puts("spawn: primary channel not registered yet\n");
+        return -EINVAL;
+    }
+    int cnreg = tm_connection_register_existing(pid, QSOE_CAP_TASKMAN_EP,
+                                                primary_idx,
+                                                (seL4_Word)pid, 0);
+    if (cnreg) {
+        sel4_debug_puts("spawn: tm_connection_register_existing failed\n");
+        return cnreg;
+    }
+
     /* 9. Liftoff. */
     err = qsoe_tcb_resume(tcb);
     if (err) { sel4_debug_puts("spawn: TCB_Resume failed\n"); return -ENOMEM; }

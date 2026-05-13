@@ -23,12 +23,13 @@ extern char _userland_cpio_start[];
 extern char _userland_cpio_end[];
 
 /* Dispatch one incoming message. Inputs: the request's badge + MRs.
- * Outputs: the reply tag and the reply MRs (the first 1-2 of which
- * may carry returned slots, etc.). */
+ * Outputs: the reply tag and the reply MRs (up to 4 — most calls only
+ * fill 0 or 1; the introspection calls fill up to 3). */
 static seL4_MessageInfo_t
 tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3,
-            seL4_Word *out_mr0, seL4_Word *out_mr1)
+            seL4_Word *out_mr0, seL4_Word *out_mr1,
+            seL4_Word *out_mr2, seL4_Word *out_mr3)
 {
     (void)mr3;
     pid_t caller = (pid_t)badge;
@@ -37,6 +38,8 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     seL4_Word reply_len = 0;
     *out_mr0 = 0;
     *out_mr1 = 0;
+    *out_mr2 = 0;
+    *out_mr3 = 0;
 
     switch (label) {
     case TM_REQ_CHANNEL_CREATE: {
@@ -69,6 +72,55 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         seL4_CPtr send_slot = (seL4_CPtr)mr0;
         int rc = tm_connect_detach(caller, send_slot);
         if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_CONNECT_SERVER_INFO: {
+        pid_t server_pid = 0;
+        int server_chid = 0;
+        seL4_Word scoid = 0;
+        int rc = tm_connect_server_info(caller, (seL4_CPtr)mr0,
+                                         &server_pid, &server_chid, &scoid);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else {
+            *out_mr0 = (seL4_Word)server_pid;
+            *out_mr1 = (seL4_Word)server_chid;
+            *out_mr2 = scoid;
+            reply_len = 3;
+        }
+        break;
+    }
+    case TM_REQ_CONNECT_CLIENT_INFO: {
+        pid_t client_pid = 0, sid = 0;
+        unsigned cflags = 0;
+        int rc = tm_connect_client_info((seL4_Word)mr0,
+                                         &client_pid, &sid, &cflags);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else {
+            *out_mr0 = (seL4_Word)client_pid;
+            *out_mr1 = (seL4_Word)sid;
+            *out_mr2 = (seL4_Word)cflags;
+            reply_len = 3;
+        }
+        break;
+    }
+    case TM_REQ_CONNECT_FLAGS: {
+        unsigned old = 0;
+        int rc = tm_connect_flags(caller, (seL4_CPtr)mr0,
+                                   (unsigned)mr1, (unsigned)mr2, &old);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else    { *out_mr0 = (seL4_Word)old; reply_len = 1; }
+        break;
+    }
+    case TM_REQ_PING_CLIENTINFO: {
+        /* Demo: exercise ConnectClientInfo from inside the dispatch
+         * loop. The badge attached to this incoming message IS the
+         * scoid of the calling connection. We return the client's
+         * pid in MR1 alongside the usual +1 echo in MR0. */
+        struct _client_info ci;
+        int rc = ConnectClientInfo((int)badge, &ci, 0);
+        *out_mr0 = mr0 + 1;
+        *out_mr1 = (rc == 0) ? (seL4_Word)ci.pid : (seL4_Word)-1;
+        reply_len = 2;
         break;
     }
     default:
@@ -138,6 +190,7 @@ int main(seL4_BootInfo *bi)
 {
     print_banner();
     qsoe_invoke_init(bi->ipcBuffer);
+    qsoe_libqsoe_init(bi->ipcBuffer, QSOE_PID_TASKMAN);
 
     seL4_CPtr ut = find_largest_ram_untyped(bi);
     if (ut == 0) {
@@ -199,13 +252,11 @@ int main(seL4_BootInfo *bi)
     seL4_MessageInfo_t info = qsoe_sys_recv(primary_ep, &badge,
                                              &mr0, &mr1, &mr2, &mr3);
     for (;;) {
-        seL4_Word reply_mr0, reply_mr1;
+        seL4_Word r0, r1, r2, r3;
         seL4_MessageInfo_t reply_info = tm_dispatch(info, badge,
                                                      mr0, mr1, mr2, mr3,
-                                                     &reply_mr0, &reply_mr1);
-        mr0 = reply_mr0;
-        mr1 = reply_mr1;
-        mr2 = 0; mr3 = 0;
+                                                     &r0, &r1, &r2, &r3);
+        mr0 = r0; mr1 = r1; mr2 = r2; mr3 = r3;
         info = qsoe_sys_reply_recv(primary_ep, reply_info, &badge,
                                     &mr0, &mr1, &mr2, &mr3);
     }

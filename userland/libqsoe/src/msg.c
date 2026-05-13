@@ -36,10 +36,22 @@
  * qsoe_ipcbuf in the process's libqsoe init hook (added below). */
 
 /* The libqsoe init hook gets called from each process's crt0 / first
- * libqsoe call. Idempotent. */
-void qsoe_libqsoe_init(seL4_IPCBuffer *buf)
+ * libqsoe call. Idempotent.
+ *
+ *   buf       — IPC buffer the kernel mapped for this thread.
+ *   self_pid  — what spawn.c passed in a0 (taskman: QSOE_PID_TASKMAN).
+ *
+ * For non-taskman processes this also pre-binds SYSMGR_COID to
+ * QSOE_CAP_TASKMAN_EP. spawn.c minted the cap into that CSpace slot at
+ * spawn time, so the connection is already live — we just teach
+ * libqsoe's coid table about it. */
+void qsoe_libqsoe_init(void *ipcbuf, pid_t self_pid)
 {
-    qsoe_ipcbuf = buf;
+    qsoe_ipcbuf = (seL4_IPCBuffer *)ipcbuf;
+    qsoe_self_pid = self_pid;
+    if (self_pid != QSOE_PID_TASKMAN) {
+        qsoe_state_bind_coid(SYSMGR_COID, QSOE_CAP_TASKMAN_EP);
+    }
 }
 
 /* IPC-buffer byte capacity: 120 words × 8 bytes. */

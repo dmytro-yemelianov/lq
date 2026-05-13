@@ -137,6 +137,59 @@ int tm_channel_register_existing(pid_t pid, int chid,
     return 0;
 }
 
+int tm_channel_index(pid_t pid, int chid)
+{
+    tm_channel_t *c = channel_find(pid, chid);
+    return c ? (int)(c - g_channels) : -1;
+}
+
+int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
+                                    int channel_idx, seL4_Word badge,
+                                    unsigned flags)
+{
+    if (channel_idx < 0 || channel_idx >= TM_MAX_CHANNELS) return -EINVAL;
+    if (!g_channels[channel_idx].in_use) return -EINVAL;
+    for (int i = 0; i < TM_MAX_CONNECTIONS; ++i) {
+        if (g_connections[i].in_use) continue;
+        g_connections[i].in_use      = 1;
+        g_connections[i].channel_idx = channel_idx;
+        g_connections[i].badge       = badge;
+        g_connections[i].client_pid  = client_pid;
+        g_connections[i].client_slot = client_slot;
+        g_connections[i].flags       = flags;
+        return 0;
+    }
+    return -ENOMEM;
+}
+
+/* Find a connection by (client_pid, client_slot). Returns 0 if not
+ * found. Used by ConnectServerInfo and ConnectFlags. */
+static tm_connection_t *
+connection_find_by_slot(pid_t client_pid, seL4_CPtr client_slot)
+{
+    for (int i = 0; i < TM_MAX_CONNECTIONS; ++i) {
+        tm_connection_t *cn = &g_connections[i];
+        if (cn->in_use &&
+            cn->client_pid  == client_pid &&
+            cn->client_slot == client_slot) {
+            return cn;
+        }
+    }
+    return 0;
+}
+
+/* Find a connection by badge (server-side view). scoid == badge in
+ * v0.3.3. Used by ConnectClientInfo. */
+static tm_connection_t *
+connection_find_by_badge(seL4_Word badge)
+{
+    for (int i = 0; i < TM_MAX_CONNECTIONS; ++i) {
+        tm_connection_t *cn = &g_connections[i];
+        if (cn->in_use && cn->badge == badge) return cn;
+    }
+    return 0;
+}
+
 static int channel_alloc_slot_idx(void)
 {
     for (int i = 0; i < TM_MAX_CHANNELS; ++i) {
@@ -220,7 +273,6 @@ int tm_channel_destroy(pid_t owner_pid, seL4_CPtr recv_slot)
 int tm_connect_attach(pid_t client_pid, pid_t target_pid, int target_chid,
                       unsigned flags, seL4_CPtr *out_send_slot)
 {
-    (void)flags;
     tm_process_t *client = tm_process_lookup(client_pid);
     if (!client) return -ESRCH;
     tm_channel_t *c = channel_find(target_pid, target_chid);
@@ -240,11 +292,14 @@ int tm_connect_attach(pid_t client_pid, pid_t target_pid, int target_chid,
         return -ENOMEM;
     }
 
+    /* Keep only the per-connection (COF_*) bits; the namespace-selector
+     * QSOE_SIDE_CHANNEL bit is for libqsoe's pool routing, not state. */
     g_connections[cidx].in_use      = 1;
     g_connections[cidx].channel_idx = (int)(c - g_channels);
     g_connections[cidx].badge       = badge;
     g_connections[cidx].client_pid  = client_pid;
     g_connections[cidx].client_slot = send_slot;
+    g_connections[cidx].flags       = flags & ~QSOE_SIDE_CHANNEL;
 
     *out_send_slot = send_slot;
     return 0;
@@ -270,5 +325,46 @@ int tm_connect_detach(pid_t client_pid, seL4_CPtr send_slot)
         return -EBADF;
     }
     cn->in_use = 0;
+    return 0;
+}
+
+/* ----------- v0.3.3 introspection handlers ----------- */
+
+int tm_connect_server_info(pid_t caller_pid, seL4_CPtr client_slot,
+                           pid_t *out_server_pid, int *out_server_chid,
+                           seL4_Word *out_scoid)
+{
+    tm_connection_t *cn = connection_find_by_slot(caller_pid, client_slot);
+    if (!cn) return -EBADF;
+    tm_channel_t *ch = &g_channels[cn->channel_idx];
+    *out_server_pid  = ch->owner_pid;
+    *out_server_chid = ch->owner_chid;
+    *out_scoid       = cn->badge;
+    return 0;
+}
+
+int tm_connect_client_info(seL4_Word scoid,
+                           pid_t *out_client_pid, pid_t *out_sid,
+                           unsigned *out_flags)
+{
+    tm_connection_t *cn = connection_find_by_badge(scoid);
+    if (!cn) return -EBADF;
+    *out_client_pid = cn->client_pid;
+    *out_sid        = cn->client_pid;  /* no sessions yet; sid := pid */
+    *out_flags      = cn->flags;
+    return 0;
+}
+
+int tm_connect_flags(pid_t caller_pid, seL4_CPtr client_slot,
+                     unsigned mask, unsigned bits,
+                     unsigned *out_old)
+{
+    tm_connection_t *cn = connection_find_by_slot(caller_pid, client_slot);
+    if (!cn) return -EBADF;
+    unsigned old = cn->flags;
+    if (mask != 0) {
+        cn->flags = (old & ~mask) | (bits & mask);
+    }
+    *out_old = old;
     return 0;
 }
