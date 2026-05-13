@@ -47,6 +47,72 @@ qsoe_sys_call(seL4_CPtr dest, seL4_MessageInfo_t info,
     return out;
 }
 
+/* seL4_Recv: block on `ep` until a message arrives. Out-fills *badge
+ * with the sender's badge (acts as our rcvid) and *mr0..*mr3 with the
+ * first four message words; longer messages spill into ipcbuf->msg[4..].
+ * Returns the message info tag. */
+static inline seL4_MessageInfo_t
+qsoe_sys_recv(seL4_CPtr ep, seL4_Word *badge,
+              seL4_Word *mr0, seL4_Word *mr1, seL4_Word *mr2, seL4_Word *mr3)
+{
+    register seL4_Word a0 asm("a0") = ep;
+    register seL4_Word a1 asm("a1");
+    register seL4_Word a2 asm("a2");
+    register seL4_Word a3 asm("a3");
+    register seL4_Word a4 asm("a4");
+    register seL4_Word a5 asm("a5");
+    register seL4_Word a7 asm("a7") = (seL4_Word)SYS_Recv;
+    asm volatile("ecall"
+                 : "+r"(a0), "=r"(a1), "=r"(a2), "=r"(a3), "=r"(a4), "=r"(a5)
+                 : "r"(a7)
+                 : "memory");
+    *badge = a0;
+    *mr0 = a2; *mr1 = a3; *mr2 = a4; *mr3 = a5;
+    seL4_MessageInfo_t out; out.words[0] = a1; return out;
+}
+
+/* seL4_Reply: reply to the previous Recv's implicit caller cap (the
+ * one the kernel stashed in tcbCaller on Recv). No destination param —
+ * non-MCS reply is per-thread, not per-cap. */
+static inline void
+qsoe_sys_reply(seL4_MessageInfo_t info,
+               seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3)
+{
+    register seL4_Word a1 asm("a1") = info.words[0];
+    register seL4_Word a2 asm("a2") = mr0;
+    register seL4_Word a3 asm("a3") = mr1;
+    register seL4_Word a4 asm("a4") = mr2;
+    register seL4_Word a5 asm("a5") = mr3;
+    register seL4_Word a7 asm("a7") = (seL4_Word)SYS_Reply;
+    asm volatile("ecall"
+                 : "+r"(a1), "+r"(a2), "+r"(a3), "+r"(a4), "+r"(a5)
+                 : "r"(a7)
+                 : "memory");
+}
+
+/* seL4_ReplyRecv: atomic reply-to-previous + receive-next. The taskman
+ * dispatch loop is built around this — it's the cheapest way to process
+ * a stream of requests. */
+static inline seL4_MessageInfo_t
+qsoe_sys_reply_recv(seL4_CPtr ep, seL4_MessageInfo_t info, seL4_Word *badge,
+                    seL4_Word *mr0, seL4_Word *mr1, seL4_Word *mr2, seL4_Word *mr3)
+{
+    register seL4_Word a0 asm("a0") = ep;
+    register seL4_Word a1 asm("a1") = info.words[0];
+    register seL4_Word a2 asm("a2") = *mr0;
+    register seL4_Word a3 asm("a3") = *mr1;
+    register seL4_Word a4 asm("a4") = *mr2;
+    register seL4_Word a5 asm("a5") = *mr3;
+    register seL4_Word a7 asm("a7") = (seL4_Word)SYS_ReplyRecv;
+    asm volatile("ecall"
+                 : "+r"(a0), "+r"(a1), "+r"(a2), "+r"(a3), "+r"(a4), "+r"(a5)
+                 : "r"(a7)
+                 : "memory");
+    *badge = a0;
+    *mr0 = a2; *mr1 = a3; *mr2 = a4; *mr3 = a5;
+    seL4_MessageInfo_t out; out.words[0] = a1; return out;
+}
+
 /* seL4_Yield — drop the current thread to the back of its priority's
  * runqueue. On non-MCS, this lets equal-priority threads run; on a
  * busy system server in a spin loop, it prevents starving lower-prio

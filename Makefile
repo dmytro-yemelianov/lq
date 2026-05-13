@@ -286,6 +286,10 @@ $(TASKBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TASKBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
+
 TASKMAN_OBJS := \
     $(TASKBUILD)/start.o \
     $(TASKBUILD)/main.o \
@@ -295,7 +299,8 @@ TASKMAN_OBJS := \
     $(TASKBUILD)/userland_archive.o \
     $(TASKBUILD)/libqsoe/channel.o \
     $(TASKBUILD)/libqsoe/connect.o \
-    $(TASKBUILD)/libqsoe/state.o
+    $(TASKBUILD)/libqsoe/state.o \
+    $(TASKBUILD)/libqsoe/msg.o
 
 $(TASKMAN_ELF): $(TASKMAN_OBJS)
 	@mkdir -p $(@D)
