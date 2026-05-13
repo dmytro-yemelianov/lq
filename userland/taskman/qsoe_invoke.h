@@ -47,6 +47,19 @@ qsoe_sys_call(seL4_CPtr dest, seL4_MessageInfo_t info,
     return out;
 }
 
+/* seL4_Yield — drop the current thread to the back of its priority's
+ * runqueue. On non-MCS, this lets equal-priority threads run; on a
+ * busy system server in a spin loop, it prevents starving lower-prio
+ * threads outright. (For our v0.3.2 dispatch loop, seL4_Recv blocks
+ * the thread until a message arrives, making the explicit yield
+ * unnecessary. But while taskman has no real work to do — e.g. in
+ * v0.3.0's spawn-and-idle phase — yield is the right primitive.) */
+static inline void qsoe_sys_yield(void)
+{
+    register seL4_Word a7 asm("a7") = (seL4_Word)SYS_Yield;
+    asm volatile("ecall" : : "r"(a7) : "memory");
+}
+
 /* seL4_Untyped_Retype: retype untyped into <num> objects of <type>, placed
  * starting at slot <node_offset> in CNode <root> (looked up via <node_index>,
  * <node_depth>). Returns the reply label (0 = success). */
@@ -111,6 +124,130 @@ qsoe_cnode_mint(seL4_CPtr dest_root, seL4_Word dest_index, seL4_Uint8 dest_depth
     seL4_Word mr0 = dest_index, mr1 = (seL4_Word)(dest_depth & 0xffu);
     seL4_Word mr2 = src_index,  mr3 = (seL4_Word)(src_depth  & 0xffu);
     seL4_MessageInfo_t reply = qsoe_sys_call(dest_root, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+/* Minimal RISC-V user context for seL4_TCB_WriteRegisters. Matches the
+ * order seL4 expects (see kernel/libsel4/arch_include/riscv/sel4/arch/types.h);
+ * only the fields we actually set are commented. We never read the
+ * trailing s/t registers — they're zero-initialised. */
+typedef struct {
+    seL4_Word pc;     /* set: entry point */
+    seL4_Word ra;
+    seL4_Word sp;     /* set: stack top */
+    seL4_Word gp;     /* set: __global_pointer$ (or 0; tester's crt0 sets gp itself) */
+    seL4_Word s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11;
+    seL4_Word a0;     /* set: first arg (we use it as pid) */
+    seL4_Word a1, a2, a3, a4, a5, a6, a7;
+    seL4_Word t0, t1, t2, t3, t4, t5, t6;
+    seL4_Word tp;
+} qsoe_user_ctx_t;
+
+/* 32 register fields total in qsoe_user_ctx_t (pc, ra, sp, gp,
+ * s0..s11, a0..a7, t0..t6, tp). Counts confirmed against the libsel4
+ * WriteRegisters stub which fills msg[2..33] with 32 reg values. */
+#define QSOE_USER_CTX_NREGS 32
+
+static inline seL4_Word
+qsoe_tcb_write_registers(seL4_CPtr tcb, int resume_target,
+                         const qsoe_user_ctx_t *ctx)
+{
+    /* Message body: flags(1) + count(1) + 32 reg fields = 34 words.
+     * mr0..mr3 hold flags, count, pc, ra. The remaining 30 reg fields
+     * spill into ipcbuf->msg[4..33]. */
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBWriteRegisters, 0, 0,
+                                                   QSOE_USER_CTX_NREGS + 2);
+    seL4_Word mr0 = (resume_target ? 1 : 0);
+    seL4_Word mr1 = QSOE_USER_CTX_NREGS;
+    seL4_Word mr2 = ctx->pc;
+    seL4_Word mr3 = ctx->ra;
+    const seL4_Word *src = &ctx->sp;          /* sp is index 2 in struct */
+    for (unsigned i = 0; i < QSOE_USER_CTX_NREGS - 2; ++i) {
+        qsoe_ipcbuf->msg[4 + i] = src[i];
+    }
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_tcb_configure(seL4_CPtr tcb, seL4_CPtr fault_ep,
+                   seL4_CPtr cnode_root, seL4_Word cnode_data,
+                   seL4_CPtr vspace_root, seL4_Word vspace_data,
+                   seL4_Word ipc_buffer_vaddr, seL4_CPtr ipc_buffer_frame)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = cnode_root;
+    qsoe_ipcbuf->caps_or_badges[1] = vspace_root;
+    qsoe_ipcbuf->caps_or_badges[2] = ipc_buffer_frame;
+
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBConfigure, 0, 3, 4);
+    seL4_Word mr0 = fault_ep;
+    seL4_Word mr1 = cnode_data;
+    seL4_Word mr2 = vspace_data;
+    seL4_Word mr3 = ipc_buffer_vaddr;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_tcb_set_priority(seL4_CPtr tcb, seL4_CPtr authority_tcb, seL4_Word prio)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = authority_tcb;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBSetPriority, 0, 1, 1);
+    seL4_Word mr0 = prio, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_tcb_resume(seL4_CPtr tcb)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBResume, 0, 0, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+/* RISC-V VM attributes. Bit 0 = ExecuteNever; we leave it 0 for code. */
+#define QSOE_VM_ATTR_DEFAULT 0
+
+static inline seL4_Word
+qsoe_riscv_pagetable_map(seL4_CPtr pt, seL4_CPtr vspace,
+                         seL4_Word vaddr, seL4_Word attr)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = vspace;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_RISCVPageTableMap, 0, 1, 2);
+    seL4_Word mr0 = vaddr, mr1 = attr, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(pt, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_riscv_page_map(seL4_CPtr page, seL4_CPtr vspace,
+                    seL4_Word vaddr, seL4_CapRights_t rights, seL4_Word attr)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = vspace;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_RISCVPageMap, 0, 1, 3);
+    seL4_Word mr0 = vaddr, mr1 = rights.words[0], mr2 = attr, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(page, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_riscv_page_unmap(seL4_CPtr page)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_RISCVPageUnmap, 0, 0, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(page, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_riscv_asidpool_assign(seL4_CPtr asid_pool, seL4_CPtr vspace)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = vspace;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_RISCVASIDPoolAssign, 0, 1, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(asid_pool, tag, &mr0, &mr1, &mr2, &mr3);
     return seL4_MessageInfo_get_label(reply);
 }
 

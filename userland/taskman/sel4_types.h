@@ -25,28 +25,55 @@ typedef struct { seL4_Word words[1]; } seL4_MessageInfo_t;
 
 typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 
-/* Object types (subset; see objecttype.h). */
-#define seL4_UntypedObject       0
-#define seL4_TCBObject           1
-#define seL4_EndpointObject      2
-#define seL4_NotificationObject  3
-#define seL4_CapTableObject      4
+/* Object types (non-MCS, RISC-V 64; see objecttype.h enums). */
+#define seL4_UntypedObject           0
+#define seL4_TCBObject               1
+#define seL4_EndpointObject          2
+#define seL4_NotificationObject      3
+#define seL4_CapTableObject          4
+#define seL4_RISCV_Giga_Page         5
+#define seL4_RISCV_4K_Page           6
+#define seL4_RISCV_Mega_Page         7
+#define seL4_RISCV_PageTableObject   8
 
-/* Initial CSpace fixed slots (subset; see bootinfo.h). */
-#define seL4_CapNull             0
-#define seL4_CapInitThreadTCB    1
-#define seL4_CapInitThreadCNode  2
-#define seL4_CapInitThreadVSpace 3
+/* Object size bits — for retype size_bits argument. */
+#define seL4_TCBBits             10  /* TCB is 2^10 = 1024 bytes (non-MCS) */
+#define seL4_EndpointBits         4
+#define seL4_PageBits            12  /* 4 KiB */
+#define seL4_PageTableBits       12  /* one PT level on Sv39 */
+#define seL4_VSpaceBits          seL4_PageTableBits
+
+/* Initial CSpace fixed slots (see bootinfo.h). */
+#define seL4_CapNull                  0
+#define seL4_CapInitThreadTCB         1
+#define seL4_CapInitThreadCNode       2
+#define seL4_CapInitThreadVSpace      3
+#define seL4_CapIRQControl            4
+#define seL4_CapASIDControl           5
+#define seL4_CapInitThreadASIDPool    6
+#define seL4_CapIOPortControl         7
+#define seL4_CapIOSpace               8
+#define seL4_CapBootInfoFrame         9
+#define seL4_CapInitThreadIPCBuffer  10
 
 /* Invocation method labels, derived by counting the enum in
  * sel4test-full/build-qsoe-riscv64/kernel/gen_headers/api/invocation.h
- * with our config (non-MCS, non-SMP, non-HW_DEBUG_API, etc). Verified by
- * boot test. */
-#define INV_UntypedRetype        1
-#define INV_CNodeRevoke         17
-#define INV_CNodeDelete         18
-#define INV_CNodeCopy           20
-#define INV_CNodeMint           21
+ * with our config (non-MCS, non-SMP, non-HW_DEBUG_API, etc). */
+#define INV_UntypedRetype            1
+#define INV_TCBWriteRegisters        3
+#define INV_TCBConfigure             5   /* non-MCS variant */
+#define INV_TCBSetPriority           6
+#define INV_TCBResume               12
+#define INV_CNodeRevoke             17
+#define INV_CNodeDelete             18
+#define INV_CNodeCopy               20
+#define INV_CNodeMint               21
+/* Arch-specific labels start at nInvocationLabels (33 in our config). */
+#define INV_RISCVPageTableMap       33
+#define INV_RISCVPageTableUnmap     34
+#define INV_RISCVPageMap            35
+#define INV_RISCVPageUnmap          36
+#define INV_RISCVASIDPoolAssign     39
 
 /* Fast-path syscall numbers (negative; see arch/api/syscall.h). */
 #define SYS_Call                (-1)
@@ -55,6 +82,7 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 #define SYS_NBSend              (-4)
 #define SYS_Recv                (-5)
 #define SYS_Reply               (-6)
+#define SYS_Yield               (-7)
 #define SYS_NBRecv              (-8)
 
 #define seL4_MsgMaxLength       120

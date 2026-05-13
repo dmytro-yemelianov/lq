@@ -49,6 +49,8 @@ LIBCPIO     := $(CORE)/lib/cpio
 
 TASKMAN_DIR := $(TOP)/userland/taskman
 LIBQSOE_DIR := $(TOP)/userland/libqsoe
+TESTER_DIR  := $(TOP)/userland/tester
+TESTBUILD   := $(BUILD)/tester
 
 SEL4TEST    := $(TOP)/sel4test-full
 SEL4BUILD   := $(SEL4TEST)/build-qsoe-riscv64
@@ -57,6 +59,7 @@ KERNEL_ELF  := $(BUILD)/kernel.elf
 
 IMAGE       := $(BUILD)/qsoe.elf
 TASKMAN_ELF := $(BUILD)/taskman.elf
+TESTER_ELF  := $(BUILD)/tester.elf
 
 # ----------------------------------------------------------------------------
 # Platform configuration (qemu-riscv-virt, RV64)
@@ -218,6 +221,7 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/sel4_types.h \
     $(TASKMAN_DIR)/qsoe_invoke.h \
     $(TASKMAN_DIR)/server.h \
+    $(TASKMAN_DIR)/spawn.h \
     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/src/state.h \
@@ -253,11 +257,22 @@ $(TASKBUILD)/start.o: $(TASKMAN_DIR)/start.S
 
 $(TASKBUILD)/main.o: $(TASKMAN_DIR)/main.c $(TM_HEADERS)
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
 
 $(TASKBUILD)/server.o: $(TASKMAN_DIR)/server.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(TASKBUILD)/spawn.o: $(TASKMAN_DIR)/spawn.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+# Pull libcpio (already extracted to core/lib/cpio for the elfloader) into
+# taskman's build too, so the rootserver can locate tester.elf inside
+# the embedded userland CPIO at runtime.
+$(TASKBUILD)/cpio.o: $(LIBCPIO)/src/cpio.c
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
 
 $(TASKBUILD)/libqsoe/channel.o: $(LIBQSOE_DIR)/src/channel.c $(TM_HEADERS)
 	@mkdir -p $(@D)
@@ -275,6 +290,9 @@ TASKMAN_OBJS := \
     $(TASKBUILD)/start.o \
     $(TASKBUILD)/main.o \
     $(TASKBUILD)/server.o \
+    $(TASKBUILD)/spawn.o \
+    $(TASKBUILD)/cpio.o \
+    $(TASKBUILD)/userland_archive.o \
     $(TASKBUILD)/libqsoe/channel.o \
     $(TASKBUILD)/libqsoe/connect.o \
     $(TASKBUILD)/libqsoe/state.o
@@ -285,6 +303,56 @@ $(TASKMAN_ELF): $(TASKMAN_OBJS)
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
 	    -o $@ $^
+
+# ----------------------------------------------------------------------------
+# Tester — second user-space program, spawned by taskman.
+# ----------------------------------------------------------------------------
+
+$(TESTBUILD)/start.o: $(TESTER_DIR)/start.S
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(TESTER_ELF): $(TESTBUILD)/start.o $(TESTBUILD)/main.o
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -static -nostdlib \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext-segment=0x10000 \
+	    -o $@ $^
+
+# ----------------------------------------------------------------------------
+# Userland CPIO — packs the spawned binaries (currently just tester.elf)
+# and gets embedded in taskman.elf via .incbin so taskman can fetch them
+# at runtime through libcpio. See plan §2.
+# ----------------------------------------------------------------------------
+
+USERLAND_CPIO := $(BUILD)/userland.cpio
+
+$(USERLAND_CPIO): $(TESTER_ELF)
+	@mkdir -p $(@D)
+	@cd $(BUILD) && \
+	    printf '%s\n' tester.elf | \
+	    cpio --quiet --create -H newc \
+	         --owner=+0:+0 --reproducible \
+	         --file=userland.cpio
+
+$(TASKBUILD)/userland_archive.S: $(USERLAND_CPIO) $(firstword $(MAKEFILE_LIST))
+	@mkdir -p $(@D)
+	@printf '%s\n' \
+	    '.section .userland_cpio,"a"' \
+	    '.balign 4096' \
+	    '.globl _userland_cpio_start, _userland_cpio_end' \
+	    '_userland_cpio_start:' \
+	    '.incbin "$<"' \
+	    '_userland_cpio_end:' \
+	    > $@
+
+$(TASKBUILD)/userland_archive.o: $(TASKBUILD)/userland_archive.S
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
 # ----------------------------------------------------------------------------
 # Kernel: produced one-time by sel4test CMake build

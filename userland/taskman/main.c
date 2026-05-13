@@ -12,9 +12,14 @@
 #include "sel4_types.h"
 #include "qsoe_invoke.h"
 #include "server.h"
+#include "spawn.h"
 #include "../libqsoe/include/qsoe/qrv.h"
 #include "../libqsoe/include/qsoe/slots.h"
 #include <qsoe/sys_version.h>
+#include <cpio/cpio.h>
+
+extern char _userland_cpio_start[];
+extern char _userland_cpio_end[];
 
 #define QSOE_STR_(x) #x
 #define QSOE_STR(x)  QSOE_STR_(x)
@@ -22,35 +27,6 @@
 
 /* Single-threaded taskman in v0.x: a plain global suffices. */
 seL4_IPCBuffer *qsoe_ipcbuf;
-
-static void putu(unsigned long x)
-{
-    char buf[19];
-    buf[0] = '0'; buf[1] = 'x';
-    for (int i = 15; i >= 0; --i) {
-        unsigned d = x & 0xF;
-        buf[2 + i] = d < 10 ? '0' + d : 'a' + (d - 10);
-        x >>= 4;
-    }
-    buf[18] = 0;
-    sel4_debug_puts(buf);
-}
-
-static void report(const char *op, int result)
-{
-    sel4_debug_puts("  ");
-    sel4_debug_puts(op);
-    sel4_debug_puts(" -> ");
-    if (result < 0) {
-        sel4_debug_puts("FAIL errno=");
-        putu((unsigned long)qsoe_errno);
-    } else {
-        sel4_debug_puts("OK (");
-        putu((unsigned long)result);
-        sel4_debug_putchar(')');
-    }
-    sel4_debug_putchar('\n');
-}
 
 static unsigned cstrlen(const char *s)
 {
@@ -111,50 +87,43 @@ int main(seL4_BootInfo *bi)
 
     tm_init(ut, seL4_CapInitThreadCNode, bi->empty.start);
 
-    /* Test 1: single channel, single connection, full lifecycle. */
-    sel4_debug_puts("test 1: single channel lifecycle\n");
-    int chid = ChannelCreate(0);
-    report("ChannelCreate", chid);
-    int coid = ConnectAttach(ND_LOCAL_NODE, QSOE_PID_TASKMAN, chid, 0, 0);
-    report("ConnectAttach", coid);
-    int r1 = ConnectDetach(coid);
-    report("ConnectDetach", r1);
-    int r2 = ChannelDestroy(chid);
-    report("ChannelDestroy", r2);
-    int t1_ok = (chid > 0 && coid > 0 && r1 == 0 && r2 == 0);
-
-    /* Test 2: two channels coexist; destroy the correct one. */
-    sel4_debug_puts("test 2: two channels, targeted destroy\n");
-    int a = ChannelCreate(0);
-    int b = ChannelCreate(0);
-    report("ChannelCreate(a)", a);
-    report("ChannelCreate(b)", b);
-    int rb = ChannelDestroy(b);
-    report("ChannelDestroy(b)", rb);
-    int ra = ChannelDestroy(a);
-    report("ChannelDestroy(a)", ra);
-    int t2_ok = (a > 0 && b > 0 && a != b && ra == 0 && rb == 0);
-
-    /* Test 3: small loop — verify we can churn without leaking handles
-     * (slots leak by design in v0.2 since the bump allocator doesn't
-     * recycle, but the libqsoe chid/coid tables must recycle). */
-    sel4_debug_puts("test 3: 8-iteration churn\n");
-    int t3_ok = 1;
-    for (int i = 0; i < 8; ++i) {
-        int c  = ChannelCreate(0);
-        int co = ConnectAttach(ND_LOCAL_NODE, QSOE_PID_TASKMAN, c, 0, 0);
-        int rd = ConnectDetach(co);
-        int rc = ChannelDestroy(c);
-        if (!(c > 0 && co > 0 && rd == 0 && rc == 0)) t3_ok = 0;
-    }
-    sel4_debug_puts(t3_ok ? "  loop OK\n" : "  loop FAILED\n");
-
-    if (t1_ok && t2_ok && t3_ok) {
-        sel4_debug_puts("v0.2 self-test PASSED\n");
-    } else {
-        sel4_debug_puts("v0.2 self-test FAILED\n");
+    /* v0.3.0: spawn tester. We don't yet have taskman's primary
+     * endpoint allocated by ChannelCreate — for v0.3.0 we create it
+     * the same way we will in v0.3.2, by hand, so that spawn() can
+     * mint a Send cap to it for tester's CSpace slot 1. */
+    seL4_CPtr primary_ep = bi->empty.start; /* very next free slot */
+    /* Bump tm_init's allocator past it so spawn() doesn't reuse it. */
+    extern seL4_CPtr s_next_slot;
+    s_next_slot = bi->empty.start + 1;
+    seL4_Word rerr = qsoe_untyped_retype(ut, seL4_EndpointObject, 0,
+                                          seL4_CapInitThreadCNode, 0, 0,
+                                          primary_ep, 1);
+    if (rerr != 0) {
+        sel4_debug_puts("FATAL: failed to retype primary endpoint\n");
+        for (;;) __asm__ volatile("nop");
     }
 
-    for (;;) __asm__ volatile("nop");
+    /* Find tester.elf in the embedded userland CPIO. */
+    unsigned long cpio_len = (unsigned long)
+        (_userland_cpio_end - _userland_cpio_start);
+    unsigned long elf_size = 0;
+    const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
+                                     "tester.elf", &elf_size);
+    if (!elf) {
+        sel4_debug_puts("FATAL: tester.elf not found in CPIO\n");
+        for (;;) __asm__ volatile("nop");
+    }
+    sel4_debug_puts("taskman: spawning tester (pid 2)...\n");
+    int sr = tm_spawn(elf, elf_size, 2, primary_ep);
+    if (sr != 0) {
+        sel4_debug_puts("FATAL: tm_spawn returned non-zero\n");
+        for (;;) __asm__ volatile("nop");
+    }
+    sel4_debug_puts("taskman: tester spawned, idling.\n");
+
+    /* Cooperative idle: yield so lower-priority threads run. v0.3.2
+     * replaces this with seL4_Recv on the primary endpoint, which
+     * blocks until a real request arrives. */
+    for (;;) qsoe_sys_yield();
     return 0;
 }

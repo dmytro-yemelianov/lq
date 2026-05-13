@@ -17,9 +17,11 @@
 static tm_channel_t    g_channels[TM_MAX_CHANNELS];
 static tm_connection_t g_connections[TM_MAX_CONNECTIONS];
 
-static seL4_CPtr s_untyped;
-static seL4_CPtr s_cnode_root;
-static seL4_CPtr s_next_slot;
+/* Shared with spawn.c — kept non-static for v0.3.0 simplicity; v0.4
+ * wraps these in a proper accessor API. */
+seL4_CPtr s_untyped;
+seL4_CPtr s_cnode_root;
+seL4_CPtr s_next_slot;
 static seL4_Word s_next_badge = 1; /* 0 reserved as "no badge" */
 
 void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
