@@ -22,6 +22,10 @@ enum {
     /* v0.4 */
     TM_REQ_THREAD_ALLOC         = 0x08,
     TM_REQ_THREAD_DESTROY       = 0x09,
+    /* v0.4.1 */
+    TM_REQ_PROCESS_CREATE       = 0x0a,
+    TM_REQ_PROCESS_TERMINATE    = 0x0b,
+    TM_REQ_DEBUG_SLOT_COUNT     = 0x0c,  /* cap-leak smoke test */
     /* Demo / smoke-test label used by tester to trigger taskman's
      * server-side ConnectClientInfo print. Echoes MR0+1 like the
      * default v0.3.2 echo, but additionally fills MR1 with the

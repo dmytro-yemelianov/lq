@@ -30,7 +30,10 @@ _start:
      * leave it as the first arg to main(pid_t). */
     call main
 
-    /* main returned — spin. */
+    /* main returned — funnel its return value into _exit() to drive
+     * the proper ProcessTerminate wire path. a0 already holds main's
+     * return value per RISC-V SysV ABI. */
+    call _exit
 1:  j 1b
 
     .size _start, . - _start

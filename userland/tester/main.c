@@ -212,8 +212,61 @@ int main(pid_t pid)
         }
     }
 
-    sel4_debug_puts("[tester] done\n");
-    for (;;) __asm__ volatile("nop");
+    /* --- 7b. posix_spawn hello.elf. v0.4.1: a sibling process spawned
+     *         from this one, not from taskman. No waitpid yet — we
+     *         yield to let hello print, then ProcessTerminate as
+     *         insurance in case hello hasn't exited on its own. --- */
+    {
+        pid_t hpid = 0;
+        int rc = posix_spawn(&hpid, "hello.elf", 0, 0, 0, 0);
+        sel4_debug_puts("[tester] posix_spawn(hello.elf) -> rc=");
+        putd(rc);
+        sel4_debug_puts(" pid=");
+        putd((int)hpid);
+        sel4_debug_putchar('\n');
+        if (rc == 0) {
+            for (int i = 0; i < 8; ++i) qsoe_sys_yield();
+        }
+    }
+
+    /* --- 8. Cap-leak smoke test. With taskman's slot free-list, the
+     *        SAME endpoint slot gets reused for every iteration after
+     *        the first. Warm-up: do one cycle so the free list isn't
+     *        empty, then measure 100 more. Expected delta=0. --- */
+    {
+        int warm = ChannelCreate(0);
+        if (warm >= 0) ChannelDestroy(warm);
+
+        seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+        seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_DEBUG_SLOT_COUNT,
+                                                       0, 0, 0);
+        qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag, &mr0, &mr1, &mr2, &mr3);
+        unsigned long before = (unsigned long)mr0;
+
+        int failed = 0;
+        for (int i = 0; i < 100; ++i) {
+            int chid = ChannelCreate(0);
+            if (chid < 0) { failed = 1; break; }
+            int rc = ChannelDestroy(chid);
+            if (rc < 0) { failed = 1; break; }
+        }
+
+        mr0 = 0; mr1 = 0; mr2 = 0; mr3 = 0;
+        tag = seL4_MessageInfo_new(TM_REQ_DEBUG_SLOT_COUNT, 0, 0, 0);
+        qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag, &mr0, &mr1, &mr2, &mr3);
+        unsigned long after = (unsigned long)mr0;
+
+        sel4_debug_puts("[cap-leak] 100 Channel cycles: s_next_slot before=");
+        putd((int)before);
+        sel4_debug_puts(" after=");
+        putd((int)after);
+        sel4_debug_puts(" delta=");
+        putd((int)(after - before));
+        if (failed) sel4_debug_puts(" (LOOP FAILED)");
+        sel4_debug_putchar('\n');
+    }
+
+    sel4_debug_puts("[tester] done, returning 0 (→ _exit via crt0)\n");
     return 0;
 }
 

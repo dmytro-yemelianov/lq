@@ -52,6 +52,7 @@ typedef unsigned int  gid_t;
 /* Error codes (QNX-compatible subset for v0.x). */
 #define EOK            0
 #define ESRCH          3
+#define ENOENT         2
 #define EBADF          9
 #define ENOMEM        12
 #define EINVAL        22
@@ -198,6 +199,33 @@ int ThreadDetach(int tid);
 int ThreadJoin(int tid, void **status);
 int ThreadCancel(int tid, void (*canstub)(void));
 int ThreadCtl(int cmd, void *data);
+
+/*
+ * Process lifecycle (v0.4.1). The minimal QSOE surface; full QNX
+ * compatibility (file_actions, attr struct, argv/envp delivery) lands
+ * incrementally.
+ *
+ *   ProcessCreate(path) — spawn the named ELF (looked up in the
+ *     embedded userland CPIO for v0.4.1). Returns the new pid or -1.
+ *
+ *   posix_spawn — POSIX-conformant wrapper. Returns 0 on success and
+ *     writes the new pid through *pid_out; non-zero errno on failure.
+ *     v0.4.1 ignores file_actions, attr, argv, envp.
+ *
+ *   ProcessTerminate(pid, status) — destroy the named process. pid==0
+ *     means "this process" (the no-return self path).
+ *
+ *   exit / _exit — self-terminate with `status`. POSIX semantics:
+ *     exit() runs atexit handlers first (no atexit yet in v0.4.1);
+ *     _exit() goes directly to ProcessTerminate(0, status).
+ */
+int  ProcessCreate(const char *path);
+int  posix_spawn(pid_t *pid_out, const char *path,
+                 const void *file_actions, const void *attr,
+                 char *const argv[], char *const envp[]);
+int  ProcessTerminate(pid_t pid, int status);
+void _exit(int status) __attribute__((noreturn));
+void exit (int status) __attribute__((noreturn));
 
 /*
  * libqsoe init hook. Each spawned process calls this exactly once at

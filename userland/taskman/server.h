@@ -27,10 +27,16 @@ typedef struct {
     pid_t     pid;
     seL4_CPtr cnode;        /* caller's root CNode cap in taskman's CSpace */
     seL4_CPtr next_slot;    /* next free slot in caller's CSpace */
-    seL4_CPtr tcb;          /* (kept for v0.4 cleanup; unused in v0.3.x) */
+    seL4_CPtr tcb;          /* main TCB master in taskman's CSpace */
     seL4_CPtr vspace;
-    /* v0.4: lazily-allocated L0 page table covering [0x200000, 0x400000)
-     * for this process's worker threads. 0 until first ThreadCreate. */
+    seL4_CPtr untyped_budget;  /* v0.4.1: per-process untyped, in
+                                  taskman's CSpace; copied into child
+                                  slot QSOE_CAP_OWN_UNTYPED at spawn */
+    /* v0.4.1: lazily-allocated PTs for the worker region at
+     * [0x40000000, 0x40200000). Both 0 until first ThreadCreate.
+     * The L1 covers [0x40000000, 0x80000000); the L0 covers the
+     * first 2 MiB of that range, which holds up to 32 worker slots. */
+    seL4_CPtr workers_l1_pt;
     seL4_CPtr workers_l0_pt;
     int       next_tid;     /* next free tid for this process (starts at 2) */
 } tm_process_t;
@@ -80,6 +86,26 @@ int            tm_process_register(pid_t pid, seL4_CPtr cnode,
                                    seL4_CPtr first_free_slot);
 tm_process_t  *tm_process_lookup(pid_t pid);
 seL4_CPtr      tm_process_alloc_slot(pid_t pid);
+
+/* v0.4.1 pid allocator. Returns 0 if no pid available. tm_pid_free()
+ * is called by ProcessTerminate to return the pid to the free list. */
+pid_t          tm_pid_alloc(void);
+void           tm_pid_free(pid_t pid);
+
+/* v0.4.1 ProcessCreate plumbing. main() registers the embedded
+ * userland CPIO and taskman's primary endpoint at boot; the wire
+ * handler tm_process_create_by_name() looks up the ELF by name and
+ * spawns it under a freshly-allocated pid. */
+void           tm_set_userland_cpio(const void *start, unsigned long len);
+void           tm_set_primary_ep(seL4_CPtr ep);
+int            tm_process_create_by_name(const char *path, unsigned path_len,
+                                         pid_t *out_pid);
+
+/* v0.4.1 ProcessTerminate. Revokes the target process's master caps
+ * (TCB, CNode, VSpace, worker TCBs/Notifications, owned channels) and
+ * frees the pid. Returns 0 / -errno. status is reserved for v0.5
+ * waitpid propagation. */
+int            tm_process_terminate(pid_t target, int status);
 
 /* Register an externally-allocated endpoint as channel (pid, chid).
  * Used for taskman's primary endpoint, which is retyped at boot before

@@ -65,9 +65,13 @@ struct elf64_phdr {
 #define CHILD_IPC_BUFFER   0x1FE000UL  /* near top of the 2 MiB region */
 #define CHILD_STACK_TOP    0x1FF000UL  /* one page; sp starts here, grows down into the next page below if needed */
 
-/* Tunables. */
-#define MAX_IMAGE_PAGES    16          /* up to 64 KiB of tester image */
-#define IMAGE_VADDR_END    (CHILD_IMAGE_BASE + (MAX_IMAGE_PAGES * 4096UL))
+/* Image can grow up to one Sv39 L0 PT's coverage — 2 MiB. Beyond that
+ * we'd need ensure_l0_pt() to lazily allocate per-2-MiB-region PTs as
+ * the loader walks pages; deferred to whenever an image actually
+ * exceeds 2 MiB. With the worker region now at 0x40000000 (a separate
+ * L1 PT, see [[project-image-size-cap]]), images and workers never
+ * collide. */
+#define IMAGE_MAX_BYTES    (2UL * 1024 * 1024 - CHILD_IMAGE_BASE)
 
 /* zero-and-memcpy helpers — we run with -fno-builtin and no libc. */
 static void qmemcpy(void *dst, const void *src, unsigned long n)
@@ -251,6 +255,22 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                           QSOE_RIGHTS_SEND, (seL4_Word)pid);
     if (err) { sel4_debug_puts("spawn: mint TASKMAN_EP failed\n"); return -ENOMEM; }
 
+    /* 5b. Untyped budget. Retype 256 KiB (2^18) of untyped out of
+     *     taskman's pool; copy the resulting Untyped cap into the
+     *     child's slot QSOE_CAP_OWN_UNTYPED. v0.4.1 just *establishes*
+     *     the budget — libqsoe still goes through taskman for
+     *     ChannelCreate. v0.5 will let the child retype from this
+     *     directly. */
+    seL4_CPtr child_untyped = alloc_object(seL4_UntypedObject, 18);
+    if (!child_untyped) {
+        sel4_debug_puts("spawn: child untyped retype failed\n");
+        return -ENOMEM;
+    }
+    err = qsoe_cnode_copy(cnode, QSOE_CAP_OWN_UNTYPED, 12,
+                          s_cnode_root, child_untyped, 64,
+                          QSOE_RIGHTS_ALL);
+    if (err) { sel4_debug_puts("spawn: copy OWN_UNTYPED failed\n"); return -ENOMEM; }
+
     /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
      *    12) and guard value 0; the CNode is 2^12 slots so addresses
      *    fit in 12 bits. seL4_CNode_CapData layout: bits[0..5] =
@@ -288,6 +308,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         sel4_debug_puts("spawn: tm_process_register failed\n");
         return reg_err;
     }
+    /* Record the child's untyped budget master for cleanup on terminate. */
+    tm_process_t *prec = tm_process_lookup(pid);
+    if (prec) prec->untyped_budget = child_untyped;
 
     /* 8b. Register the connection record for the SYSMGR_COID cap we
      *     minted in step 5. The badge we used was `pid` itself, so the

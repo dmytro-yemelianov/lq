@@ -36,6 +36,105 @@ After sel4runtime hands control to \texttt{main()}, taskman:
           to reply and immediately receive the next request.
 \end{enumerate}
 
+\section{Process lifecycle}
+\label{sec:process-lifecycle}
+
+QSOE's process model is QNX-style: no \texttt{fork()}, only
+\texttt{posix\_spawn()} (per CLAUDE.md's architectural decisions).
+\texttt{taskman} owns the pid namespace and the master capabilities
+for every kernel object backing a process.
+
+\subsection{pid allocator}
+
+pid 1 is reserved for \texttt{taskman} forever.  Child pids start at
+2 and are bump-allocated up to \texttt{TM\_MAX\_PROCESSES-1}; freed
+pids land on a LIFO free list and are reused before the bump pointer
+advances.  No reserved ranges or family bits yet --- v0.5+ can add
+them when the system grows multiple service tiers.
+
+\subsection{Spawn (ProcessCreate / posix\_spawn)}
+
+The libqsoe entrypoint is \texttt{ProcessCreate(path)} returning the
+new pid, plus a POSIX-shaped wrapper \texttt{posix\_spawn()} that
+ignores file\_actions / attr / argv / envp for v0.4.1 (argv/envp on
+the child stack lands in v0.4.2).  Wire request label
+\texttt{TM\_REQ\_PROCESS\_CREATE} carries the path length in MR0 and
+the path bytes in \texttt{ipcbuf->msg[4..]} --- past the four
+register-transferred MRs.
+
+Taskman receives the request, looks up the named ELF in the embedded
+userland CPIO, allocates a fresh pid, calls the existing
+\texttt{tm\_spawn} sequence (Chapter 3.4) under the new pid, and
+replies with the pid.  No argv/envp delivery yet --- the child gets
+just \texttt{a0 = pid} as before.
+
+\subsection{Termination (ProcessTerminate / exit / \_exit)}
+
+Two paths share the same handler:
+
+\begin{itemize}
+    \item \textbf{Self}: the child calls \texttt{exit(status)}, which
+          (in v0.4.1) is a direct alias for \texttt{\_exit(status)},
+          which sends \texttt{TM\_REQ\_PROCESS\_TERMINATE} with
+          \texttt{pid=0}, \texttt{status=N} to taskman.  The crt0
+          falls through to \texttt{\_exit(main's return value)} so a
+          plain \texttt{return 0;} from \texttt{main()} cleanly
+          terminates the process.
+    \item \textbf{External}: another process calls
+          \texttt{ProcessTerminate(target\_pid, status)}.  Same wire
+          label; taskman uses the badge to authorise the request.
+\end{itemize}
+
+\texttt{tm\_process\_terminate} revokes the target's master caps in
+order: worker thread TCBs and join Notifications, owned channels,
+client-side connection records, main TCB, VSpace, CNode, the
+workers' L0/L1 page tables, and finally the per-child untyped
+budget.  Then it frees the pid.
+
+\textbf{No-reply dispatch} for self-terminate: revoking the caller's
+TCB inside the handler means the caller's thread is gone before
+taskman would normally call Reply.  The dispatch loop honours an
+\texttt{out\_no\_reply} flag set by the handler and switches from
+\texttt{seL4\_ReplyRecv} to \texttt{seL4\_Recv} for the next
+iteration --- otherwise it'd block forever waiting for a reply target
+that no longer exists.
+
+\subsection{Cap-leak hygiene}
+
+Taskman maintains a slot free list
+(\texttt{s\_slot\_free\_list[256]}).  Every \texttt{CNode\_Delete} on
+a taskman-allocated slot pushes the slot back to the list; every
+\texttt{taskman\_alloc\_and\_retype()} pops from the list before
+bumping \texttt{s\_next\_slot}.  The cap-leak smoke test verifies
+this: 100 cycles of \texttt{ChannelCreate} + \texttt{ChannelDestroy}
+yield \texttt{delta = 0} in taskman's bump pointer.
+
+Slot reuse within a child's own CSpace (\texttt{p->next\_slot}) is
+not yet implemented in v0.4.1 --- the cost is purely CSpace room in
+the child, not kernel memory.  v0.5 generalises.
+
+\section{Untyped budget per process}
+\label{sec:untyped-budget}
+
+Each spawned process receives an untyped capability of fixed size
+($2^{18}$ bytes = 256 KiB in v0.4.1) at boot, copied into well-known
+CSpace slot \texttt{QSOE\_CAP\_OWN\_UNTYPED} (= 2).  The cap lives in
+the child's CSpace; the master copy stays in taskman's CSpace,
+recorded in \texttt{tm\_process\_t.untyped\_budget} so
+\texttt{tm\_process\_terminate} can revoke + delete it cleanly.
+
+In v0.4.1 the budget is \emph{established} but not yet consumed:
+libqsoe's \texttt{ChannelCreate} still goes through taskman for the
+retype.  v0.5 will let the child do that retype locally from its own
+budget, removing one round-trip per channel.  This decentralises
+allocation but doesn't change the security model --- taskman still
+owns the master caps via the parent / child untyped derivation tree
+and can Revoke at ProcessTerminate time.
+
+The budget size is currently a fixed compile-time constant.  A v0.4.2
+\texttt{posix\_spawnattr} extension will let callers ask for a larger
+budget at spawn time.
+
 \section{SMP boot}
 \label{sec:smp-boot}
 

@@ -7,6 +7,7 @@
 
 #define QSOE_CAP_NULL          0
 #define QSOE_CAP_TASKMAN_EP    1   /* Send cap to taskman's primary endpoint */
+#define QSOE_CAP_OWN_UNTYPED   2   /* This process's untyped budget (v0.4.1+) */
 #define QSOE_CAP_WELL_KNOWN_END 16 /* slots [2..15] reserved; dynamics start at 16 */
 
 /* By convention pid 1 is taskman itself. */

@@ -265,7 +265,7 @@ $(TASKBUILD)/main.o: $(TASKMAN_DIR)/main.c $(TM_HEADERS)
 
 $(TASKBUILD)/server.o: $(TASKMAN_DIR)/server.c $(TM_HEADERS)
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
 
 $(TASKBUILD)/spawn.o: $(TASKMAN_DIR)/spawn.c $(TM_HEADERS)
 	@mkdir -p $(@D)
@@ -298,6 +298,10 @@ $(TASKBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TASKBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
+
 TASKMAN_OBJS := \
     $(TASKBUILD)/start.o \
     $(TASKBUILD)/main.o \
@@ -309,7 +313,8 @@ TASKMAN_OBJS := \
     $(TASKBUILD)/libqsoe/connect.o \
     $(TASKBUILD)/libqsoe/state.o \
     $(TASKBUILD)/libqsoe/msg.o \
-    $(TASKBUILD)/libqsoe/thread.o
+    $(TASKBUILD)/libqsoe/thread.o \
+    $(TASKBUILD)/libqsoe/process.o
 
 $(TASKMAN_ELF): $(TASKMAN_OBJS)
 	@mkdir -p $(@D)
@@ -359,6 +364,10 @@ $(TESTBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TESTBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 TESTER_OBJS := \
     $(TESTBUILD)/start.o \
     $(TESTBUILD)/main.o \
@@ -366,7 +375,8 @@ TESTER_OBJS := \
     $(TESTBUILD)/libqsoe/connect.o \
     $(TESTBUILD)/libqsoe/state.o \
     $(TESTBUILD)/libqsoe/msg.o \
-    $(TESTBUILD)/libqsoe/thread.o
+    $(TESTBUILD)/libqsoe/thread.o \
+    $(TESTBUILD)/libqsoe/process.o
 
 $(TESTER_ELF): $(TESTER_OBJS)
 	@mkdir -p $(@D)
@@ -376,17 +386,65 @@ $(TESTER_ELF): $(TESTER_OBJS)
 	    -o $@ $^
 
 # ----------------------------------------------------------------------------
-# Userland CPIO — packs the spawned binaries (currently just tester.elf)
-# and gets embedded in taskman.elf via .incbin so taskman can fetch them
-# at runtime through libcpio. See plan §2.
+# hello — first non-taskman/non-tester userland program. Spawned by
+# tester via posix_spawn(). Uses the same libqsoe build flags as tester.
+# ----------------------------------------------------------------------------
+
+HELLO_DIR  := $(TOP)/userland/hello
+HELLOBUILD := $(BUILD)/hello
+HELLO_ELF  := $(BUILD)/hello.elf
+
+$(HELLOBUILD)/start.o: $(HELLO_DIR)/start.S
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(HELLOBUILD)/main.o: $(HELLO_DIR)/main.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(HELLOBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(HELLOBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(HELLOBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(HELLOBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+HELLO_OBJS := \
+    $(HELLOBUILD)/start.o \
+    $(HELLOBUILD)/main.o \
+    $(HELLOBUILD)/libqsoe/state.o \
+    $(HELLOBUILD)/libqsoe/msg.o \
+    $(HELLOBUILD)/libqsoe/process.o \
+    $(HELLOBUILD)/libqsoe/thread.o
+
+$(HELLO_ELF): $(HELLO_OBJS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -static -nostdlib \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext-segment=0x10000 \
+	    -o $@ $^
+
+# ----------------------------------------------------------------------------
+# Userland CPIO — packs all spawnable binaries (tester + hello) and gets
+# embedded in taskman.elf via .incbin so taskman can fetch them at
+# runtime through libcpio. See plan §2.
 # ----------------------------------------------------------------------------
 
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
-$(USERLAND_CPIO): $(TESTER_ELF)
+$(USERLAND_CPIO): $(TESTER_ELF) $(HELLO_ELF)
 	@mkdir -p $(@D)
 	@cd $(BUILD) && \
-	    printf '%s\n' tester.elf | \
+	    printf '%s\n' tester.elf hello.elf | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=userland.cpio

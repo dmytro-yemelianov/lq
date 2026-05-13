@@ -31,7 +31,10 @@
 #  include "server.h"
 #endif
 
-#define WORKER_BASE_VADDR     0x200000UL
+/* v0.4.1: worker region starts at 1 GiB — a separate L1 PT from the
+ * image region. The 1 GiB image cap (see [[project-image-size-cap]])
+ * guarantees they never collide. */
+#define WORKER_BASE_VADDR     0x40000000UL
 #define WORKER_SLOT_SIZE      0x10000UL    /* 64 KiB per worker */
 #define WORKER_STACK_TOP_OFF  0xE000UL     /* sp = base + this */
 #define WORKER_IPC_OFF        0xF000UL     /* IPC buffer at base + this */

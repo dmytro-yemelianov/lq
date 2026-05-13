@@ -29,7 +29,8 @@ static seL4_MessageInfo_t
 tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3,
             seL4_Word *out_mr0, seL4_Word *out_mr1,
-            seL4_Word *out_mr2, seL4_Word *out_mr3)
+            seL4_Word *out_mr2, seL4_Word *out_mr3,
+            int *out_no_reply)
 {
     (void)mr3;
     pid_t caller = (pid_t)badge;
@@ -40,6 +41,7 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     *out_mr1 = 0;
     *out_mr2 = 0;
     *out_mr3 = 0;
+    *out_no_reply = 0;
 
     switch (label) {
     case TM_REQ_CHANNEL_CREATE: {
@@ -109,6 +111,39 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
                                    (unsigned)mr1, (unsigned)mr2, &old);
         if (rc) { err = (seL4_Word)(-rc); }
         else    { *out_mr0 = (seL4_Word)old; reply_len = 1; }
+        break;
+    }
+    case TM_REQ_PROCESS_CREATE: {
+        /* MR0 = path length in bytes. Path bytes ride in
+         * ipcbuf->msg[4..] — the kernel only copies that range across
+         * the IPC, MR0..3 being register-transferred. */
+        unsigned plen = (unsigned)mr0;
+        const char *path = (const char *)&qsoe_ipcbuf->msg[4];
+        pid_t new_pid = 0;
+        int rc = tm_process_create_by_name(path, plen, &new_pid);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else    { *out_mr0 = (seL4_Word)new_pid; reply_len = 1; }
+        break;
+    }
+    case TM_REQ_DEBUG_SLOT_COUNT: {
+        /* Diagnostic: return taskman's bump-pointer for cap-leak tests. */
+        extern seL4_CPtr s_next_slot;
+        *out_mr0 = (seL4_Word)s_next_slot;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_PROCESS_TERMINATE: {
+        /* MR0 = target pid (0 = self), MR1 = exit status.
+         * For self-terminate, the caller's TCB is revoked inside the
+         * handler — we signal the dispatch loop to skip Reply. */
+        pid_t target = (pid_t)mr0;
+        if (target == 0) target = caller;
+        int rc = tm_process_terminate(target, (int)mr1);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else if (target == caller) {
+            /* Caller's TCB is gone — there's no thread to reply to. */
+            *out_no_reply = 1;
+        }
         break;
     }
     case TM_REQ_THREAD_ALLOC: {
@@ -242,9 +277,15 @@ int main(seL4_BootInfo *bi)
         for (;;) __asm__ volatile("nop");
     }
 
-    /* Find tester.elf in the embedded userland CPIO. */
+    /* v0.4.1: hand the embedded CPIO and primary endpoint to server.c
+     * so TM_REQ_PROCESS_CREATE handlers can locate ELFs and badge
+     * SYSMGR caps. */
     unsigned long cpio_len = (unsigned long)
         (_userland_cpio_end - _userland_cpio_start);
+    tm_set_userland_cpio(_userland_cpio_start, cpio_len);
+    tm_set_primary_ep(primary_ep);
+
+    /* Find tester.elf in the embedded userland CPIO. */
     unsigned long elf_size = 0;
     const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
                                      "tester.elf", &elf_size);
@@ -252,8 +293,18 @@ int main(seL4_BootInfo *bi)
         sel4_debug_puts("FATAL: tester.elf not found in CPIO\n");
         for (;;) __asm__ volatile("nop");
     }
-    sel4_debug_puts("taskman: spawning tester (pid 2)...\n");
-    int sr = tm_spawn(elf, elf_size, 2, primary_ep);
+    pid_t tester_pid = tm_pid_alloc();
+    if (!tester_pid) {
+        sel4_debug_puts("FATAL: pid allocator empty\n");
+        for (;;) __asm__ volatile("nop");
+    }
+    sel4_debug_puts("taskman: spawning tester (pid=");
+    {
+        char d = '0' + (char)(tester_pid & 0x7);
+        sel4_debug_putchar(d);
+    }
+    sel4_debug_puts(")...\n");
+    int sr = tm_spawn(elf, elf_size, tester_pid, primary_ep);
     if (sr != 0) {
         sel4_debug_puts("FATAL: tm_spawn returned non-zero\n");
         for (;;) __asm__ volatile("nop");
@@ -269,12 +320,22 @@ int main(seL4_BootInfo *bi)
                                              &mr0, &mr1, &mr2, &mr3);
     for (;;) {
         seL4_Word r0, r1, r2, r3;
+        int no_reply = 0;
         seL4_MessageInfo_t reply_info = tm_dispatch(info, badge,
                                                      mr0, mr1, mr2, mr3,
-                                                     &r0, &r1, &r2, &r3);
-        mr0 = r0; mr1 = r1; mr2 = r2; mr3 = r3;
-        info = qsoe_sys_reply_recv(primary_ep, reply_info, &badge,
-                                    &mr0, &mr1, &mr2, &mr3);
+                                                     &r0, &r1, &r2, &r3,
+                                                     &no_reply);
+        if (no_reply) {
+            /* Caller's TCB was revoked (e.g. self-terminate). Skip the
+             * reply phase and just receive the next request. */
+            mr0 = 0; mr1 = 0; mr2 = 0; mr3 = 0;
+            info = qsoe_sys_recv(primary_ep, &badge,
+                                  &mr0, &mr1, &mr2, &mr3);
+        } else {
+            mr0 = r0; mr1 = r1; mr2 = r2; mr3 = r3;
+            info = qsoe_sys_reply_recv(primary_ep, reply_info, &badge,
+                                        &mr0, &mr1, &mr2, &mr3);
+        }
     }
     return 0;
 }
