@@ -65,9 +65,13 @@ SEL4BUILD   := $(SEL4TEST)/build-qsoe-riscv64
 KERNEL_SRC  := $(SEL4BUILD)/kernel/kernel.elf
 KERNEL_ELF  := $(BUILD)/kernel.elf
 
-IMAGE       := $(BUILD)/qsoe.elf
-TASKMAN_ELF := $(BUILD)/taskman.elf
-TESTER_ELF  := $(BUILD)/tester.elf
+IMAGE         := $(BUILD)/qsoe.elf
+TASKMAN_ELF   := $(BUILD)/taskman.elf
+TESTER_ELF    := $(BUILD)/tester.elf
+HELLO_ELF     := $(BUILD)/hello.elf
+INIT_ELF      := $(BUILD)/init.elf
+DSER_ELF      := $(BUILD)/devc-ser8250.elf
+USERLAND_CPIO := $(BUILD)/userland.cpio
 
 # ----------------------------------------------------------------------------
 # Platform configuration (qemu-riscv-virt, RV64)
@@ -264,208 +268,56 @@ $(GEN)/qsoe/sys_version.h: $(wildcard .git/HEAD .git/index)
 	 printf '#endif\n' >> $@
 
 # ----------------------------------------------------------------------------
-# musl libc (v0.5.1+): build $(LIBC_A) from the vendored upstream tree at
-# core/userland/libc/. The patched syscall_arch.h at patches/arch/riscv64/
-# routes every musl syscall through the __sysinfo function pointer, which
-# _qsoe_start_main initialises to qsoe_syscall_dispatch.
+# musl libc — build delegated to userland/libc/Makefile.
+#
+# Run `make -C userland/libc clean all` for a standalone libc.a rebuild;
+# the top-level `libc` target below proxies the same submake invocation
+# so existing dependencies keep working.
 # ----------------------------------------------------------------------------
-
-# Match upstream musl CFLAGS as closely as possible; add our RISC-V flags
-# and -nostdinc so we never accidentally pick up host /usr/include headers.
-MUSL_CFLAGS := $(ARCH_CFLAGS) \
-    -std=c99 -ffreestanding -nostdinc \
-    -fno-pic -fno-pie -fno-common \
-    -fno-stack-protector -fno-builtin \
-    -fexcess-precision=standard -frounding-math \
-    -D_XOPEN_SOURCE=700 \
-    -Wa,--noexecstack \
-    -Os
-
-# Include order: patched headers (so syscall_arch.h indirect-call variant
-# wins over the stock ecall one), then arch-specific, generic, generated
-# (bits/alltypes.h, bits/syscall.h, version.h), and finally the public
-# include tree.
-MUSL_INCLUDES := \
-    -I$(MUSL_PATCHES)/arch/riscv64 \
-    -I$(MUSL_DIR)/arch/riscv64 \
-    -I$(MUSL_DIR)/arch/generic \
-    -I$(MUSL_GEN)/src/internal \
-    -I$(MUSL_DIR)/src/include \
-    -I$(MUSL_DIR)/src/internal \
-    -I$(MUSL_GEN)/include \
-    -I$(MUSL_DIR)/include
-
-# Generated headers. The two sed transforms below replicate what upstream
-# musl does in its own Makefile.
-$(MUSL_GEN)/include/bits/alltypes.h: $(MUSL_DIR)/tools/mkalltypes.sed \
-                                      $(MUSL_DIR)/arch/riscv64/bits/alltypes.h.in \
-                                      $(MUSL_DIR)/include/alltypes.h.in
-	@mkdir -p $(@D)
-	sed -f $(MUSL_DIR)/tools/mkalltypes.sed \
-	    $(MUSL_DIR)/arch/riscv64/bits/alltypes.h.in \
-	    $(MUSL_DIR)/include/alltypes.h.in > $@
-
-$(MUSL_GEN)/include/bits/syscall.h: $(MUSL_DIR)/arch/riscv64/bits/syscall.h.in
-	@mkdir -p $(@D)
-	cp $< $@
-	sed -n -e s/__NR_/SYS_/p < $< >> $@
-
-# Static stand-in for upstream's git-derived version string.
-$(MUSL_GEN)/src/internal/version.h:
-	@mkdir -p $(@D)
-	@printf '#define VERSION "qsoe-vendored"\n' > $@
 
 MUSL_GEN_HDRS := $(MUSL_GEN)/include/bits/alltypes.h \
                  $(MUSL_GEN)/include/bits/syscall.h \
                  $(MUSL_GEN)/src/internal/version.h
 
-# Enumerate musl sources. We pull every .c in src/ except subtrees that
-# would drag in features QSOE doesn't have yet (dynlinker, SysV IPC,
-# Linux-specific syscalls, async I/O, mqueue). The linker prunes any
-# unused archive members from the final binary so over-building is fine.
-# Per-arch subdirs other than riscv64 are also excluded — they contain
-# hand-rolled assembly for other ISAs that won't even parse.
-MUSL_SRCS_ALL := $(shell find $(MUSL_DIR)/src -name '*.c' \
-    -not -path '*/ldso/*' \
-    -not -path '*/ipc/*' \
-    -not -path '*/linux/*' \
-    -not -path '*/mq/*' \
-    -not -path '*/aio/*' \
-    -not -path '*/aarch64/*' \
-    -not -path '*/arm/*' \
-    -not -path '*/i386/*' \
-    -not -path '*/x86_64/*' \
-    -not -path '*/x32/*' \
-    -not -path '*/m68k/*' \
-    -not -path '*/microblaze/*' \
-    -not -path '*/mips/*' \
-    -not -path '*/mips64/*' \
-    -not -path '*/mipsn32/*' \
-    -not -path '*/or1k/*' \
-    -not -path '*/powerpc/*' \
-    -not -path '*/powerpc64/*' \
-    -not -path '*/riscv32/*' \
-    -not -path '*/s390x/*' \
-    -not -path '*/sh/*' \
-    -not -path '*/loongarch64/*')
-
-MUSL_OBJS := $(patsubst $(MUSL_DIR)/%.c,$(LIBC_BUILD)/%.o,$(MUSL_SRCS_ALL))
-
-# Per-file compile rule. Header deps are coarse — every .c depends on
-# the three generated headers — but that keeps the build correct.
-$(LIBC_BUILD)/%.o: $(MUSL_DIR)/%.c $(MUSL_GEN_HDRS)
-	@mkdir -p $(@D)
-	$(CC) $(MUSL_CFLAGS) $(MUSL_INCLUDES) -c -o $@ $<
-
 AR := $(CROSS)ar
-$(LIBC_A): $(MUSL_OBJS)
-	@echo "  AR  $@ ($(words $(MUSL_OBJS)) objects)"
-	@$(AR) rcs $@ $(MUSL_OBJS)
 
 .PHONY: libc
-libc: $(LIBC_A)
+libc:
+	+$(MAKE) -C $(TOP)/userland/libc all
 
-# libqsoe is compiled into taskman with -DQSOE_LIBQSOE_IN_TASKMAN so its
-# entrypoints call tm_* handlers directly instead of doing self-IPC.
-LIBQSOE_CFLAGS := $(TM_CFLAGS) -DQSOE_LIBQSOE_IN_TASKMAN -I$(TASKMAN_DIR)
+# Order-only proxy targets — when a downstream rule has $(LIBC_A) or one
+# of $(MUSL_GEN_HDRS) as a prerequisite, make sees libc as the producer
+# and recurses into userland/libc.
+$(LIBC_A) $(MUSL_GEN_HDRS): | libc
+	@true
 
-$(TASKBUILD)/start.o: $(TASKMAN_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+# libqsoe — build delegated to userland/libqsoe/Makefile.  Produces two
+# archives:
+#   $(LIBQSOE_A)    — normal flavour (hello/init/tester/devc-ser8250)
+#   $(LIBQSOE_TM_A) — IN_TASKMAN flavour (taskman links this in)
+LIBQSOE_A    := $(BUILD)/libqsoe.a
+LIBQSOE_TM_A := $(BUILD)/libqsoe-tm.a
 
-$(TASKBUILD)/main.o: $(TASKMAN_DIR)/main.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+.PHONY: libqsoe
+libqsoe:
+	+$(MAKE) -C $(TOP)/userland/libqsoe all
 
-$(TASKBUILD)/server.o: $(TASKMAN_DIR)/server.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+$(LIBQSOE_A) $(LIBQSOE_TM_A): | libqsoe
+	@true
 
-$(TASKBUILD)/spawn.o: $(TASKMAN_DIR)/spawn.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+# taskman — build delegated to userland/taskman/Makefile.  Embeds the
+# userland CPIO via .incbin, so depends on $(USERLAND_CPIO) existing
+# first (built by the cpio rule further down).
+.PHONY: taskman
+taskman: $(USERLAND_CPIO) $(LIBQSOE_TM_A)
+	+$(MAKE) -C $(TOP)/userland/taskman all
 
-$(TASKBUILD)/pathmgr.o: $(TASKMAN_DIR)/pathmgr.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/console.o: $(TASKMAN_DIR)/console.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/cpiofs.o: $(TASKMAN_DIR)/cpiofs.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
-
-# Pull libcpio (already extracted to core/lib/cpio for the elfloader) into
-# taskman's build too, so the rootserver can locate tester.elf inside
-# the embedded userland CPIO at runtime.
-$(TASKBUILD)/cpio.o: $(LIBCPIO)/src/cpio.c
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
-
-$(TASKBUILD)/libqsoe/channel.o: $(LIBQSOE_DIR)/src/channel.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/libqsoe/connect.o: $(LIBQSOE_DIR)/src/connect.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TASKBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
-
-TASKMAN_OBJS := \
-    $(TASKBUILD)/start.o \
-    $(TASKBUILD)/main.o \
-    $(TASKBUILD)/server.o \
-    $(TASKBUILD)/spawn.o \
-    $(TASKBUILD)/pathmgr.o \
-    $(TASKBUILD)/console.o \
-    $(TASKBUILD)/cpiofs.o \
-    $(TASKBUILD)/cpio.o \
-    $(TASKBUILD)/userland_archive.o \
-    $(TASKBUILD)/libqsoe/channel.o \
-    $(TASKBUILD)/libqsoe/connect.o \
-    $(TASKBUILD)/libqsoe/state.o \
-    $(TASKBUILD)/libqsoe/msg.o \
-    $(TASKBUILD)/libqsoe/thread.o \
-    $(TASKBUILD)/libqsoe/process.o \
-    $(TASKBUILD)/libqsoe/io.o
-
-$(TASKMAN_ELF): $(TASKMAN_OBJS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -static -nostdlib \
-	    -Wl,--build-id=none \
-	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $^
+$(TASKMAN_ELF): | taskman
+	@true
 
 # ----------------------------------------------------------------------------
 # Tester — second user-space program, spawned by taskman.
 # ----------------------------------------------------------------------------
-
-# libqsoe for tester is the same source as libqsoe-in-taskman, just
-# compiled WITHOUT QSOE_LIBQSOE_IN_TASKMAN — so its entrypoints take
-# the real-IPC path (seL4_Call to taskman) instead of direct tm_*
-# function calls.
-TESTER_LIBQSOE_CFLAGS := $(TM_CFLAGS) -I$(TASKMAN_DIR)
 
 $(TESTBUILD)/start.o: $(TESTER_DIR)/start.S
 	@mkdir -p $(@D)
@@ -478,66 +330,22 @@ $(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-$(TESTBUILD)/libqsoe/channel.o: $(LIBQSOE_DIR)/src/channel.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/connect.o: $(LIBQSOE_DIR)/src/connect.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/start_main.o: $(LIBQSOE_DIR)/src/start_main.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/syscall_dispatch.o: $(LIBQSOE_DIR)/src/syscall_dispatch.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(TESTBUILD)/libqsoe/float128_stubs.o: $(LIBQSOE_DIR)/src/float128_stubs.c
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
+# Tester links against $(LIBQSOE_A) (normal flavour: real-IPC path).
+# --whole-archive ensures start_main / syscall_dispatch / float128_stubs
+# are pulled in even when tester's own code doesn't reference them
+# directly (start.S calls _qsoe_start_main; musl needs __sysinfo; etc.).
 TESTER_OBJS := \
     $(TESTBUILD)/start.o \
-    $(TESTBUILD)/main.o \
-    $(TESTBUILD)/libqsoe/channel.o \
-    $(TESTBUILD)/libqsoe/connect.o \
-    $(TESTBUILD)/libqsoe/state.o \
-    $(TESTBUILD)/libqsoe/msg.o \
-    $(TESTBUILD)/libqsoe/thread.o \
-    $(TESTBUILD)/libqsoe/process.o \
-    $(TESTBUILD)/libqsoe/start_main.o \
-    $(TESTBUILD)/libqsoe/io.o \
-    $(TESTBUILD)/libqsoe/syscall_dispatch.o \
-    $(TESTBUILD)/libqsoe/float128_stubs.o
+    $(TESTBUILD)/main.o
 
-$(TESTER_ELF): $(TESTER_OBJS) $(LIBC_A)
+$(TESTER_ELF): $(TESTER_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(TESTER_OBJS) $(LIBC_A)
+	    -o $@ $(TESTER_OBJS) \
+	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
+	    $(LIBC_A)
 
 # ----------------------------------------------------------------------------
 # hello — first non-taskman/non-tester userland program. Spawned by
@@ -546,7 +354,6 @@ $(TESTER_ELF): $(TESTER_OBJS) $(LIBC_A)
 
 HELLO_DIR  := $(TOP)/userland/hello
 HELLOBUILD := $(BUILD)/hello
-HELLO_ELF  := $(BUILD)/hello.elf
 
 $(HELLOBUILD)/start.o: $(HELLO_DIR)/start.S
 	@mkdir -p $(@D)
@@ -561,66 +368,18 @@ $(HELLOBUILD)/main.o: $(HELLO_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS)
 	    -isystem $(MUSL_DIR)/arch/generic \
 	    -c -o $@ $<
 
-$(HELLOBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/msg.o: $(LIBQSOE_DIR)/src/msg.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/channel.o: $(LIBQSOE_DIR)/src/channel.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/connect.o: $(LIBQSOE_DIR)/src/connect.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/start_main.o: $(LIBQSOE_DIR)/src/start_main.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/syscall_dispatch.o: $(LIBQSOE_DIR)/src/syscall_dispatch.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/libqsoe/float128_stubs.o: $(LIBQSOE_DIR)/src/float128_stubs.c
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
 HELLO_OBJS := \
     $(HELLOBUILD)/start.o \
-    $(HELLOBUILD)/main.o \
-    $(HELLOBUILD)/libqsoe/state.o \
-    $(HELLOBUILD)/libqsoe/msg.o \
-    $(HELLOBUILD)/libqsoe/process.o \
-    $(HELLOBUILD)/libqsoe/thread.o \
-    $(HELLOBUILD)/libqsoe/channel.o \
-    $(HELLOBUILD)/libqsoe/connect.o \
-    $(HELLOBUILD)/libqsoe/start_main.o \
-    $(HELLOBUILD)/libqsoe/io.o \
-    $(HELLOBUILD)/libqsoe/syscall_dispatch.o \
-    $(HELLOBUILD)/libqsoe/float128_stubs.o
+    $(HELLOBUILD)/main.o
 
-$(HELLO_ELF): $(HELLO_OBJS) $(LIBC_A)
+$(HELLO_ELF): $(HELLO_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(HELLO_OBJS) $(LIBC_A)
+	    -o $@ $(HELLO_OBJS) \
+	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
+	    $(LIBC_A)
 
 # ----------------------------------------------------------------------------
 # init — /sbin/init (v0.6.1+). Spawned by taskman at boot; orchestrates
@@ -629,7 +388,6 @@ $(HELLO_ELF): $(HELLO_OBJS) $(LIBC_A)
 
 INIT_DIR   := $(TOP)/userland/init
 INITBUILD  := $(BUILD)/init
-INIT_ELF   := $(BUILD)/init.elf
 
 $(INITBUILD)/start.o: $(INIT_DIR)/start.S
 	@mkdir -p $(@D)
@@ -644,30 +402,18 @@ $(INITBUILD)/main.o: $(INIT_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS)
 	    -isystem $(MUSL_DIR)/arch/generic \
 	    -c -o $@ $<
 
-$(INITBUILD)/libqsoe/%.o: $(LIBQSOE_DIR)/src/%.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
 INIT_OBJS := \
     $(INITBUILD)/start.o \
-    $(INITBUILD)/main.o \
-    $(INITBUILD)/libqsoe/state.o \
-    $(INITBUILD)/libqsoe/msg.o \
-    $(INITBUILD)/libqsoe/process.o \
-    $(INITBUILD)/libqsoe/thread.o \
-    $(INITBUILD)/libqsoe/channel.o \
-    $(INITBUILD)/libqsoe/connect.o \
-    $(INITBUILD)/libqsoe/start_main.o \
-    $(INITBUILD)/libqsoe/io.o \
-    $(INITBUILD)/libqsoe/syscall_dispatch.o \
-    $(INITBUILD)/libqsoe/float128_stubs.o
+    $(INITBUILD)/main.o
 
-$(INIT_ELF): $(INIT_OBJS) $(LIBC_A)
+$(INIT_ELF): $(INIT_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(INIT_OBJS) $(LIBC_A)
+	    -o $@ $(INIT_OBJS) \
+	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
+	    $(LIBC_A)
 
 # ----------------------------------------------------------------------------
 # devc-ser8250 — 16550 UART driver / resource manager (v0.6.1+).
@@ -675,58 +421,14 @@ $(INIT_ELF): $(INIT_OBJS) $(LIBC_A)
 # on a dedicated thread bound to a kernel-signaled Notification.
 # ----------------------------------------------------------------------------
 
-DSER_DIR   := $(TOP)/userland/devc-ser8250
-DSERBUILD  := $(BUILD)/devc-ser8250
-DSER_ELF   := $(BUILD)/devc-ser8250.elf
 
-$(DSERBUILD)/start.o: $(DSER_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+# devc-ser8250 — build delegated to userland/devc-ser8250/Makefile.
+.PHONY: devc-ser8250
+devc-ser8250: $(LIBQSOE_A) $(LIBC_A)
+	+$(MAKE) -C $(TOP)/userland/devc-ser8250 all
 
-$(DSERBUILD)/main.o: $(DSER_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS) \
-                     $(DSER_DIR)/uart.h $(DSER_DIR)/ring.h
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) \
-	    -isystem $(MUSL_GEN)/include \
-	    -isystem $(MUSL_DIR)/include \
-	    -isystem $(MUSL_DIR)/arch/riscv64 \
-	    -isystem $(MUSL_DIR)/arch/generic \
-	    -c -o $@ $<
-
-$(DSERBUILD)/uart.o: $(DSER_DIR)/uart.c $(DSER_DIR)/uart.h $(DSER_DIR)/ring.h
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(DSERBUILD)/ring.o: $(DSER_DIR)/ring.c $(DSER_DIR)/ring.h
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(DSERBUILD)/libqsoe/%.o: $(LIBQSOE_DIR)/src/%.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
-
-DSER_OBJS := \
-    $(DSERBUILD)/start.o \
-    $(DSERBUILD)/main.o \
-    $(DSERBUILD)/uart.o \
-    $(DSERBUILD)/ring.o \
-    $(DSERBUILD)/libqsoe/state.o \
-    $(DSERBUILD)/libqsoe/msg.o \
-    $(DSERBUILD)/libqsoe/process.o \
-    $(DSERBUILD)/libqsoe/thread.o \
-    $(DSERBUILD)/libqsoe/channel.o \
-    $(DSERBUILD)/libqsoe/connect.o \
-    $(DSERBUILD)/libqsoe/start_main.o \
-    $(DSERBUILD)/libqsoe/io.o \
-    $(DSERBUILD)/libqsoe/syscall_dispatch.o \
-    $(DSERBUILD)/libqsoe/float128_stubs.o
-
-$(DSER_ELF): $(DSER_OBJS) $(LIBC_A)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -static -nostdlib \
-	    -Wl,--build-id=none \
-	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(DSER_OBJS) $(LIBC_A)
+$(DSER_ELF): | devc-ser8250
+	@true
 
 # ----------------------------------------------------------------------------
 # Userland CPIO — packs all spawnable binaries (init + tester + hello) and
@@ -734,7 +436,6 @@ $(DSER_ELF): $(DSER_OBJS) $(LIBC_A)
 # runtime through libcpio. See plan §2.
 # ----------------------------------------------------------------------------
 
-USERLAND_CPIO := $(BUILD)/userland.cpio
 
 $(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF)
 	@mkdir -p $(BUILD)/cpio-root/bin
@@ -748,20 +449,8 @@ $(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF)
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)
 
-$(TASKBUILD)/userland_archive.S: $(USERLAND_CPIO) $(firstword $(MAKEFILE_LIST))
-	@mkdir -p $(@D)
-	@printf '%s\n' \
-	    '.section .userland_cpio,"a"' \
-	    '.balign 4096' \
-	    '.globl _userland_cpio_start, _userland_cpio_end' \
-	    '_userland_cpio_start:' \
-	    '.incbin "$<"' \
-	    '_userland_cpio_end:' \
-	    > $@
-
-$(TASKBUILD)/userland_archive.o: $(TASKBUILD)/userland_archive.S
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+# userland_archive.S/.o (CPIO .incbin shim) is built by the taskman
+# submake at $(BUILD)/taskman/userland_archive.{S,o}.
 
 # ----------------------------------------------------------------------------
 # Kernel: produced one-time by sel4test CMake build

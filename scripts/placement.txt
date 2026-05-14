@@ -297,102 +297,85 @@ projects/musllibc/ldso/                             userland/libc/ldso/
 # === musllibc: seL4-specific patches (RISC-V 64-bit) ===
 projects/musllibc/patches/arch/riscv64/             userland/libc/patches/arch/riscv64/
 
-# === musllibc: Exclude other architectures from src/ ===
-!userland/libc/src/fenv/riscv32/
-!userland/libc/src/fenv/aarch64/
-!userland/libc/src/fenv/arm/
-!userland/libc/src/fenv/i386/
-!userland/libc/src/fenv/m68k/
-!userland/libc/src/fenv/mips/
-!userland/libc/src/fenv/mips64/
-!userland/libc/src/fenv/mipsn32/
-!userland/libc/src/fenv/powerpc/
-!userland/libc/src/fenv/powerpc64/
-!userland/libc/src/fenv/s390x/
-!userland/libc/src/fenv/sh/
-!userland/libc/src/fenv/x32/
-!userland/libc/src/fenv/x86_64/
-!userland/libc/src/fenv/loongarch64/
-!userland/libc/src/ldso/riscv32/
-!userland/libc/src/ldso/aarch64/
-!userland/libc/src/ldso/arm/
-!userland/libc/src/ldso/i386/
-!userland/libc/src/ldso/mips/
-!userland/libc/src/ldso/mips64/
-!userland/libc/src/ldso/mipsn32/
-!userland/libc/src/ldso/powerpc/
-!userland/libc/src/ldso/powerpc64/
-!userland/libc/src/ldso/s390x/
-!userland/libc/src/ldso/sh/
-!userland/libc/src/ldso/x32/
-!userland/libc/src/ldso/x86_64/
-!userland/libc/src/ldso/loongarch64/
-!userland/libc/src/math/riscv32/
-!userland/libc/src/math/aarch64/
-!userland/libc/src/math/arm/
-!userland/libc/src/math/i386/
-!userland/libc/src/math/m68k/
-!userland/libc/src/math/mips/
-!userland/libc/src/math/powerpc/
-!userland/libc/src/math/s390x/
-!userland/libc/src/math/sh/
-!userland/libc/src/math/x32/
-!userland/libc/src/math/x86_64/
-!userland/libc/src/math/loongarch64/
-!userland/libc/src/process/riscv32/
-!userland/libc/src/process/aarch64/
-!userland/libc/src/process/arm/
-!userland/libc/src/process/i386/
-!userland/libc/src/process/s390x/
-!userland/libc/src/process/sh/
-!userland/libc/src/process/x32/
-!userland/libc/src/process/x86_64/
-!userland/libc/src/setjmp/riscv32/
-!userland/libc/src/setjmp/aarch64/
-!userland/libc/src/setjmp/arm/
-!userland/libc/src/setjmp/i386/
-!userland/libc/src/setjmp/m68k/
-!userland/libc/src/setjmp/microblaze/
-!userland/libc/src/setjmp/mips/
-!userland/libc/src/setjmp/mips64/
-!userland/libc/src/setjmp/mipsn32/
-!userland/libc/src/setjmp/or1k/
-!userland/libc/src/setjmp/powerpc/
-!userland/libc/src/setjmp/powerpc64/
-!userland/libc/src/setjmp/s390x/
-!userland/libc/src/setjmp/sh/
-!userland/libc/src/setjmp/x32/
-!userland/libc/src/setjmp/x86_64/
-!userland/libc/src/setjmp/loongarch64/
-!userland/libc/src/signal/riscv32/
-!userland/libc/src/signal/aarch64/
-!userland/libc/src/signal/arm/
-!userland/libc/src/signal/i386/
-!userland/libc/src/signal/m68k/
-!userland/libc/src/signal/mips/
-!userland/libc/src/signal/mips64/
-!userland/libc/src/signal/mipsn32/
-!userland/libc/src/signal/or1k/
-!userland/libc/src/signal/powerpc/
-!userland/libc/src/signal/powerpc64/
-!userland/libc/src/signal/s390x/
-!userland/libc/src/signal/sh/
-!userland/libc/src/signal/x32/
-!userland/libc/src/signal/x86_64/
-!userland/libc/src/signal/loongarch64/
-!userland/libc/src/thread/riscv32/
-!userland/libc/src/thread/aarch64/
-!userland/libc/src/thread/arm/
-!userland/libc/src/thread/i386/
-!userland/libc/src/thread/m68k/
-!userland/libc/src/thread/microblaze/
-!userland/libc/src/thread/mips/
-!userland/libc/src/thread/mips64/
-!userland/libc/src/thread/mipsn32/
-!userland/libc/src/thread/or1k/
-!userland/libc/src/thread/powerpc/
-!userland/libc/src/thread/powerpc64/
-!userland/libc/src/thread/s390x/
-!userland/libc/src/thread/sh/
-!userland/libc/src/thread/x32/
-!userland/libc/src/thread/x86_64/
+# === musllibc: Exclude non-RISC-V64 arch subdirs from src/ ===
+# Recursive-dir-exclusion syntax (path/**/dirname/) strips every
+# <dirname> subdirectory anywhere under userland/libc/src/.
+!userland/libc/src/**/aarch64/
+!userland/libc/src/**/arm/
+!userland/libc/src/**/i386/
+!userland/libc/src/**/loongarch64/
+!userland/libc/src/**/m68k/
+!userland/libc/src/**/microblaze/
+!userland/libc/src/**/mips/
+!userland/libc/src/**/mips64/
+!userland/libc/src/**/mipsn32/
+!userland/libc/src/**/or1k/
+!userland/libc/src/**/powerpc/
+!userland/libc/src/**/powerpc64/
+!userland/libc/src/**/riscv32/
+!userland/libc/src/**/s390x/
+!userland/libc/src/**/sh/
+!userland/libc/src/**/x32/
+!userland/libc/src/**/x86_64/
+
+# === musllibc: Subtree exclusions ===
+#   aio/      Linux io_submit/io_getevents.
+#   ipc/      System V IPC (shmget, msgctl, semop).
+#   ldso/     Dynamic linker.  QSOE is static-only.
+#   linux/    Explicitly Linux-only syscalls (pivot_root, signalfd, …).
+#   mq/       POSIX message queues (uses mqueue Linux syscalls).
+!userland/libc/src/aio/
+!userland/libc/src/ipc/
+!userland/libc/src/ldso/
+!userland/libc/src/linux/
+!userland/libc/src/mq/
+
+# === musllibc: Per-file Linux-specific exclusions ===
+# src/process/: fork / exec / posix_spawn / wait family — each uses
+# Linux clone()/execve()/waitid().  libqsoe owns posix_spawn/waitpid
+# at link time (strong-symbol override).  Keep portable spawnattr_*
+# and spawn_file_actions_* struct setters.
+!userland/libc/src/process/fork.c
+!userland/libc/src/process/vfork.c
+!userland/libc/src/process/_Fork.c
+!userland/libc/src/process/posix_spawn.c
+!userland/libc/src/process/posix_spawnp.c
+!userland/libc/src/process/wait.c
+!userland/libc/src/process/waitid.c
+!userland/libc/src/process/waitpid.c
+!userland/libc/src/process/execve.c
+!userland/libc/src/process/execvp.c
+!userland/libc/src/process/execv.c
+!userland/libc/src/process/execl.c
+!userland/libc/src/process/execle.c
+!userland/libc/src/process/execlp.c
+!userland/libc/src/process/fexecve.c
+!userland/libc/src/process/riscv64/vfork.s
+
+# src/thread/: clone()/futex callers.  libqsoe will provide its own
+# pthread surface (Stream B+).  Most of src/thread/ stays because it
+# contains musl-internal helpers (__lock, __unlock, __synccall) that
+# stdio's open-file list relies on.  These are atomic-based, not
+# kernel-thread-based.
+!userland/libc/src/thread/pthread_create.c
+!userland/libc/src/thread/pthread_barrier_wait.c
+!userland/libc/src/thread/pthread_cond_timedwait.c
+!userland/libc/src/thread/pthread_mutexattr_setprotocol.c
+!userland/libc/src/thread/pthread_mutex_timedlock.c
+!userland/libc/src/thread/pthread_mutex_trylock.c
+!userland/libc/src/thread/pthread_mutex_unlock.c
+!userland/libc/src/thread/__timedwait.c
+!userland/libc/src/thread/__wait.c
+!userland/libc/src/thread/riscv64/clone.s
+
+# src/unistd/: Linux ID model.  setresuid/setresgid use Linux extension
+# syscalls; setegid/seteuid wrap setresuid; acct enables Linux process
+# accounting.
+!userland/libc/src/unistd/setresuid.c
+!userland/libc/src/unistd/setresgid.c
+!userland/libc/src/unistd/setegid.c
+!userland/libc/src/unistd/seteuid.c
+!userland/libc/src/unistd/acct.c
+
+# src/misc/: setdomainname is a Linux extension.
+!userland/libc/src/misc/setdomainname.c

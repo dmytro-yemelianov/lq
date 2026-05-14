@@ -1,0 +1,27 @@
+/*
+ * qsh — QSOE shell (derived from MirBSD mksh)
+ *
+ * Copyright (c) 19xx pdksh authors
+ * Copyright (c) 2002-2025 Thorsten Glaser <tg@mirbsd.org>
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef RLIMITS_OPTCS
+#if defined(RLIMITS_DEFNS)
+#elif defined(RLIMITS_ITEMS)
+#define FN(lname,lg,ls,lw,lopt) (const struct limits *)(&rlimits_ ## lg),
+#endif
+#ifndef F0
+#define F0 FN
+#endif
+#undef F0
+#undef FN
+#undef RLIMITS_DEFNS
+#undef RLIMITS_ITEMS
+#endif
+#ifdef RLIMITS_OPTCS
+"a"
+"H"
+"S"
+#undef RLIMITS_OPTCS
+#endif

@@ -20,8 +20,12 @@
 #   source/dir/**/*.h                     dest/dir/              # Recursive glob
 #
 # Exclusion patterns (processed after all copies):
-#   !exclude/pattern/                     # Exclude entire directory
-#   !exclude/**/*.txt                     # Exclude by glob pattern
+#   !exclude/pattern/                     # Exclude entire directory (literal path)
+#   !exclude/path/**/dirname/             # Recursive directory exclusion:
+#                                         # delete every dir named <dirname>
+#                                         # anywhere under <path>
+#   !exclude/**/*.txt                     # Exclude by file-glob pattern (recursive)
+#   !exclude/dir/*.x                      # Exclude by file-glob (one level)
 #
 
 set -e
@@ -288,15 +292,28 @@ if [[ ${#EXCLUSIONS[@]} -gt 0 ]]; then
     for excl in "${EXCLUSIONS[@]}"; do
         excl_path="${OUTPUT_DIR}/${excl}"
 
-        if [[ "${excl}" == */ ]]; then
-            # Directory exclusion
+        if [[ "${excl}" == *"**"*"/" ]]; then
+            # Recursive directory exclusion: path/**/dirname/
+            # Strips every directory named <dirname> anywhere under <path>.
+            base="${excl%%\**}"; base="${base%/}"
+            tail="${excl%/}"             # strip trailing /
+            dirname="${tail##*/}"        # last path component
+            if [[ -d "${OUTPUT_DIR}/${base}" ]]; then
+                while IFS= read -r -d '' d; do
+                    count=$(find "${d}" -type f 2>/dev/null | wc -l)
+                    rm -rf "${d}"
+                    excluded=$((excluded + count))
+                done < <(find "${OUTPUT_DIR}/${base}" -type d -name "${dirname}" -print0 2>/dev/null)
+            fi
+        elif [[ "${excl}" == */ ]]; then
+            # Directory exclusion (literal path)
             if [[ -d "${excl_path%/}" ]]; then
                 count=$(find "${excl_path%/}" -type f | wc -l)
                 rm -rf "${excl_path%/}"
                 excluded=$((excluded + count))
             fi
         elif [[ "${excl}" == *"**"* ]]; then
-            # Recursive glob exclusion
+            # Recursive file-glob exclusion: path/**/*.x
             base="${excl%%\**}"
             base="${base%/}"
             pattern="${excl##*/}"

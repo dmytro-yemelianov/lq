@@ -1,0 +1,52 @@
+Original mksh licence (kept for the historical record)
+======================================================
+
+The MirOS Licence — also spelt "MirBSD Licence" — is the licence
+used for original works authored by Thorsten Glaser and other
+MirBSD/MirOS contributors, including mksh (the MirBSD Korn Shell)
+that was imported into QRV-OS at userland/sh/ and serves as the
+basis for the QRV System Shell.
+
+The MirOS Licence explicitly grants the right to sublicense.  QRV
+exercises that right: every file in userland/sh/ is now distributed
+under SPDX-License-Identifier: Apache-2.0 (see the per-file
+headers).  The text below is preserved here as the "accompanying
+document" the MirOS Licence asks for.
+
+SPDX identifier of the original licence: MirOS
+
+Original copyright holders are recorded in the per-file copyright
+lines at the top of each affected source file.
+
+License text
+------------
+
+Copyright (c) <years> <author(s)>
+
+Provided that these terms and disclaimer and all copyright notices
+are retained or reproduced in an accompanying document, permission
+is granted to deal in this work without restriction, including un-
+limited rights to use, publicly perform, distribute, sell, modify,
+merge, give away, or sublicence.
+
+This work is provided "AS IS" and WITHOUT WARRANTY of any kind, to
+the utmost extent permitted by applicable law, neither express nor
+implied; without malicious intent or gross negligence. In no event
+may a licensor, author or contributor be held liable for indirect,
+direct, other damage, loss, or other issues arising in any way out
+of dealing in the work, even if advised of the possibility of such
+damage or existence of a defect, except proven that it results out
+of said person's immediate fault when using the work as intended.
+
+Notes for QRV-OS users
+----------------------
+
+A small number of files in userland/sh/ are licensed under different
+permissive terms (preserved per file via SPDX-License-Identifier):
+
+  * strlcpy.c       — ISC license (Todd C. Miller, OpenBSD)
+  * mbsdcc.h        — CC0-1.0 OR MirOS  (mirabilos)
+  * mbsdint.h       — CC0-1.0 OR MirOS  (mirabilos)
+
+The full ISC and CC0-1.0 license texts are available at
+https://spdx.org/licenses/.

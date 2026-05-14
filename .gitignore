@@ -9,11 +9,6 @@ CLAUDE.md
 # Upstream checkout pulled by extraction script
 /sel4test-full/
 
-# QRV shell source pulled by scripts/pull-qsh.sh (v0.6.2 compile-attempt
-# research; license — mixed QNX-QCL-2.0 + Yuri's Apache 2.0 — needs
-# resolution before committing into QSOE proper).
-/userland/qsh/
-
 *.aux
 *.fdb_latexmk
 *.fls
