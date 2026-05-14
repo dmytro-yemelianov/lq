@@ -516,26 +516,80 @@ Wire requests:
           server-side scoid.  Empty queue $\to$ \texttt{ENOENT}.
 \end{itemize}
 
-\texttt{MsgReceive} polls \texttt{TM\_REQ\_PULSE\_FETCH} \emph{before}
-falling back to \texttt{seL4\_Recv} on the channel's endpoint.  If a
-pulse is available it's returned immediately; otherwise the receiver
-blocks for a regular synchronous message.
+\subsection{Wake-up: bound Notifications (v0.4.3)}
 
-\subsection{v0.4.2 limitation: poll-only}
+Each \texttt{tm\_channel\_t} carries a \texttt{Notification} object
+alongside the endpoint.  At \texttt{ChannelCreate} time, taskman:
 
-A receiver already blocked in \texttt{seL4\_Recv} when a pulse arrives
-does \emph{not} wake on the pulse alone.  It wakes only when a regular
-message also arrives on the endpoint, and at that point the
-next \texttt{MsgReceive} call will drain the queued pulse.  This is
-fine for event-driven servers that always cycle back to
-\texttt{MsgReceive}; it isn't full QNX semantics for long-running
-threads that don't poll.
+\begin{enumerate}
+    \item retypes a \texttt{Notification} into \texttt{ntfn\_master};
+    \item mints a Send-cap (\texttt{ntfn\_sig}) into its own CSpace
+          with badge \texttt{QSOE\_NTFN\_BADGE\_BIT} ($= 2^{63}$);
+    \item calls \texttt{seL4\_TCB\_BindNotification(owner\_tcb,
+          ntfn\_master)} so signals on the notification wake the
+          owner's TCB even when it is blocked on \texttt{seL4\_Recv}.
+\end{enumerate}
 
-The real fix --- a \texttt{Notification} per channel, bound to the
-receiving TCB via \texttt{seL4\_TCB\_BindNotification}, signalled by
-taskman on pulse delivery --- is queued for v0.4.3 (Tier 2).  It will
-let pulses wake a blocked receiver in addition to the queue
-guaranteeing delivery on later poll.
+\texttt{tm\_pulse\_send}, after queueing the pulse, fires
+\texttt{seL4\_Signal(ntfn\_sig)}.  Because the cap is badged with
+bit~63, the receiver's \texttt{seL4\_Recv} wakes and returns a badge
+whose top bit is set --- distinguishable from regular EP-message
+badges, which encode pids ($\le 255$).  If more pulses remain in the
+queue after a fetch, taskman re-signals so the next
+\texttt{MsgReceive} wakes immediately.
+
+\texttt{MsgReceive} therefore does:
+
+\begin{enumerate}
+    \item single \texttt{seL4\_Recv} on the channel's endpoint
+          (kernel may wake from either an EP message or the bound
+          Notification);
+    \item if \texttt{badge \& QSOE\_NTFN\_BADGE\_BIT}, issue
+          \texttt{TM\_REQ\_PULSE\_FETCH} to taskman and return the
+          dequeued pulse as a \texttt{struct \_pulse} with
+          \texttt{QSOE\_MI\_PULSE} set on \texttt{flags};
+    \item otherwise unpack MRs as a regular synchronous message.
+\end{enumerate}
+
+The v0.4.2 unconditional pre-poll is gone.  Cost per operation:
+
+\begin{center}
+\begin{tabular}{lrr}
+\hline
+                        & v0.4.2 & v0.4.3 \\
+\hline
+\texttt{MsgSendPulse}   & 4 IPCs & 2 IPCs \\
+\texttt{MsgReceive} (no pulse pending)
+                        & 3 IPCs & \textbf{1 IPC} \\
+\texttt{MsgReceive} (pulse pending)
+                        & 4 IPCs & 2 IPCs \\
+\hline
+\end{tabular}
+\end{center}
+
+The big win is the second row: every \texttt{MsgReceive} used to pay
+a 2-IPC poll tax whether or not pulses were in play.  That tax is
+gone.
+
+\subsection{Limitations (v0.4.3)}
+
+\begin{itemize}
+    \item \textbf{One bound Notification per TCB} is an seL4 hard
+          limit.  If a thread \texttt{ChannelCreate}s a second channel
+          while the first is alive, the second channel's Notification
+          is allocated but its bind fails; taskman tears the
+          Notification down and the channel works for synchronous
+          IPC only --- queued pulses won't fire a wake.  In practice
+          a receiver owns one channel per thread, so this rarely
+          matters; \texttt{ChannelDestroy} unbinds, freeing the slot
+          for the next channel.
+    \item \textbf{Senders still proxy through taskman} for the queue
+          push.  A 1-IPC direct \texttt{Signal} path (sender holds a
+          badged Send-cap on the channel's Notification) is possible
+          but requires shared memory for the (code, value) payload,
+          since the Notification badge alone can't carry queueable
+          data under OR-accumulation.  Deferred.
+\end{itemize}
 
 \section{Relationship to musl libc}
 

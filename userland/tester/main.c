@@ -212,9 +212,13 @@ int main(pid_t pid)
         }
     }
 
-    /* --- 7a. Pulses (v0.4.2). Create a side-channel, self-connect to it,
-     *         send 3 pulses with different code/value, then MsgReceive
-     *         3 times — each fills _pulse via taskman's queue. --- */
+    /* --- 7a. Pulses (v0.4.2 + v0.4.3 bound-Notification wake). Create a
+     *         side-channel, self-connect to it, spawn a sender thread on
+     *         hart 1, and MsgReceive on hart 0. The sender's busy-spin
+     *         delay ensures the first MsgReceive actually blocks — its
+     *         wake is delivered by the bound Notification kernel-side
+     *         when the sender's MsgSendPulse signals it. Subsequent
+     *         receives may find pulses already queued (faster path). --- */
     {
         int pulse_chid = ChannelCreate(QSOE_SIDE_CHANNEL);
         sel4_debug_puts("[tester] pulse chid=");
@@ -227,17 +231,14 @@ int main(pid_t pid)
         puthex((unsigned long)pulse_coid);
         sel4_debug_putchar('\n');
 
-        for (int i = 0; i < 3; ++i) {
-            int rc = MsgSendPulse(pulse_coid, 10, /*code=*/i + 1,
-                                   /*value=*/(i + 1) * 100);
-            sel4_debug_puts("[tester] MsgSendPulse(code=");
-            putd(i + 1);
-            sel4_debug_puts(",val=");
-            putd((i + 1) * 100);
-            sel4_debug_puts(") -> rc=");
-            putd(rc);
-            sel4_debug_putchar('\n');
-        }
+        extern void *worker_pulse_sender_fn(void *);
+        struct _thread_attr at = { 0 };
+        at.runmask = 0x2;  /* hart 1 — runs in parallel with main on hart 0 */
+        int sender_tid = ThreadCreate(0, worker_pulse_sender_fn,
+                                       (void *)(long)pulse_coid, &at);
+        sel4_debug_puts("[tester] pulse sender tid=");
+        putd(sender_tid);
+        sel4_debug_putchar('\n');
 
         for (int i = 0; i < 3; ++i) {
             struct _pulse p;
@@ -256,14 +257,19 @@ int main(pid_t pid)
             sel4_debug_putchar('\n');
         }
 
+        void *st = 0;
+        ThreadJoin(sender_tid, &st);
+
         ConnectDetach(pulse_coid);
         ChannelDestroy(pulse_chid);
     }
 
-    /* --- 7b. posix_spawn hello.elf. v0.4.1: a sibling process spawned
-     *         from this one, not from taskman. No waitpid yet — we
-     *         yield to let hello print, then ProcessTerminate as
-     *         insurance in case hello hasn't exited on its own. --- */
+    /* --- 7b. posix_spawn hello.elf as a tiny IPC server (v0.4.3).
+     *         hello now does ChannelCreate + MsgReceive+Reply loop.
+     *         We ConnectAttach to hello's chid=1 with retry (it may
+     *         not have created the channel yet — yields let it run);
+     *         then MsgSend 3 round-trips. ConnectServerInfo confirms
+     *         the server identity (pid != taskman). --- */
     {
         pid_t hpid = 0;
         int rc = posix_spawn(&hpid, "hello.elf", 0, 0, 0, 0);
@@ -272,7 +278,50 @@ int main(pid_t pid)
         sel4_debug_puts(" pid=");
         putd((int)hpid);
         sel4_debug_putchar('\n');
+
         if (rc == 0) {
+            /* Give hello a few ticks to reach ChannelCreate. */
+            for (int i = 0; i < 4; ++i) qsoe_sys_yield();
+
+            int hcoid = -1;
+            for (int try = 0; try < 8 && hcoid < 0; ++try) {
+                hcoid = ConnectAttach(ND_LOCAL_NODE, hpid, /*chid=*/1, 0, 0);
+                if (hcoid < 0) qsoe_sys_yield();
+            }
+            sel4_debug_puts("[tester] ConnectAttach(hello) -> coid=");
+            putd(hcoid);
+            sel4_debug_putchar('\n');
+
+            if (hcoid >= 0) {
+                /* Introspect: confirm we're really connected to hello. */
+                struct _server_info si;
+                int sirc = ConnectServerInfo(0, hcoid, &si);
+                sel4_debug_puts("[tester] hello ConnectServerInfo: rc=");
+                putd(sirc);
+                sel4_debug_puts(" pid=");
+                putd((int)si.pid);
+                sel4_debug_puts(" chid=");
+                putd(si.chid);
+                sel4_debug_putchar('\n');
+
+                for (int i = 0; i < 3; ++i) {
+                    unsigned long payload = 1000UL + (unsigned long)i;
+                    unsigned long reply = 0;
+                    int mr = MsgSend(hcoid, &payload, sizeof payload,
+                                      &reply, sizeof reply);
+                    sel4_debug_puts("[tester] MsgSend(hello, ");
+                    putd((int)payload);
+                    sel4_debug_puts(") rc=");
+                    putd(mr);
+                    sel4_debug_puts(" reply=");
+                    putd((int)reply);
+                    sel4_debug_putchar('\n');
+                }
+
+                ConnectDetach(hcoid);
+            }
+
+            /* Yield until hello finishes its loop and exits. */
             for (int i = 0; i < 8; ++i) qsoe_sys_yield();
         }
     }
@@ -356,6 +405,29 @@ void *worker_loop_fn(void *arg)
     }
     sel4_debug_puts("[loop worker] finished without cancel?!\n");
     return (void *)0xBADBADUL;
+}
+
+/* v0.4.3: pulse-sender worker. Pinned to hart 1 so it can run while
+ * the main thread is parked in MsgReceive on hart 0. Brief busy-spin
+ * before each send so the first MsgReceive on main actually blocks
+ * (and exercises the bound-Notification wake path) rather than
+ * finding a pulse already queued. */
+void *worker_pulse_sender_fn(void *arg)
+{
+    int coid = (int)(long)arg;
+    for (int i = 0; i < 3; ++i) {
+        for (volatile int spin = 0; spin < 200000; ++spin) ;
+        int rc = MsgSendPulse(coid, /*prio=*/10,
+                              /*code=*/i + 1, /*value=*/(i + 1) * 100);
+        sel4_debug_puts("[sender tid=");
+        putd(qsoe_curthr()->tid);
+        sel4_debug_puts("] MsgSendPulse code=");
+        putd(i + 1);
+        sel4_debug_puts(" rc=");
+        putd(rc);
+        sel4_debug_putchar('\n');
+    }
+    return (void *)0;
 }
 
 /* SMP worker: each instance is pinned to one of harts 1..3. Sends a

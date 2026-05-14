@@ -295,3 +295,64 @@ The point of describing this here rather than under \texttt{taskman}'s
 process-manager service is that the invariant in \S\ref{sec:registries}
 is what makes step~1 a single \texttt{Revoke} per channel rather than a
 client-by-client search.
+
+\section{Generated headers from the kernel build}
+
+Invocation method labels and syscall numbers are kernel ABI surface,
+gated on \texttt{CONFIG\_KERNEL\_MCS}, \texttt{CONFIG\_ENABLE\_SMP\_SUPPORT},
+and other compile-time options.  v0.4.3 stopped hand-counting them in
+\texttt{userland/taskman/sel4\_types.h} and instead pulls the four
+kernel-generated headers via \texttt{scripts/placement.txt}:
+
+\begin{itemize}
+    \item \texttt{api/invocation.h} --- the generic
+          \texttt{enum invocation\_label} (\texttt{UntypedRetype},
+          \texttt{TCBConfigure}, \texttt{CNodeRevoke}, etc.).
+    \item \texttt{arch/api/invocation.h} --- the arch-specific
+          \texttt{arch\_invocation\_label} (\texttt{RISCVPageTableMap},
+          \texttt{RISCVASIDPoolAssign}, etc.).
+    \item \texttt{arch/api/sel4\_invocation.h} --- glues the two
+          enums together so the arch labels start at
+          \texttt{nInvocationLabels}.
+    \item \texttt{arch/api/syscall.h} --- the
+          \texttt{enum syscall} (\texttt{SysCall}, \texttt{SysReplyRecv},
+          etc.) and \texttt{SYSCALL\_*} macros for assembly.
+\end{itemize}
+
+These live under \texttt{core/kernel/sel4\_gen/} and are refreshed
+from the kernel build whenever a config option changes.  Taskman's
+\texttt{INV\_*} and \texttt{SYS\_*} macros are now thin aliases for
+the upstream enum members --- a kernel reconfigure no longer requires
+a manual recount and re-edit of \texttt{sel4\_types.h}.
+
+\section{Multi-server IPC}
+
+QSOE is built on the premise that every system service after taskman
+is a userland process.  v0.4.3 demonstrates the full path end-to-end:
+the \texttt{hello} binary, previously a \texttt{print-and-exit} demo,
+now does a complete server loop:
+
+\begin{enumerate}
+    \item \texttt{ChannelCreate(0)} --- gets \texttt{chid=1} (the
+          first FD-namespace chid).
+    \item \texttt{MsgReceive} / \texttt{MsgReply} three times.
+    \item \texttt{ChannelDestroy(1)} and exit.
+\end{enumerate}
+
+The tester, on receiving \texttt{hello}'s pid back from
+\texttt{posix\_spawn}, then:
+
+\begin{enumerate}
+    \item \texttt{ConnectAttach(ND\_LOCAL\_NODE, hello\_pid, 1, ...)}
+          --- with retry, since hello may not yet have reached
+          \texttt{ChannelCreate} when the first attempt fires.
+    \item \texttt{ConnectServerInfo(0, hcoid, \&si)} --- confirms
+          \texttt{si.pid == hello\_pid} and \texttt{si.chid == 1}.
+    \item Three \texttt{MsgSend} round-trips with payload+1 echo.
+    \item \texttt{ConnectDetach}.
+\end{enumerate}
+
+scoids remain in a single global namespace (the per-channel
+namespacing QNX uses is a QNX-faithfulness refinement deferred until
+the 28-bit endpoint-badge space gets uncomfortable, which won't
+happen for the foreseeable future).

@@ -78,6 +78,12 @@ typedef struct {
     int        pulse_head;   /* next slot to read */
     int        pulse_tail;   /* next slot to write */
     int        pulse_count;
+    /* v0.4.3 bound-Notification wake. Allocated alongside the endpoint,
+     * minted with badge=QSOE_NTFN_BADGE_BIT into ntfn_sig (taskman's
+     * own CSpace), bound to the owner's TCB via TCB_BindNotification.
+     * 0 if no Notification was set up (taskman's primary EP). */
+    seL4_CPtr  ntfn_master;  /* unbadged master, used for Bind/Revoke */
+    seL4_CPtr  ntfn_sig;     /* badged Send cap; taskman Signals via this */
 } tm_channel_t;
 
 typedef struct {

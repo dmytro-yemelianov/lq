@@ -170,6 +170,16 @@ kernel/include/arch/riscv/arch/64/mode/object/structures.h kernel/include/arch/r
 kernel/include/arch/riscv/arch/64/mode/smp/ipi.h    kernel/include/arch/riscv/arch/64/mode/smp/ipi.h
 kernel/include/arch/riscv/arch/64/mode/types.h      kernel/include/arch/riscv/arch/64/mode/types.h
 
+# === KERNEL: Generated invocation/syscall enums (refresh from kernel build) ===
+# These are emitted by invocation_header_gen.py / syscall_header_gen.py at
+# kernel build time, gated by CONFIG_KERNEL_MCS, CONFIG_ENABLE_SMP_SUPPORT,
+# etc. Re-copy after any kernel config change. Source path here is the
+# kernel build directory, not the kernel source tree.
+build-qsoe-riscv64/kernel/gen_headers/api/invocation.h          kernel/sel4_gen/api/invocation.h
+build-qsoe-riscv64/kernel/gen_headers/arch/api/invocation.h     kernel/sel4_gen/arch/api/invocation.h
+build-qsoe-riscv64/kernel/gen_headers/arch/api/sel4_invocation.h kernel/sel4_gen/arch/api/sel4_invocation.h
+build-qsoe-riscv64/kernel/gen_headers/arch/api/syscall.h        kernel/sel4_gen/arch/api/syscall.h
+
 # === ELFLOADER: RISC-V 64-bit source files ===
 tools/seL4/elfloader-tool/src/arch-riscv/crt0.S     kernel/startup/arch-riscv/crt0.S
 tools/seL4/elfloader-tool/src/arch-riscv/boot.c     kernel/startup/arch-riscv/boot.c

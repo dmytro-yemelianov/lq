@@ -132,12 +132,19 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
     seL4_CPtr recv = qsoe_state_chid_to_slot(chid);
     if (!recv) { qsoe_errno = EBADF; return -1; }
 
+    seL4_Word badge;
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge,
+                                            &mr0, &mr1, &mr2, &mr3);
+
 #ifndef QSOE_LIBQSOE_IN_TASKMAN
-    /* v0.4.2: poll for a pending pulse first. If one's queued at this
-     * channel, fill the receiver's msg buffer with a _pulse struct,
-     * mark info.flags with QSOE_MI_PULSE, and return. Otherwise fall
-     * through to the regular endpoint Recv. */
-    {
+    /* v0.4.3: bound-Notification pulse wake. If the receive resolved
+     * via the bound Notification (badge has QSOE_NTFN_BADGE_BIT set
+     * because taskman minted the Signal-cap with that badge), fetch
+     * the queued pulse from taskman and return it as a _pulse rather
+     * than treating MRs as a regular message. The high bit can't
+     * collide with EP-message badges, which encode pids (≤ 255). */
+    if (badge & QSOE_NTFN_BADGE_BIT) {
         seL4_Word p_mr0 = (seL4_Word)recv;
         seL4_Word p_mr1 = 0, p_mr2 = 0, p_mr3 = 0;
         seL4_MessageInfo_t p_tag = seL4_MessageInfo_new(TM_REQ_PULSE_FETCH,
@@ -146,8 +153,6 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
                                                     &p_mr0, &p_mr1, &p_mr2, &p_mr3);
         seL4_Word p_err = seL4_MessageInfo_get_label(p_reply);
         if (p_err == 0) {
-            /* Pulse present. p_mr0=code, p_mr1=value, p_mr2=sender_pid,
-             * p_mr3=scoid. */
             int8_t  code   = (int8_t)p_mr0;
             int32_t val    = (int32_t)p_mr1;
             pid_t   sender = (pid_t)p_mr2;
@@ -173,17 +178,13 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
                 info->priority  = 0;
                 info->flags     = QSOE_MI_PULSE;
             }
-            /* rcvid for a pulse: 0 — no reply expected. */
             return 0;
         }
-        /* No pulse (ENOENT) or other error → fall through to Recv. */
+        /* Notification fired but no pulse queued — race with another
+         * fetcher. Fall through and treat as if the wake-up was
+         * spurious; MRs are zero so callers see an empty EP message. */
     }
 #endif
-
-    seL4_Word badge;
-    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
-    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge,
-                                            &mr0, &mr1, &mr2, &mr3);
 
     qsoe_ipcbuf->msg[0] = mr0;
     qsoe_ipcbuf->msg[1] = mr1;

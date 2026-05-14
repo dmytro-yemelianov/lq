@@ -193,18 +193,24 @@ static void taskman_free_slot(seL4_CPtr slot)
      * unused, which costs CSpace room but never corrupts state. */
 }
 
+/* Pop a free taskman-CSpace slot (from the free list, else bumping
+ * s_next_slot). Use for slots that get a cap minted into them later
+ * (rather than a retype). */
+static seL4_CPtr taskman_alloc_empty_slot(void)
+{
+    if (s_slot_free_count > 0) {
+        return s_slot_free_list[--s_slot_free_count];
+    }
+    return s_next_slot++;
+}
+
 /* Allocate one untyped retype into a slot of taskman's CSpace. Reuses
  * a freed slot if available; otherwise bumps s_next_slot. Master caps
  * always live in taskman's CSpace regardless of who created the
  * channel. */
 static seL4_CPtr taskman_alloc_and_retype(seL4_Word type, seL4_Word size_bits)
 {
-    seL4_CPtr slot;
-    if (s_slot_free_count > 0) {
-        slot = s_slot_free_list[--s_slot_free_count];
-    } else {
-        slot = s_next_slot++;
-    }
+    seL4_CPtr slot = taskman_alloc_empty_slot();
     seL4_Word err = qsoe_untyped_retype(s_untyped, type, size_bits,
                                          s_cnode_root, 0, 0, slot, 1);
     if (err != 0) {
@@ -237,15 +243,17 @@ int tm_channel_register_existing(pid_t pid, int chid,
         if (!g_channels[i].in_use) { idx = i; break; }
     }
     if (idx < 0) return -ENOMEM;
-    g_channels[idx].in_use     = 1;
-    g_channels[idx].master     = master_slot;
-    g_channels[idx].owner_recv = recv_slot;
-    g_channels[idx].owner_pid  = pid;
-    g_channels[idx].owner_chid = chid;
-    g_channels[idx].flags      = 0;
-    g_channels[idx].pulse_head = 0;
-    g_channels[idx].pulse_tail = 0;
+    g_channels[idx].in_use      = 1;
+    g_channels[idx].master      = master_slot;
+    g_channels[idx].owner_recv  = recv_slot;
+    g_channels[idx].owner_pid   = pid;
+    g_channels[idx].owner_chid  = chid;
+    g_channels[idx].flags       = 0;
+    g_channels[idx].pulse_head  = 0;
+    g_channels[idx].pulse_tail  = 0;
     g_channels[idx].pulse_count = 0;
+    g_channels[idx].ntfn_master = 0;
+    g_channels[idx].ntfn_sig    = 0;
     return 0;
 }
 
@@ -341,15 +349,52 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
         return -ENOMEM;
     }
 
-    g_channels[idx].in_use     = 1;
-    g_channels[idx].master     = master;
-    g_channels[idx].owner_recv = recv;
-    g_channels[idx].owner_pid  = owner_pid;
-    g_channels[idx].owner_chid = chid;
-    g_channels[idx].flags      = flags;
-    g_channels[idx].pulse_head = 0;
-    g_channels[idx].pulse_tail = 0;
+    /* v0.4.3: per-channel Notification for pulse wake. ntfn_master is
+     * unbadged (used for Bind/Unbind/Revoke); ntfn_sig is a Send-cap
+     * minted with badge=QSOE_NTFN_BADGE_BIT so every Signal OR's that
+     * bit into the Notification's notifyWord — the receiver's
+     * MsgReceive sees the bit and routes to TM_REQ_PULSE_FETCH. */
+    seL4_CPtr ntfn_master = taskman_alloc_and_retype(seL4_NotificationObject,
+                                                      seL4_NotificationBits);
+    seL4_CPtr ntfn_sig    = 0;
+    if (ntfn_master) {
+        ntfn_sig = taskman_alloc_empty_slot();
+        seL4_CapRights_t sig_rights = seL4_CapRights_new(0, 0, 0, 1); /* W */
+        if (qsoe_cnode_mint(s_cnode_root, ntfn_sig, TM_DEPTH_TASKMAN,
+                            s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN,
+                            sig_rights, QSOE_NTFN_BADGE_BIT) != 0) {
+            /* Mint failed — drop the notification entirely. */
+            qsoe_cnode_delete(s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN);
+            taskman_free_slot(ntfn_master);
+            taskman_free_slot(ntfn_sig);
+            ntfn_master = ntfn_sig = 0;
+        } else if (owner->tcb) {
+            /* Best-effort bind. If the TCB already has a Notification
+             * bound (e.g. owner created an earlier channel and hasn't
+             * destroyed it), we leave ntfn_master/sig in place but
+             * mark them unbound — pulses queue without waking. */
+            if (qsoe_tcb_bind_notification(owner->tcb, ntfn_master) != 0) {
+                /* Bind failed. Tear down ntfn so we don't leak it. */
+                qsoe_cnode_revoke(s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN);
+                qsoe_cnode_delete(s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN);
+                taskman_free_slot(ntfn_master);
+                taskman_free_slot(ntfn_sig);
+                ntfn_master = ntfn_sig = 0;
+            }
+        }
+    }
+
+    g_channels[idx].in_use      = 1;
+    g_channels[idx].master      = master;
+    g_channels[idx].owner_recv  = recv;
+    g_channels[idx].owner_pid   = owner_pid;
+    g_channels[idx].owner_chid  = chid;
+    g_channels[idx].flags       = flags;
+    g_channels[idx].pulse_head  = 0;
+    g_channels[idx].pulse_tail  = 0;
     g_channels[idx].pulse_count = 0;
+    g_channels[idx].ntfn_master = ntfn_master;
+    g_channels[idx].ntfn_sig    = ntfn_sig;
 
     *out_recv_slot = recv;
     return 0;
@@ -367,6 +412,24 @@ int tm_channel_destroy(pid_t owner_pid, seL4_CPtr recv_slot)
         }
     }
     if (!c) return -EBADF;
+
+    /* v0.4.3: tear down the per-channel Notification first. The
+     * binding to the owner's TCB must be released BEFORE the
+     * Notification is revoked, otherwise the kernel leaves a dangling
+     * binding that prevents the next ChannelCreate by the same thread
+     * from binding its fresh Notification. */
+    if (c->ntfn_master) {
+        tm_process_t *owner = tm_process_lookup(c->owner_pid);
+        if (owner && owner->tcb) {
+            qsoe_tcb_unbind_notification(owner->tcb);
+        }
+        qsoe_cnode_revoke(s_cnode_root, c->ntfn_master, TM_DEPTH_TASKMAN);
+        qsoe_cnode_delete(s_cnode_root, c->ntfn_master, TM_DEPTH_TASKMAN);
+        taskman_free_slot(c->ntfn_master);
+        taskman_free_slot(c->ntfn_sig);
+        c->ntfn_master = 0;
+        c->ntfn_sig = 0;
+    }
 
     /* Revoke from the master (cascades to recv cap + every Send-cap). */
     if (qsoe_cnode_revoke(s_cnode_root, c->master, TM_DEPTH_TASKMAN) != 0) {
@@ -527,9 +590,18 @@ int tm_process_terminate(pid_t target, int status)
         }
     }
 
-    /* 2. Channels owned by this pid. */
+    /* 2. Channels owned by this pid. Tear down the bound Notification
+     *    (if any) before the endpoint, mirroring tm_channel_destroy:
+     *    Unbind is skipped here because the owner's TCB is about to
+     *    be revoked anyway (step 4), which dissolves the binding. */
     for (int i = 0; i < TM_MAX_CHANNELS; ++i) {
         if (g_channels[i].in_use && g_channels[i].owner_pid == target) {
+            if (g_channels[i].ntfn_master) {
+                qsoe_cnode_revoke(s_cnode_root, g_channels[i].ntfn_master, TM_DEPTH_TASKMAN);
+                qsoe_cnode_delete(s_cnode_root, g_channels[i].ntfn_master, TM_DEPTH_TASKMAN);
+                g_channels[i].ntfn_master = 0;
+                g_channels[i].ntfn_sig = 0;
+            }
             qsoe_cnode_revoke(s_cnode_root, g_channels[i].master, TM_DEPTH_TASKMAN);
             qsoe_cnode_delete(s_cnode_root, g_channels[i].master, TM_DEPTH_TASKMAN);
             g_channels[i].in_use = 0;
@@ -740,6 +812,15 @@ int tm_pulse_send(pid_t sender_pid, seL4_CPtr connection_slot,
 
     c->pulse_tail = (slot + 1) % TM_PULSE_QUEUE_LEN;
     c->pulse_count++;
+
+    /* v0.4.3: wake the receiver via the channel's bound Notification.
+     * If no Notification is set up (taskman's primary EP, or a channel
+     * whose owner already had a binding when ChannelCreate ran), the
+     * pulse stays queued and is picked up by the next MsgReceive's
+     * fetch path — no wake, but data is preserved. */
+    if (c->ntfn_sig) {
+        qsoe_sys_signal(c->ntfn_sig);
+    }
     return 0;
 }
 
@@ -773,6 +854,13 @@ int tm_pulse_fetch(pid_t receiver_pid, seL4_CPtr recv_slot,
             *out_scoid = (int)g_connections[i].badge;
             break;
         }
+    }
+
+    /* v0.4.3: if more pulses remain, re-arm the bound Notification so
+     * the receiver's NEXT MsgReceive wakes immediately rather than
+     * blocking on the endpoint Recv. */
+    if (c->pulse_count > 0 && c->ntfn_sig) {
+        qsoe_sys_signal(c->ntfn_sig);
     }
     return 0;
 }

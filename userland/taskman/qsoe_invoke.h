@@ -291,6 +291,33 @@ qsoe_tcb_suspend(seL4_CPtr tcb)
     return seL4_MessageInfo_get_label(reply);
 }
 
+/* seL4_TCB_BindNotification — attach a Notification to a TCB so that
+ * signals on the notification wake the TCB even when blocked on a
+ * regular endpoint Recv. The badge value carried on the wake is the
+ * notification's accumulated notifyWord (OR of all Signal-cap badges).
+ * On non-MCS each TCB binds at most one Notification; binding a second
+ * fails until the first is unbound. v0.4.3 uses this for QNX-style
+ * pulse delivery: each channel has a Notification, bound to the
+ * owner's TCB, so a queued pulse wakes MsgReceive directly. */
+static inline seL4_Word
+qsoe_tcb_bind_notification(seL4_CPtr tcb, seL4_CPtr ntfn)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = ntfn;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TCBBindNotification, 0, 1, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_tcb_unbind_notification(seL4_CPtr tcb)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TCBUnbindNotification, 0, 0, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
 /* seL4_Signal — empty Send to a Notification cap (kernel checks cap
  * type). No reply, no MRs. */
 static inline void

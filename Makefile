@@ -99,6 +99,7 @@ TM_CFLAGS := $(ARCH_CFLAGS) \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
     -fno-builtin -Wall -Wextra \
     -I$(GEN) \
+    -I$(CORE)/kernel/sel4_gen \
     -I$(LIBQSOE_DIR)/include
 
 # ----------------------------------------------------------------------------
@@ -418,13 +419,23 @@ $(HELLOBUILD)/libqsoe/thread.o: $(LIBQSOE_DIR)/src/thread.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(HELLOBUILD)/libqsoe/channel.o: $(LIBQSOE_DIR)/src/channel.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(HELLOBUILD)/libqsoe/connect.o: $(LIBQSOE_DIR)/src/connect.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 HELLO_OBJS := \
     $(HELLOBUILD)/start.o \
     $(HELLOBUILD)/main.o \
     $(HELLOBUILD)/libqsoe/state.o \
     $(HELLOBUILD)/libqsoe/msg.o \
     $(HELLOBUILD)/libqsoe/process.o \
-    $(HELLOBUILD)/libqsoe/thread.o
+    $(HELLOBUILD)/libqsoe/thread.o \
+    $(HELLOBUILD)/libqsoe/channel.o \
+    $(HELLOBUILD)/libqsoe/connect.o
 
 $(HELLO_ELF): $(HELLO_OBJS)
 	@mkdir -p $(@D)

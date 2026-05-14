@@ -1,19 +1,40 @@
 /*
- * sel4_types.h - minimal seL4 type and structure definitions for taskman.
+ * sel4_types.h - seL4 type and structure definitions used by taskman.
  *
- * These mirror the layouts that libsel4 produces on RISC-V 64-bit / non-MCS.
- * We define them ourselves rather than including libsel4 because v0.x does
- * not yet pull libsel4 into the QSOE build; switching is planned for v0.3.
+ * Invocation labels and syscall numbers come from the upstream kernel's
+ * generated headers (core/kernel/sel4_gen/), so they stay in lockstep
+ * with the kernel's actual ABI when CONFIG_* options change. The
+ * type/struct/bitfield layouts are still defined inline here because
+ * QSOE does not yet pull libsel4's static headers — that lands when
+ * v0.5+ adds path and memory managers.
  *
- * Cross-check, if a future kernel update changes ABIs:
+ * Cross-check, if a future kernel update changes layouts:
  *   sel4test-full/kernel/libsel4/include/sel4/bootinfo_types.h
  *   sel4test-full/kernel/libsel4/include/sel4/types.h
- *   sel4test-full/build-qsoe-riscv64/kernel/gen_headers/api/invocation.h
  */
 #ifndef QSOE_SEL4_TYPES_H
 #define QSOE_SEL4_TYPES_H
 
+/* Match the CONFIG_* options our seL4 kernel was built with (see
+ * autoconf.h in the kernel build). The upstream invocation/syscall
+ * enums are gated on these; defining them here ensures we get the
+ * same enum positions the kernel uses. */
+#ifndef CONFIG_ENABLE_SMP_SUPPORT
+# define CONFIG_ENABLE_SMP_SUPPORT 1
+#endif
+/* CONFIG_KERNEL_MCS intentionally NOT defined — non-MCS build. */
+
 typedef unsigned long       seL4_Word;
+
+/* word_t is a kernel-internal typedef the upstream-generated syscall.h
+ * references (typedef word_t syscall_t;). Provide it before including. */
+typedef seL4_Word word_t;
+
+/* Upstream-generated enums: nInvocationLabels, TCB*, CNode*, RISCV*,
+ * SysCall/SysReplyRecv/etc. Pulls in via -I core/kernel/sel4_gen. */
+#include <arch/api/invocation.h>
+#include <arch/api/syscall.h>
+
 typedef seL4_Word           seL4_CPtr;
 typedef seL4_Word           seL4_NodeId;
 typedef unsigned char       seL4_Uint8;
@@ -57,40 +78,36 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 #define seL4_CapBootInfoFrame         9
 #define seL4_CapInitThreadIPCBuffer  10
 
-/* Invocation method labels, derived by counting the enum in
- * sel4test-full/build-qsoe-riscv64/kernel/gen_headers/api/invocation.h
- * with our config (non-MCS, SMP=ON with NUM_NODES=4, non-HW_DEBUG_API).
- *
- * v0.3.4: SMP inserts TCBSetAffinity at position 15, shifting every
- * later label by +1. nInvocationLabels = 34 (was 33), so arch-
- * specific labels start at 34. */
-#define INV_UntypedRetype            1
-#define INV_TCBWriteRegisters        3
-#define INV_TCBConfigure             5   /* non-MCS variant */
-#define INV_TCBSetPriority           6
-#define INV_TCBSuspend              11
-#define INV_TCBResume               12
-#define INV_TCBSetAffinity          15   /* SMP-only — v0.4 uses */
-#define INV_CNodeRevoke             18
-#define INV_CNodeDelete             19
-#define INV_CNodeCopy               21
-#define INV_CNodeMint               22
-/* Arch-specific labels start at nInvocationLabels (34 with SMP). */
-#define INV_RISCVPageTableMap       34
-#define INV_RISCVPageTableUnmap     35
-#define INV_RISCVPageMap            36
-#define INV_RISCVPageUnmap          37
-#define INV_RISCVASIDPoolAssign     40
+/* Invocation method labels — aliases for upstream enum members.
+ * The numeric values are determined by the kernel's invocation.h with
+ * our CONFIG_* set above; we never count them by hand. */
+#define INV_UntypedRetype        UntypedRetype
+#define INV_TCBWriteRegisters    TCBWriteRegisters
+#define INV_TCBConfigure         TCBConfigure
+#define INV_TCBSetPriority       TCBSetPriority
+#define INV_TCBSuspend           TCBSuspend
+#define INV_TCBResume            TCBResume
+#define INV_TCBSetAffinity       TCBSetAffinity
+#define INV_CNodeRevoke          CNodeRevoke
+#define INV_CNodeDelete          CNodeDelete
+#define INV_CNodeCopy            CNodeCopy
+#define INV_CNodeMint            CNodeMint
+#define INV_CNodeSaveCaller      CNodeSaveCaller
+#define INV_RISCVPageTableMap    RISCVPageTableMap
+#define INV_RISCVPageTableUnmap  RISCVPageTableUnmap
+#define INV_RISCVPageMap         RISCVPageMap
+#define INV_RISCVPageUnmap       RISCVPageUnmap
+#define INV_RISCVASIDPoolAssign  RISCVASIDPoolAssign
 
-/* Fast-path syscall numbers (negative; see arch/api/syscall.h). */
-#define SYS_Call                (-1)
-#define SYS_ReplyRecv           (-2)
-#define SYS_Send                (-3)
-#define SYS_NBSend              (-4)
-#define SYS_Recv                (-5)
-#define SYS_Reply               (-6)
-#define SYS_Yield               (-7)
-#define SYS_NBRecv              (-8)
+/* Fast-path syscall numbers — aliases for upstream enum members. */
+#define SYS_Call    SysCall
+#define SYS_ReplyRecv SysReplyRecv
+#define SYS_Send    SysSend
+#define SYS_NBSend  SysNBSend
+#define SYS_Recv    SysRecv
+#define SYS_Reply   SysReply
+#define SYS_Yield   SysYield
+#define SYS_NBRecv  SysNBRecv
 
 #define seL4_MsgMaxLength       120
 #define seL4_MsgMaxExtraCaps    3

@@ -141,6 +141,14 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes);
 #define _PULSE_TYPE       0
 #define QSOE_MI_PULSE     0x00000010u   /* _msg_info.flags bit */
 
+/* v0.4.3: a bit set on the badge of the Notification cap taskman mints
+ * for each pulse-bearing channel. EP-cap badges in QSOE encode the
+ * caller's pid (≤ 255), so bit 63 is always free for marking "this
+ * Recv wake came from the bound Notification, not an EP message".
+ * libqsoe's MsgReceive checks this on every wake to decide whether to
+ * fetch a queued pulse from taskman or process an EP message. */
+#define QSOE_NTFN_BADGE_BIT  (1UL << 63)
+
 typedef int  int32_t;
 typedef short int16_t;
 typedef unsigned short uint16_t;
