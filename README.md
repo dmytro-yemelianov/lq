@@ -37,14 +37,54 @@ QSOE brings the proven synchronous message-passing programming model of QNX Neut
 ## Repository layout
 
 ```
-kernel/                  seL4 microkernel (generic + RISC-V arch)
-kernel/startup/          elfloader (boot/startup code)
-userland/libc/           musl libc (RISC-V 64-bit, seL4-patched)
-userland/taskman/        taskman — central system server
-userland/taskman/runenv/ sel4runtime (C runtime for seL4 user-space)
-scripts/                 source extraction and build helpers
-doc/tex/Design/          design document (LaTeX)
+core/                          vendored upstream (gitignored; populated
+                                 by scripts/extract-sel4-riscv.sh)
+  kernel/                      seL4 microkernel (generic + RISC-V arch)
+  kernel/startup/              elfloader (boot/startup code)
+  kernel/sel4_gen/             kernel-build-generated invocation/syscall enums
+  lib/cpio/                    libcpio (used by elfloader and taskman)
+  userland/libc/               musl libc (RISC-V 64-bit, seL4-patched)
+  userland/taskman/runenv/     sel4runtime (C runtime for seL4 user-space)
+
+userland/                      QSOE-native source (this is the work)
+  taskman/                     central system server
+  libqsoe/                     QNX-compatible IPC library
+  tester/                      end-to-end test program
+  hello/                       second user-space binary, exercises posix_spawn
+
+scripts/                       source extraction and build helpers
+doc/tex/Design/                design document (LaTeX)
+sel4test-full/                 upstream seL4 + sel4test checkout (gitignored)
 ```
+
+## Build & run
+
+```
+./scripts/extract-sel4-riscv.sh     # one-time: fetch upstream sources
+make                                # builds kernel, elfloader, taskman, tester, hello
+make run                            # boot under qemu-system-riscv64
+```
+
+Exit QEMU with `Ctrl-A x`. First-time builds take a few minutes because
+the seL4 kernel is bootstrapped through sel4test's CMake; subsequent
+incremental builds are seconds.
+
+## Current status
+
+See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
+of **v0.4.4**:
+
+- QNX-style synchronous IPC: `ChannelCreate`/`Destroy`,
+  `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`
+- Pulses with `seL4` bound-Notification wake (`MsgSendPulse`, 1-IPC idle
+  `MsgReceive`)
+- Threading (`ThreadCreate`/`Join`/`Detach`/`Destroy`/`Cancel`/`Ctl`)
+  with per-thread TLS and SMP affinity across 4 harts
+- Processes (`ProcessCreate`/`Terminate`, `posix_spawn`, `_exit`) with
+  per-child untyped budget and cap-leak hygiene
+- argv/envp delivery on the child's initial stack per RISC-V SysV ABI
+- Multi-server IPC end-to-end (a second process can act as a server
+  and serve `MsgReceive` from other processes)
 
 ## Documentation
 
