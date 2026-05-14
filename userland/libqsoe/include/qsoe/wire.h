@@ -34,6 +34,14 @@ enum {
      * default v0.3.2 echo, but additionally fills MR1 with the
      * client pid that taskman saw via ConnectClientInfo. */
     TM_REQ_PING_CLIENTINFO      = 0x10,
+    /* v0.5.0 POSIX I/O surface. The 0x20+ range disambiguates the
+     * libc-facing wire from the taskman-internal management wire
+     * above. open() consults the path manager; write/read/close
+     * operate on a connection (badge identifies it). */
+    TM_REQ_OPEN                 = 0x20,
+    TM_REQ_CLOSE                = 0x21,
+    TM_REQ_IO_WRITE             = 0x22,
+    TM_REQ_IO_READ              = 0x23,
 };
 
 /* Reply label conventions: 0 on success, positive QNX errno on failure.

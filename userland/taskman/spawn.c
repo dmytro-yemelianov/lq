@@ -11,6 +11,7 @@
 #include "sel4_syscalls.h"
 #include "qsoe_invoke.h"
 #include "server.h"
+#include "pathmgr.h"
 #include "../libqsoe/include/qsoe/slots.h"
 
 /* ELF64 minimal types — just enough to walk PHDRs. */
@@ -421,6 +422,39 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                           s_cnode_root, child_untyped, 64,
                           QSOE_RIGHTS_ALL);
     if (err) { sel4_debug_puts("spawn: copy OWN_UNTYPED failed\n"); return -ENOMEM; }
+
+    /* 5c. v0.5.0: stdio inheritance. Mint three badged Send-caps on
+     *     (taskman, TM_CONSOLE_CHID) — which shares primary_ep — into
+     *     the child's CSpace at slots QSOE_CAP_STDIN/OUT/ERR_CONNECT.
+     *     Each gets its own scoid badge so taskman's dispatch can
+     *     distinguish them (and ConnectClientInfo can answer). The
+     *     console channel must already be registered in taskman's
+     *     channel table; main.c does this at boot. */
+    int console_idx = tm_channel_index(QSOE_PID_TASKMAN, TM_CONSOLE_CHID);
+    if (console_idx < 0) {
+        sel4_debug_puts("spawn: console channel not registered\n");
+        return -EINVAL;
+    }
+    static const seL4_CPtr stdio_slots[3] = {
+        QSOE_CAP_STDIN_CONNECT,
+        QSOE_CAP_STDOUT_CONNECT,
+        QSOE_CAP_STDERR_CONNECT,
+    };
+    for (int i = 0; i < 3; ++i) {
+        seL4_Word scoid = tm_alloc_scoid();
+        err = qsoe_cnode_mint(cnode, stdio_slots[i], 12,
+                              s_cnode_root, primary_ep, 64,
+                              QSOE_RIGHTS_SEND, scoid);
+        if (err) {
+            sel4_debug_puts("spawn: mint stdio cap failed\n");
+            return -ENOMEM;
+        }
+        if (tm_connection_register_existing(pid, stdio_slots[i],
+                                             console_idx, scoid, 0) != 0) {
+            sel4_debug_puts("spawn: register stdio connection failed\n");
+            return -ENOMEM;
+        }
+    }
 
     /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
      *    12) and guard value 0; the CNode is 2^12 slots so addresses

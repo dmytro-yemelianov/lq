@@ -414,3 +414,102 @@ shared memory, deferred.
 \texttt{libqsoe/src/start\_main.c}) which performs
 \texttt{qsoe\_libqsoe\_init} and dispatches to the user's
 \texttt{main(int argc, char **argv, char **envp)}.
+
+\section{Path manager (v0.5)}
+
+Taskman gains a path namespace registry in v0.5.  Every absolute
+path that anyone can \texttt{open()} resolves through this registry
+to a \emph{server}: a (pid, chid) tuple identifying which channel a
+resource manager listens on for that prefix.  Lookups use
+longest-prefix-match, so a server registered at \texttt{/dev} would
+serve any future \texttt{open("/dev/foo")} unless something more
+specific is registered first.
+
+\paragraph{Data structure.}  The registry is a tree of nodes, one
+per path component, allocated from a fixed pool of 64
+(\texttt{userland/taskman/pathmgr.c}).  Each node carries
+\texttt{parent / sibling / child} links, a name, and optionally an
+attached \texttt{tm\_pathmgr\_obj\_t} containing the registered
+server's pid, chid, flags, and a handler-kind discriminator.  The
+handler kind is a v0.5.0 shortcut for in-taskman handlers (e.g.
+\texttt{PATHMGR\_HANDLER\_TASKMAN\_CONSOLE}); v0.6+ external
+servers will use \texttt{HANDLER\_EXTERNAL} and route through a
+plain \texttt{ConnectAttach}.
+
+\paragraph{API.}
+\begin{lstlisting}[language=C]
+int tm_pathmgr_register(const char *path,
+                        const tm_pathmgr_obj_t *obj);
+int tm_pathmgr_resolve (const char *path,
+                        tm_pathmgr_obj_t *out,
+                        unsigned *out_consumed_bytes);
+\end{lstlisting}
+
+\texttt{out\_consumed\_bytes} reports how many leading bytes of the
+input path matched the registered prefix --- the trailing slice is
+the path that gets forwarded to the server's \texttt{io\_open}
+handler (a v0.6 concern).
+
+\section{The /dev/console resource manager (v0.5)}
+
+\texttt{/dev/console} is the first registered service in QSOE.  It
+lives \emph{inside taskman} for v0.5.0 --- the simplest possible
+resmgr, hosted in the system process to avoid bootstrapping a real
+server before the C library is in place.
+
+\paragraph{Channel.}  Taskman registers a second channel,
+\texttt{TM\_CONSOLE\_CHID = 2}, sharing the same Endpoint object as
+the primary channel.  The two channels are distinguished by badge:
+each connection gets a unique scoid, and the connection registry
+records which channel the scoid belongs to.  The dispatch loop's
+\texttt{tm\_channel\_by\_badge(badge)} helper performs that lookup
+on every incoming \texttt{IO\_WRITE} / \texttt{IO\_READ} message.
+
+\paragraph{Wire labels.}
+\begin{tabular}{ll}
+\hline
+\texttt{TM\_REQ\_OPEN}     (0x20) & open by path, returns CSpace slot \\
+\texttt{TM\_REQ\_CLOSE}    (0x21) & detach a connection \\
+\texttt{TM\_REQ\_IO\_WRITE} (0x22) & write \texttt{msg[4..]} to the resmgr \\
+\texttt{TM\_REQ\_IO\_READ}  (0x23) & read into \texttt{msg[4..]} \\
+\hline
+\end{tabular}
+
+\paragraph{Handler.}  \texttt{IO\_WRITE} on the console channel
+walks \texttt{msg[4..4+nbytes]} byte by byte, invoking
+\texttt{sel4\_debug\_putchar} (the seL4 debug-build SBI putchar
+syscall).  \texttt{IO\_READ} is stubbed: it returns
+\texttt{EAGAIN}, since seL4 doesn't expose SBI getchar via a debug
+syscall and v0.5.0 has no UART driver.  A real 16550 driver lands
+in a later milestone.
+
+\section{File descriptors and stdio inheritance (v0.5)}
+
+QSOE's fd namespace coincides with the libqsoe \emph{coid}
+namespace (see \S~\ref{sec:coid-namespace}).  A file descriptor is
+simply an index into the same per-process table that
+\texttt{ConnectAttach} populates; each entry stores the CSpace slot
+of a badged Send-cap on the resmgr's channel.
+
+\paragraph{Spawn-time inheritance.}  Before resuming a new child,
+\texttt{spawn.c} mints three badged Send-caps on
+\texttt{(TASKMAN\_PID, TM\_CONSOLE\_CHID)} into the child's CSpace
+at well-known slots \texttt{QSOE\_CAP\_STDIN/STDOUT/STDERR\_CONNECT
+= 3/4/5}, and registers the three connections in taskman's
+connection table.  Then \texttt{\_qsoe\_start\_main} calls
+\texttt{qsoe\_state\_force\_bind\_coid(0,
+QSOE\_CAP\_STDIN\_CONNECT)} (and the equivalents for 1 and 2) to
+plant fds 0/1/2 into the per-process coid table.
+
+By the time \texttt{main()} runs, \texttt{write(1, "hi", 2)}
+already has a working backing path: the slot at the badged cap
+$\rightarrow$ taskman's primary EP, dispatch routes by badge to the
+console handler, output appears on the SBI console.  No
+\texttt{open()} call is needed at startup --- this matches POSIX's
+``fds 0/1/2 are inherited across exec'' contract.
+
+\paragraph{Subsequent \texttt{open()}.}
+\texttt{qsoe\_state\_alloc\_coid} scans from index 1 (skipping fd
+0); since \texttt{force\_bind\_coid} has already populated slots
+0/1/2, the first allocation by a fresh \texttt{open()} returns fd
+3, matching POSIX expectations.

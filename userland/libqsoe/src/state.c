@@ -152,7 +152,10 @@ void qsoe_state_bind_coid(int coid, unsigned long slot)
         int i = side_index(coid);
         if (i >= 0 && i < QSOE_MAX_SIDE_CONNECTIONS) g_side_coid_slot[i] = slot;
     } else {
-        if (coid >= 1 && coid < QSOE_MAX_FD_CONNECTIONS) g_fd_coid_slot[coid] = slot;
+        /* fd=0 is permitted (stdin). qsoe_state_alloc_coid scans from
+         * i=1, so it never auto-allocates 0; force-binding via
+         * qsoe_state_force_bind_coid is the only path that uses it. */
+        if (coid >= 0 && coid < QSOE_MAX_FD_CONNECTIONS) g_fd_coid_slot[coid] = slot;
     }
     qsoe_spin_unlock(&g_state_lock);
 }
@@ -165,8 +168,19 @@ unsigned long qsoe_state_coid_to_slot(int coid)
         int i = side_index(coid);
         if (i >= 0 && i < QSOE_MAX_SIDE_CONNECTIONS) s = g_side_coid_slot[i];
     } else {
-        if (coid >= 1 && coid < QSOE_MAX_FD_CONNECTIONS) s = g_fd_coid_slot[coid];
+        if (coid >= 0 && coid < QSOE_MAX_FD_CONNECTIONS) s = g_fd_coid_slot[coid];
     }
     qsoe_spin_unlock(&g_state_lock);
     return (s == QSOE_SLOT_RESERVED) ? 0 : s;
+}
+
+/* v0.5.0: bind an FD-namespace coid (including 0) directly to a
+ * CSpace slot, bypassing the alloc_coid path. Used at process
+ * startup to wire fds 0/1/2 to the inherited stdio connections that
+ * spawn.c minted into QSOE_CAP_STDIN/OUT/ERR_CONNECT. After this
+ * call, qsoe_state_alloc_coid will not return `coid` because the
+ * slot is non-zero. */
+void qsoe_state_force_bind_coid(int coid, unsigned long slot)
+{
+    qsoe_state_bind_coid(coid, slot);
 }

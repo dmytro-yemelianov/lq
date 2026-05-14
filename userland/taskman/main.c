@@ -13,6 +13,8 @@
 #include "qsoe_invoke.h"
 #include "server.h"
 #include "spawn.h"
+#include "pathmgr.h"
+#include "console.h"
 #include "../libqsoe/include/qsoe/qrv.h"
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
@@ -235,6 +237,82 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         }
         break;
     }
+    case TM_REQ_OPEN: {
+        /* MR0 = path length in bytes. Path bytes ride in msg[4..]. */
+        unsigned plen = (unsigned)mr0;
+        if (plen == 0 || plen >= 128) { err = (seL4_Word)EINVAL; break; }
+
+        /* Copy + NUL-terminate the path locally so resolve() sees a
+         * proper C string. */
+        static char s_open_path[128];
+        const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+        for (unsigned i = 0; i < plen; ++i) s_open_path[i] = (char)src[i];
+        s_open_path[plen] = 0;
+
+        tm_pathmgr_obj_t obj;
+        unsigned consumed = 0;
+        int rc = tm_pathmgr_resolve(s_open_path, &obj, &consumed);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+
+        /* For v0.5.0, every registered handler lives inside taskman
+         * (handler_kind != EXTERNAL). The ConnectAttach is the same
+         * code path whether the server is in-taskman or external —
+         * we mint a badged Send cap on (server_pid, server_chid) into
+         * the caller's CSpace. */
+        seL4_CPtr slot = 0;
+        rc = tm_connect_attach(caller, obj.server_pid, obj.server_chid,
+                                0, &slot);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = slot;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_CLOSE: {
+        /* MR0 = the connection slot in the caller's CSpace. */
+        seL4_CPtr slot = (seL4_CPtr)mr0;
+        int rc = tm_connect_detach(caller, slot);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_IO_WRITE: {
+        /* Badge identifies the connection; we look up which channel
+         * it points at and route. MR0 = nbytes (the count of bytes
+         * the client placed into msg[4..]). */
+        unsigned nbytes = (unsigned)mr0;
+        pid_t srv_pid = 0;
+        int srv_chid = 0;
+        if (tm_channel_by_badge(badge, &srv_pid, &srv_chid) != 0) {
+            err = (seL4_Word)EBADF;
+            break;
+        }
+        if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
+            unsigned wrote = tm_console_write(nbytes);
+            *out_mr0 = (seL4_Word)wrote;
+            reply_len = 1;
+        } else {
+            err = (seL4_Word)ENOSYS;  /* external resmgr — v0.6+ */
+        }
+        break;
+    }
+    case TM_REQ_IO_READ: {
+        unsigned want = (unsigned)mr0;
+        pid_t srv_pid = 0;
+        int srv_chid = 0;
+        if (tm_channel_by_badge(badge, &srv_pid, &srv_chid) != 0) {
+            err = (seL4_Word)EBADF;
+            break;
+        }
+        if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
+            unsigned got = 0;
+            int rc = tm_console_read(want, &got);
+            if (rc) { err = (seL4_Word)(-rc); break; }
+            *out_mr0 = (seL4_Word)got;
+            reply_len = 1;
+        } else {
+            err = (seL4_Word)ENOSYS;
+        }
+        break;
+    }
     case TM_REQ_PING_CLIENTINFO: {
         /* Demo: exercise ConnectClientInfo from inside the dispatch
          * loop. The badge attached to this incoming message IS the
@@ -344,6 +422,30 @@ int main(seL4_BootInfo *bi)
                                       primary_ep, primary_ep) != 0) {
         sel4_debug_puts("FATAL: failed to register primary channel\n");
         for (;;) __asm__ volatile("nop");
+    }
+
+    /* v0.5.0: register the console channel (TM_CONSOLE_CHID, shares
+     * primary_ep so the dispatch loop receives all traffic on one
+     * Recv; we route by badge -> connection -> channel). Then bring
+     * up the path manager and register /dev/console pointing at the
+     * in-taskman console handler. */
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CONSOLE_CHID,
+                                      primary_ep, primary_ep) != 0) {
+        sel4_debug_puts("FATAL: failed to register console channel\n");
+        for (;;) __asm__ volatile("nop");
+    }
+    tm_pathmgr_init();
+    {
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = QSOE_PID_TASKMAN,
+            .server_chid  = TM_CONSOLE_CHID,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_TASKMAN_CONSOLE,
+        };
+        if (tm_pathmgr_register("/dev/console", &obj) != 0) {
+            sel4_debug_puts("FATAL: pathmgr register /dev/console failed\n");
+            for (;;) __asm__ volatile("nop");
+        }
     }
 
     /* v0.4.1: hand the embedded CPIO and primary endpoint to server.c

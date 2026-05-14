@@ -159,6 +159,18 @@ int tm_channel_register_existing(pid_t pid, int chid,
  * tm_connection_register_existing stores the index. */
 int tm_channel_index(pid_t pid, int chid);
 
+/* v0.5.0: resolve which channel a badged message arrived through.
+ * The dispatch loop uses this on IO_WRITE/IO_READ to route to the
+ * right resmgr handler. Returns 0 + fills out_pid/out_chid; or
+ * -ENOENT if the badge doesn't match a known connection. */
+int tm_channel_by_badge(seL4_Word badge, pid_t *out_pid, int *out_chid);
+
+/* v0.5.0: allocate a fresh scoid (also used as the cap's badge value).
+ * Globally unique within the running taskman. spawn.c uses this when
+ * minting stdio connections into a child that hasn't been registered
+ * in the process table yet, so it can't go through tm_connect_attach. */
+seL4_Word tm_alloc_scoid(void);
+
 /* Register a connection that was minted outside ConnectAttach (e.g.
  * spawn.c minting SYSMGR_COID into a child's slot 1). Returns 0 on
  * success. */

@@ -5,6 +5,47 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.5.0] — 2026-05-14
+
+### Added
+- **Path manager in taskman.** First-class subsystem
+  (`userland/taskman/pathmgr.{c,h}`): prefix-tree registry of named
+  services, longest-prefix lookup, fixed pool of 64 nodes. Inspired
+  by QNX's pathmgr tNode tree, written from scratch.
+- **`/dev/console` as the first registered resource manager.** Lives
+  inside taskman for v0.5.0 (`userland/taskman/console.{c,h}`).
+  `write()` walks bytes through `sel4_debug_putchar` (the seL4
+  debug-build SBI putchar). `read()` is stubbed to `EAGAIN` until a
+  UART driver lands.
+- **Wire labels for POSIX-shape I/O** (0x20-0x23): `TM_REQ_OPEN`,
+  `TM_REQ_CLOSE`, `TM_REQ_IO_WRITE`, `TM_REQ_IO_READ`. The 0x20+
+  range disambiguates the libc-facing wire from the taskman-internal
+  management wire (0x01-0x1f).
+- **Spawn-time stdio inheritance.** `spawn.c` now mints three badged
+  Send-caps on `(TASKMAN_PID, TM_CONSOLE_CHID)` into every child's
+  CSpace at `QSOE_CAP_STDIN/STDOUT/STDERR_CONNECT = 3/4/5`, and
+  registers the three connections in taskman's connection table.
+  `_qsoe_start_main` then calls `qsoe_state_force_bind_coid` to
+  plant fds 0/1/2 in the child's coid table before `main()` runs ---
+  matches POSIX's "fds 0/1/2 inherited across exec" contract.
+- **libqsoe I/O wrappers** (`userland/libqsoe/src/io.c`):
+  `qsoe_open`, `qsoe_close`, `qsoe_write`, `qsoe_read`. Each is the
+  client-side half of one wire request; `qsoe_write` chunks payloads
+  larger than ~900 bytes across multiple `TM_REQ_IO_WRITE` calls.
+- **`tm_channel_by_badge` helper** in `server.c` — the dispatch loop
+  uses it on every IO_WRITE/IO_READ to route the message to the
+  right resmgr handler via (badge -> connection -> channel).
+- **End-to-end smoke test in tester**: writes through fds 1 and 2,
+  then `qsoe_open("/dev/console")` -> fd 3 -> `qsoe_write` -> close.
+  All bytes appear on the QEMU console without any musl libc.
+
+### Known limitations (target for v0.5.1)
+- musl libc is extracted but not linked. `printf` doesn't work yet
+  (use `qsoe_write` directly for now).
+- `read()` returns 0 / `EAGAIN`. Real console input needs a 16550
+  driver and is deferred.
+- No heap; `qsoe_brk` not yet wired.
+
 ## [v0.4.4] — 2026-05-14
 
 ### Added

@@ -72,7 +72,7 @@ incremental builds are seconds.
 ## Current status
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
-of **v0.4.4**:
+of **v0.5.0**:
 
 - QNX-style synchronous IPC: `ChannelCreate`/`Destroy`,
   `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`
@@ -85,6 +85,10 @@ of **v0.4.4**:
 - argv/envp delivery on the child's initial stack per RISC-V SysV ABI
 - Multi-server IPC end-to-end (a second process can act as a server
   and serve `MsgReceive` from other processes)
+- **Path manager** in taskman (prefix-tree namespace registry)
+- **`/dev/console`** as the first registered resource manager
+- POSIX-style `open`/`close`/`read`/`write` via libqsoe; spawned
+  processes inherit fds 0/1/2 bound to `/dev/console`
 
 ## Documentation
 

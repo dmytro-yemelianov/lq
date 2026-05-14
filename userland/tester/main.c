@@ -56,6 +56,33 @@ int main(int argc, char **argv, char **envp)
     }
     sel4_debug_putchar('\n');
 
+    /* --- 0. v0.5.0 stdio smoke-test: write through fds 1 and 2,
+     *        then open /dev/console explicitly and write through
+     *        the new fd. These exercise the full pathmgr + console
+     *        resmgr path without going through musl yet. --- */
+    {
+        const char *out_msg = "[tester] stdout via qsoe_write(1)\n";
+        const char *err_msg = "[tester] stderr via qsoe_write(2)\n";
+        unsigned out_len = 0; while (out_msg[out_len]) out_len++;
+        unsigned err_len = 0; while (err_msg[err_len]) err_len++;
+        qsoe_write(1, out_msg, out_len);
+        qsoe_write(2, err_msg, err_len);
+
+        int cfd = qsoe_open("/dev/console", 0);
+        sel4_debug_puts("[tester] qsoe_open(/dev/console) -> fd=");
+        putd(cfd);
+        sel4_debug_putchar('\n');
+        if (cfd >= 0) {
+            const char *m = "[tester] write via opened /dev/console\n";
+            unsigned ml = 0; while (m[ml]) ml++;
+            long w = qsoe_write(cfd, m, ml);
+            sel4_debug_puts("[tester] write -> ");
+            putd((int)w);
+            sel4_debug_putchar('\n');
+            qsoe_close(cfd);
+        }
+    }
+
     /* --- 1. Round-trip on SYSMGR_COID (no ConnectAttach needed) --- */
     for (int i = 1; i <= 3; ++i) {
         unsigned long payload = (unsigned long)i;

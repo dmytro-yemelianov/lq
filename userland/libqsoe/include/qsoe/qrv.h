@@ -271,6 +271,15 @@ int  ProcessCreate(const char *path);
 int  posix_spawn(pid_t *pid_out, const char *path,
                  const void *file_actions, const void *attr,
                  char *const argv[], char *const envp[]);
+
+/* v0.5.0: POSIX-shape I/O. These are the wire-level callees musl's
+ * read/write/open/close syscalls land in via __sysinfo (see
+ * userland/libqsoe/src/syscall_dispatch.c). They can also be called
+ * directly from -nostdlib programs that want raw IO. */
+int   qsoe_open  (const char *path, int flags);
+int   qsoe_close (int fd);
+long  qsoe_write (int fd, const void *buf, unsigned long count);
+long  qsoe_read  (int fd, void *buf, unsigned long count);
 int  ProcessTerminate(pid_t pid, int status);
 void _exit(int status) __attribute__((noreturn));
 void exit (int status) __attribute__((noreturn));

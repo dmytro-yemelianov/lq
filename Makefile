@@ -225,6 +225,8 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/qsoe_invoke.h \
     $(TASKMAN_DIR)/server.h \
     $(TASKMAN_DIR)/spawn.h \
+    $(TASKMAN_DIR)/pathmgr.h \
+    $(TASKMAN_DIR)/console.h \
     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
@@ -272,6 +274,14 @@ $(TASKBUILD)/spawn.o: $(TASKMAN_DIR)/spawn.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
+$(TASKBUILD)/pathmgr.o: $(TASKMAN_DIR)/pathmgr.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(TASKBUILD)/console.o: $(TASKMAN_DIR)/console.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
 # Pull libcpio (already extracted to core/lib/cpio for the elfloader) into
 # taskman's build too, so the rootserver can locate tester.elf inside
 # the embedded userland CPIO at runtime.
@@ -303,11 +313,17 @@ $(TASKBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TASKBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(LIBQSOE_CFLAGS) -c -o $@ $<
+
 TASKMAN_OBJS := \
     $(TASKBUILD)/start.o \
     $(TASKBUILD)/main.o \
     $(TASKBUILD)/server.o \
     $(TASKBUILD)/spawn.o \
+    $(TASKBUILD)/pathmgr.o \
+    $(TASKBUILD)/console.o \
     $(TASKBUILD)/cpio.o \
     $(TASKBUILD)/userland_archive.o \
     $(TASKBUILD)/libqsoe/channel.o \
@@ -315,7 +331,8 @@ TASKMAN_OBJS := \
     $(TASKBUILD)/libqsoe/state.o \
     $(TASKBUILD)/libqsoe/msg.o \
     $(TASKBUILD)/libqsoe/thread.o \
-    $(TASKBUILD)/libqsoe/process.o
+    $(TASKBUILD)/libqsoe/process.o \
+    $(TASKBUILD)/libqsoe/io.o
 
 $(TASKMAN_ELF): $(TASKMAN_OBJS)
 	@mkdir -p $(@D)
@@ -373,6 +390,10 @@ $(TESTBUILD)/libqsoe/start_main.o: $(LIBQSOE_DIR)/src/start_main.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TESTBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 TESTER_OBJS := \
     $(TESTBUILD)/start.o \
     $(TESTBUILD)/main.o \
@@ -382,7 +403,8 @@ TESTER_OBJS := \
     $(TESTBUILD)/libqsoe/msg.o \
     $(TESTBUILD)/libqsoe/thread.o \
     $(TESTBUILD)/libqsoe/process.o \
-    $(TESTBUILD)/libqsoe/start_main.o
+    $(TESTBUILD)/libqsoe/start_main.o \
+    $(TESTBUILD)/libqsoe/io.o
 
 $(TESTER_ELF): $(TESTER_OBJS)
 	@mkdir -p $(@D)
@@ -436,6 +458,10 @@ $(HELLOBUILD)/libqsoe/start_main.o: $(LIBQSOE_DIR)/src/start_main.c $(TM_HEADERS
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(HELLOBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 HELLO_OBJS := \
     $(HELLOBUILD)/start.o \
     $(HELLOBUILD)/main.o \
@@ -445,7 +471,8 @@ HELLO_OBJS := \
     $(HELLOBUILD)/libqsoe/thread.o \
     $(HELLOBUILD)/libqsoe/channel.o \
     $(HELLOBUILD)/libqsoe/connect.o \
-    $(HELLOBUILD)/libqsoe/start_main.o
+    $(HELLOBUILD)/libqsoe/start_main.o \
+    $(HELLOBUILD)/libqsoe/io.o
 
 $(HELLO_ELF): $(HELLO_OBJS)
 	@mkdir -p $(@D)

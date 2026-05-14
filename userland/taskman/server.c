@@ -266,6 +266,14 @@ int tm_channel_index(pid_t pid, int chid)
     return c ? (int)(c - g_channels) : -1;
 }
 
+seL4_Word tm_alloc_scoid(void)
+{
+    return s_next_badge++;
+}
+
+/* tm_channel_by_badge is defined further down, after the static
+ * connection_find_by_badge helper it relies on. */
+
 int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
                                     int channel_idx, seL4_Word badge,
                                     unsigned flags)
@@ -310,6 +318,18 @@ connection_find_by_badge(seL4_Word badge)
         tm_connection_t *cn = &g_connections[i];
         if (cn->in_use && cn->badge == badge) return cn;
     }
+    return 0;
+}
+
+int tm_channel_by_badge(seL4_Word badge, pid_t *out_pid, int *out_chid)
+{
+    tm_connection_t *cn = connection_find_by_badge(badge);
+    if (!cn) return -ENOENT;
+    if (cn->channel_idx < 0 || cn->channel_idx >= TM_MAX_CHANNELS) return -ENOENT;
+    tm_channel_t *c = &g_channels[cn->channel_idx];
+    if (!c->in_use) return -ENOENT;
+    if (out_pid)  *out_pid  = c->owner_pid;
+    if (out_chid) *out_chid = c->owner_chid;
     return 0;
 }
 

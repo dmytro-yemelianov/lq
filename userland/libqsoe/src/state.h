@@ -39,6 +39,7 @@ unsigned long qsoe_state_chid_to_slot(int chid);
 int           qsoe_state_alloc_coid(unsigned flags);
 void          qsoe_state_bind_coid(int coid, unsigned long slot);
 unsigned long qsoe_state_coid_to_slot(int coid);
+void          qsoe_state_force_bind_coid(int coid, unsigned long slot);
 
 /* v0.4 thread pool accessors. */
 qsoe_tcb_t   *qsoe_tcb_of_tid(int tid);
