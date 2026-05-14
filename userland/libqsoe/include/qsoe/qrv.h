@@ -60,6 +60,9 @@ typedef unsigned int  gid_t;
 #define E2BIG          7
 #define ESPIPE        29
 #define ENOTTY        25
+#define EROFS         30
+#define EISDIR        21
+#define EFBIG         27
 #define ENOSYS        89
 #define EHOSTUNREACH 113
 

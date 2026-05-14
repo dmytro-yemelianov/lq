@@ -72,7 +72,7 @@ incremental builds are seconds.
 ## Current status
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
-of **v0.5.1**:
+of **v0.6.0**:
 
 - QNX-style synchronous IPC: `ChannelCreate`/`Destroy`,
   `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`
@@ -93,6 +93,8 @@ of **v0.5.1**:
   routes musl's "syscalls" into libqsoe; `printf` works end-to-end
 - Per-process heap (2 MiB Mega_Page) backing musl's `lite_malloc`
   via `brk()`
+- **cpiofs** — embedded `userland.cpio` mounted as a read-only
+  filesystem at `/`; `open("/bin/hello.elf")` works from any program
 
 ## Documentation
 

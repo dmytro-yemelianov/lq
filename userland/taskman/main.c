@@ -15,6 +15,7 @@
 #include "spawn.h"
 #include "pathmgr.h"
 #include "console.h"
+#include "cpiofs.h"
 #include "../libqsoe/include/qsoe/qrv.h"
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
@@ -254,15 +255,29 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         int rc = tm_pathmgr_resolve(s_open_path, &obj, &consumed);
         if (rc) { err = (seL4_Word)(-rc); break; }
 
-        /* For v0.5.0, every registered handler lives inside taskman
-         * (handler_kind != EXTERNAL). The ConnectAttach is the same
-         * code path whether the server is in-taskman or external —
-         * we mint a badged Send cap on (server_pid, server_chid) into
-         * the caller's CSpace. */
+        /* ConnectAttach mints a badged Send cap on
+         * (server_pid, server_chid) into the caller's CSpace.
+         * Same code path for in-taskman and external resmgrs. */
         seL4_CPtr slot = 0;
         rc = tm_connect_attach(caller, obj.server_pid, obj.server_chid,
                                 0, &slot);
         if (rc) { err = (seL4_Word)(-rc); break; }
+
+        /* v0.6.0: handlers that need per-fd state populate it here.
+         * cpiofs stores the (data, size) of the resolved file so
+         * subsequent IO_READ can resume from the right offset. */
+        if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CPIOFS) {
+            seL4_Word badge = 0;
+            if (tm_connection_badge_by_slot(caller, slot, &badge) == 0) {
+                int orc = tm_cpiofs_open(s_open_path, consumed, badge);
+                if (orc) {
+                    /* Roll back the mint — file not found. */
+                    tm_connect_detach(caller, slot);
+                    err = (seL4_Word)(-orc);
+                    break;
+                }
+            }
+        }
         *out_mr0 = slot;
         reply_len = 1;
         break;
@@ -289,6 +304,8 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             unsigned wrote = tm_console_write(nbytes);
             *out_mr0 = (seL4_Word)wrote;
             reply_len = 1;
+        } else if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
+            err = (seL4_Word)EROFS;  /* cpiofs is read-only */
         } else {
             err = (seL4_Word)ENOSYS;  /* external resmgr — v0.6+ */
         }
@@ -308,6 +325,16 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             if (rc) { err = (seL4_Word)(-rc); break; }
             *out_mr0 = (seL4_Word)got;
             reply_len = 1;
+        } else if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
+            unsigned got = 0;
+            int rc = tm_cpiofs_read(badge, want, &got);
+            if (rc) { err = (seL4_Word)(-rc); break; }
+            *out_mr0 = (seL4_Word)got;
+            /* The byte payload lives in msg[4..]; the kernel only
+             * transfers msg[4..length-1] across IPC, so the reply
+             * length needs to cover those words (the +4 accounts for
+             * the four register-passed MRs). */
+            reply_len = 4 + (got + 7) / 8;
         } else {
             err = (seL4_Word)ENOSYS;
         }
@@ -434,6 +461,13 @@ int main(seL4_BootInfo *bi)
         sel4_debug_puts("FATAL: failed to register console channel\n");
         for (;;) __asm__ volatile("nop");
     }
+    /* v0.6.0: register the cpiofs channel (also shares primary_ep). */
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CPIOFS_CHID,
+                                      primary_ep, primary_ep) != 0) {
+        sel4_debug_puts("FATAL: failed to register cpiofs channel\n");
+        for (;;) __asm__ volatile("nop");
+    }
+
     tm_pathmgr_init();
     {
         tm_pathmgr_obj_t obj = {
@@ -447,6 +481,21 @@ int main(seL4_BootInfo *bi)
             for (;;) __asm__ volatile("nop");
         }
     }
+    /* v0.6.0: register cpiofs at "/". Longest-prefix-match means
+     * /dev/console and (future) /dev/ser1 still resolve to their
+     * specific handlers; everything else under / goes to cpiofs. */
+    {
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = QSOE_PID_TASKMAN,
+            .server_chid  = TM_CPIOFS_CHID,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_TASKMAN_CPIOFS,
+        };
+        if (tm_pathmgr_register("/", &obj) != 0) {
+            sel4_debug_puts("FATAL: pathmgr register / failed\n");
+            for (;;) __asm__ volatile("nop");
+        }
+    }
 
     /* v0.4.1: hand the embedded CPIO and primary endpoint to server.c
      * so TM_REQ_PROCESS_CREATE handlers can locate ELFs and badge
@@ -455,13 +504,15 @@ int main(seL4_BootInfo *bi)
         (_userland_cpio_end - _userland_cpio_start);
     tm_set_userland_cpio(_userland_cpio_start, cpio_len);
     tm_set_primary_ep(primary_ep);
+    tm_cpiofs_set_cpio(_userland_cpio_start, cpio_len);
 
-    /* Find tester.elf in the embedded userland CPIO. */
+    /* Find tester.elf in the embedded userland CPIO. v0.6.0 moved
+     * entries under bin/, in line with cpiofs's expected layout. */
     unsigned long elf_size = 0;
     const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
-                                     "tester.elf", &elf_size);
+                                     "bin/tester.elf", &elf_size);
     if (!elf) {
-        sel4_debug_puts("FATAL: tester.elf not found in CPIO\n");
+        sel4_debug_puts("FATAL: bin/tester.elf not found in CPIO\n");
         for (;;) __asm__ volatile("nop");
     }
     pid_t tester_pid = tm_pid_alloc();

@@ -128,6 +128,16 @@ int tm_pathmgr_resolve(const char *path,
     const char *comp;
     unsigned len;
 
+    /* Root itself may carry an object (cpiofs mounted at "/"). If it
+     * does, that's our initial deepest match; later components only
+     * override if they find something more specific. */
+    if (g_root->has_obj) {
+        deepest = g_root;
+        /* "consumed" for a root match: 1 if path starts with '/', 0
+         * for empty path (already rejected above). */
+        deepest_p = path + 1;
+    }
+
     while (pm_next_component(&p, &comp, &len)) {
         pm_node_t *child = pm_find_child(node, comp, len);
         if (!child) break;

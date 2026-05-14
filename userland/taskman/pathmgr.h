@@ -24,13 +24,16 @@
  * use HANDLER_EXTERNAL and resolve via (server_pid, server_chid). */
 #define PATHMGR_HANDLER_EXTERNAL        0
 #define PATHMGR_HANDLER_TASKMAN_CONSOLE 1
+#define PATHMGR_HANDLER_TASKMAN_CPIOFS  2  /* v0.6.0 */
 
 /* Internal taskman channel ids beyond the primary (1). The console
- * channel shares the primary endpoint; (TASKMAN_PID, CONSOLE_CHID) is
- * registered in the channel table so ConnectAttach can mint badged
- * Send caps onto it, and the dispatch loop routes IO_WRITE/IO_READ
- * by checking which channel each badge points at. */
+ * and cpiofs channels both share the primary endpoint;
+ * (TASKMAN_PID, *_CHID) is registered in the channel table so
+ * ConnectAttach can mint badged Send caps onto them, and the
+ * dispatch loop routes IO_WRITE/IO_READ by checking which channel
+ * each badge points at. */
 #define TM_CONSOLE_CHID  2
+#define TM_CPIOFS_CHID   3
 
 typedef struct tm_pathmgr_obj {
     pid_t    server_pid;

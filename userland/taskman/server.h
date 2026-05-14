@@ -93,6 +93,11 @@ typedef struct {
     pid_t     client_pid;
     seL4_CPtr client_slot;   /* the slot the client received */
     unsigned  flags;         /* v0.3.3: ConnectFlags state (COF_*) */
+    /* v0.6.0: per-connection opaque context for stateful resmgrs.
+     * cpiofs stashes (file_data_ptr, current_read_offset) here so
+     * sequential reads on the same fd resume at the right place.
+     * Other handlers can repurpose. Zeroed at registration time. */
+    unsigned long ctx[2];
 } tm_connection_t;
 
 /* Initialise taskman's allocators and registries.
@@ -177,6 +182,19 @@ seL4_Word tm_alloc_scoid(void);
 int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
                                     int channel_idx, seL4_Word badge,
                                     unsigned flags);
+
+/* v0.6.0: get/set opaque per-connection context. Returns 0 on
+ * success or -ENOENT if the badge doesn't name a live connection.
+ * cpiofs uses ctx[0]=data_ptr, ctx[1]=read_offset. */
+int tm_connection_set_ctx(seL4_Word badge, unsigned long c0, unsigned long c1);
+int tm_connection_get_ctx(seL4_Word badge, unsigned long *c0, unsigned long *c1);
+
+/* v0.6.0: look up the scoid badge for a connection identified by
+ * (client_pid, slot). Used by TM_REQ_OPEN's cpiofs path to attach
+ * per-fd state to the freshly-minted connection. Returns 0 on
+ * success or -ENOENT. */
+int tm_connection_badge_by_slot(pid_t client_pid, seL4_CPtr slot,
+                                 seL4_Word *out_badge);
 
 /* ----------- lifecycle handlers (v0.2) ----------- */
 

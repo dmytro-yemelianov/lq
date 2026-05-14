@@ -5,6 +5,34 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.6.0] — 2026-05-14
+
+### Added
+- **cpiofs** — the embedded `userland.cpio` is now mounted at `/`
+  via a third in-taskman handler kind
+  (`PATHMGR_HANDLER_TASKMAN_CPIOFS`). `open("/bin/hello.elf")` works
+  from any user program. Read-only; writes return `EROFS`.
+  (`userland/taskman/cpiofs.{c,h}`)
+- **Per-connection opaque context** (`unsigned long ctx[2]` on
+  `tm_connection_t`). cpiofs uses it to stash the file's data
+  pointer and the packed `(size << 32) | offset`. Generic — future
+  stateful resmgrs can repurpose.
+- **`tm_connection_badge_by_slot` / `tm_connection_set_ctx` /
+  `tm_connection_get_ctx` helpers** in `server.c`.
+- **Path manager root-match** — `tm_pathmgr_resolve` now seeds the
+  deepest-match candidate from `g_root->has_obj` so a mount at `/`
+  is reachable as a fallback even when no path components match.
+- **CPIO layout migration**: entries are now `bin/tester.elf`,
+  `bin/hello.elf`. `tm_process_create_by_name` internally prepends
+  `bin/` so the wire protocol callers stay unchanged.
+
+### Fixed
+- **`TM_REQ_IO_READ` reply length** for variable payloads: the
+  reply `MessageInfo.length` is now `4 + ceil(got/8)` so the kernel
+  actually transfers `msg[4..]` to the client. Without this fix
+  cpiofs reads returned stale bytes from the client's own IPC
+  buffer (e.g. the path string from the previous `open` call).
+
 ## [v0.5.1] — 2026-05-14
 
 ### Added

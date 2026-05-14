@@ -235,6 +235,7 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/spawn.h \
     $(TASKMAN_DIR)/pathmgr.h \
     $(TASKMAN_DIR)/console.h \
+    $(TASKMAN_DIR)/cpiofs.h \
     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
@@ -392,6 +393,10 @@ $(TASKBUILD)/console.o: $(TASKMAN_DIR)/console.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
+$(TASKBUILD)/cpiofs.o: $(TASKMAN_DIR)/cpiofs.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+
 # Pull libcpio (already extracted to core/lib/cpio for the elfloader) into
 # taskman's build too, so the rootserver can locate tester.elf inside
 # the embedded userland CPIO at runtime.
@@ -434,6 +439,7 @@ TASKMAN_OBJS := \
     $(TASKBUILD)/spawn.o \
     $(TASKBUILD)/pathmgr.o \
     $(TASKBUILD)/console.o \
+    $(TASKBUILD)/cpiofs.o \
     $(TASKBUILD)/cpio.o \
     $(TASKBUILD)/userland_archive.o \
     $(TASKBUILD)/libqsoe/channel.o \
@@ -625,12 +631,14 @@ $(HELLO_ELF): $(HELLO_OBJS) $(LIBC_A)
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
 $(USERLAND_CPIO): $(TESTER_ELF) $(HELLO_ELF)
-	@mkdir -p $(@D)
-	@cd $(BUILD) && \
-	    printf '%s\n' tester.elf hello.elf | \
+	@mkdir -p $(BUILD)/cpio-root/bin
+	@cp $(TESTER_ELF) $(BUILD)/cpio-root/bin/tester.elf
+	@cp $(HELLO_ELF)  $(BUILD)/cpio-root/bin/hello.elf
+	@cd $(BUILD)/cpio-root && \
+	    printf '%s\n' bin/tester.elf bin/hello.elf | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
-	         --file=userland.cpio
+	         --file=$(USERLAND_CPIO)
 
 $(TASKBUILD)/userland_archive.S: $(USERLAND_CPIO) $(firstword $(MAKEFILE_LIST))
 	@mkdir -p $(@D)

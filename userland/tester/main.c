@@ -83,6 +83,32 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
+    /* --- 0b. v0.6.0 cpiofs demo: open /bin/hello.elf, read 64 bytes,
+     *         print the ELF magic to prove the path went through the
+     *         path manager, cpiofs registered at "/", and the per-fd
+     *         offset state in tm_connection_t.ctx[]. --- */
+    {
+        int fd = qsoe_open("/bin/hello.elf", 0);
+        sel4_debug_puts("[tester] open(/bin/hello.elf) -> fd=");
+        putd(fd);
+        sel4_debug_putchar('\n');
+        if (fd >= 0) {
+            unsigned char hdr[64];
+            long n = qsoe_read(fd, hdr, sizeof hdr);
+            sel4_debug_puts("[tester] read(fd, 64) -> ");
+            putd((int)n);
+            sel4_debug_puts(" bytes, magic=");
+            for (int i = 0; i < 4 && i < n; ++i) {
+                static const char hex[] = "0123456789abcdef";
+                sel4_debug_putchar(hex[(hdr[i] >> 4) & 0xf]);
+                sel4_debug_putchar(hex[hdr[i] & 0xf]);
+                sel4_debug_putchar(' ');
+            }
+            sel4_debug_putchar('\n');
+            qsoe_close(fd);
+        }
+    }
+
     /* --- 1. Round-trip on SYSMGR_COID (no ConnectAttach needed) --- */
     for (int i = 1; i <= 3; ++i) {
         unsigned long payload = (unsigned long)i;

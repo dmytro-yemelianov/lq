@@ -513,3 +513,82 @@ console handler, output appears on the SBI console.  No
 0); since \texttt{force\_bind\_coid} has already populated slots
 0/1/2, the first allocation by a fresh \texttt{open()} returns fd
 3, matching POSIX expectations.
+
+\section{cpiofs --- the userland CPIO as a read-only filesystem (v0.6)}
+
+Until v0.5.x every spawnable binary lived in the embedded
+\texttt{userland.cpio} but was only reachable by name to taskman's
+\texttt{posix\_spawn} path.  v0.6.0 mounts that CPIO as a real
+filesystem at \texttt{/} via a third in-taskman handler kind,
+\texttt{PATHMGR\_HANDLER\_TASKMAN\_CPIOFS} (alongside
+\texttt{EXTERNAL} and \texttt{TASKMAN\_CONSOLE}).
+
+\paragraph{Registration.}  At boot, \texttt{main.c} registers
+\texttt{TM\_CPIOFS\_CHID = 3} (sharing the primary endpoint), then:
+\begin{lstlisting}[language=C]
+tm_pathmgr_obj_t obj = {
+    .server_pid   = QSOE_PID_TASKMAN,
+    .server_chid  = TM_CPIOFS_CHID,
+    .handler_kind = PATHMGR_HANDLER_TASKMAN_CPIOFS,
+};
+tm_pathmgr_register("/", &obj);
+\end{lstlisting}
+
+Longest-prefix-match in \texttt{tm\_pathmgr\_resolve} now treats
+the root node specially: if \texttt{g\_root->has\_obj} is set,
+the root match becomes the initial deepest-candidate that any
+more-specific descendant can override.  So
+\texttt{open("/dev/console")} still routes to the console
+handler, but \texttt{open("/bin/hello.elf")} falls through to
+cpiofs.
+
+\paragraph{Per-connection state.}  Stateful resmgrs need
+per-fd state.  \texttt{tm\_connection\_t} grew a generic
+\texttt{unsigned long ctx[2]} array (\texttt{server.h}).  cpiofs
+uses it as:
+\begin{itemize}
+    \item \texttt{ctx[0]} --- data pointer (the CPIO archive
+          address of the file's bytes, returned by
+          \texttt{cpio\_get\_file})
+    \item \texttt{ctx[1]} --- packed \texttt{(size << 32) | offset}
+          (file size in the high 32 bits, current read offset in
+          the low 32 bits; caps file size at 4 GiB which is fine
+          for v0.6.0)
+\end{itemize}
+
+\paragraph{Open path.}  When \texttt{TM\_REQ\_OPEN} resolves a
+path to a CPIOFS handler:
+\begin{enumerate}
+    \item \texttt{tm\_connect\_attach} mints a badged Send-cap on
+          \texttt{(taskman, TM\_CPIOFS\_CHID)} into the caller's
+          CSpace.
+    \item Look up the badge of the freshly-minted connection via
+          \texttt{tm\_connection\_badge\_by\_slot}.
+    \item \texttt{tm\_cpiofs\_open(path, consumed\_bytes, badge)}
+          strips the leading consumed bytes (typically just the
+          \texttt{/}), looks up the rest in the CPIO via
+          \texttt{cpio\_get\_file}, and stashes \texttt{(data,
+          size)} on the connection's \texttt{ctx[]}.
+    \item Reply with the slot number; libqsoe binds it to a
+          fresh fd.
+\end{enumerate}
+
+\paragraph{Read path.}  \texttt{TM\_REQ\_IO\_READ} on the cpiofs
+channel calls \texttt{tm\_cpiofs\_read(badge, want, *got)} which
+copies up to \texttt{min(want, 928, size-offset)} bytes from
+the file's CPIO data into \texttt{msg[4..]} and advances the
+offset.  Crucially, the reply's \texttt{MessageInfo.length} is
+\texttt{4 + ceil(got/8)} words, so the kernel transfers the
+byte payload through the IPC buffer (the four register-passed
+MRs alone aren't enough).
+
+\paragraph{Write.}  Returns \texttt{-EROFS}.  Read-only; a real
+read/write filesystem is a v0.7+ project (probably an external
+resmgr, perhaps backed by NVMe via a future devb-nvme).
+
+\paragraph{CPIO layout migration.}  v0.6.0 moved the cpio entries
+from bare \texttt{tester.elf} / \texttt{hello.elf} to
+\texttt{bin/tester.elf} / \texttt{bin/hello.elf} to fit the
+filesystem-style hierarchy.  taskman's \texttt{tm\_process\_create\_by\_name}
+canonicalises by internally prepending \texttt{bin/}, so the wire
+protocol still accepts the bare name.

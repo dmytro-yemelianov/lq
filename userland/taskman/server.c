@@ -78,13 +78,16 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
                               int envc, const char *const *envp,
                               pid_t *out_pid)
 {
-    if (path_len == 0 || path_len >= 64) return -EINVAL;
+    if (path_len == 0 || path_len >= 60) return -EINVAL;
     if (!s_cpio_start || !s_primary_ep) return -EINVAL;
 
-    /* Copy and NUL-terminate — libcpio's lookup wants a C string. */
+    /* v0.6.0: prepend "bin/" so the lookup matches the new CPIO
+     * layout. The wire protocol still has callers pass the bare
+     * name ("hello.elf"); taskman canonicalises here. */
     char name[64];
-    for (unsigned i = 0; i < path_len; ++i) name[i] = path[i];
-    name[path_len] = 0;
+    name[0] = 'b'; name[1] = 'i'; name[2] = 'n'; name[3] = '/';
+    for (unsigned i = 0; i < path_len; ++i) name[4 + i] = path[i];
+    name[4 + path_len] = 0;
 
     unsigned long elf_size = 0;
     const void *elf = cpio_get_file(s_cpio_start, s_cpio_len, name, &elf_size);
@@ -288,9 +291,54 @@ int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
         g_connections[i].client_pid  = client_pid;
         g_connections[i].client_slot = client_slot;
         g_connections[i].flags       = flags;
+        g_connections[i].ctx[0]      = 0;
+        g_connections[i].ctx[1]      = 0;
         return 0;
     }
     return -ENOMEM;
+}
+
+/* v0.6.0: store opaque per-connection state. cpiofs uses this for
+ * file data pointer + current read offset. Returns -ENOENT if no
+ * such connection. */
+int tm_connection_set_ctx(seL4_Word badge, unsigned long c0, unsigned long c1)
+{
+    for (int i = 0; i < TM_MAX_CONNECTIONS; ++i) {
+        tm_connection_t *cn = &g_connections[i];
+        if (cn->in_use && cn->badge == badge) {
+            cn->ctx[0] = c0;
+            cn->ctx[1] = c1;
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
+int tm_connection_get_ctx(seL4_Word badge, unsigned long *c0, unsigned long *c1)
+{
+    for (int i = 0; i < TM_MAX_CONNECTIONS; ++i) {
+        tm_connection_t *cn = &g_connections[i];
+        if (cn->in_use && cn->badge == badge) {
+            if (c0) *c0 = cn->ctx[0];
+            if (c1) *c1 = cn->ctx[1];
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
+int tm_connection_badge_by_slot(pid_t client_pid, seL4_CPtr slot,
+                                 seL4_Word *out_badge)
+{
+    for (int i = 0; i < TM_MAX_CONNECTIONS; ++i) {
+        tm_connection_t *cn = &g_connections[i];
+        if (cn->in_use && cn->client_pid == client_pid &&
+            cn->client_slot == slot) {
+            if (out_badge) *out_badge = cn->badge;
+            return 0;
+        }
+    }
+    return -ENOENT;
 }
 
 /* Find a connection by (client_pid, client_slot). Returns 0 if not
