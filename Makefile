@@ -848,3 +848,73 @@ clean:
 
 distclean: clean
 	rm -rf $(SEL4BUILD)
+
+# ----------------------------------------------------------------------------
+# v0.6.2 — qsh compile-attempt (research-only target, not in `all`).
+#
+# Pull QRV's userland/sh source (= mksh, renamed qsh) and try to
+# compile each .c against musl + libqsoe. The goal is the error log,
+# not a working binary. Yuri analyses the output and decides v0.6.x
+# next steps.
+#
+#   make qsh           — pull source if needed + compile each .c
+#                        (build/qsh.log) + attempt partial link to
+#                        capture undefined symbols (build/qsh.symbols.txt)
+#
+# Errors don't abort the loop — each file gets its own .errs sidecar.
+# ----------------------------------------------------------------------------
+
+QSH_DIR    := $(TOP)/userland/qsh
+QSHBUILD   := $(BUILD)/qsh
+QSH_LOG    := $(BUILD)/qsh.log
+QSH_SYMS   := $(BUILD)/qsh.symbols.txt
+
+QSH_CFLAGS := $(TM_CFLAGS) \
+    -isystem $(MUSL_GEN)/include \
+    -isystem $(MUSL_DIR)/include \
+    -isystem $(MUSL_DIR)/arch/riscv64 \
+    -isystem $(MUSL_DIR)/arch/generic \
+    -I$(QSH_DIR)/include \
+    -I$(QSH_DIR)/gen \
+    -Wno-error -w
+
+.PHONY: qsh qsh-pull
+qsh-pull:
+	@if [ ! -f $(QSH_DIR)/main.c ]; then \
+	    echo "==> Pulling qsh source via scripts/pull-qsh.sh..."; \
+	    $(TOP)/scripts/pull-qsh.sh; \
+	fi
+
+qsh: qsh-pull $(MUSL_GEN_HDRS)
+	@mkdir -p $(QSHBUILD)
+	@rm -f $(QSHBUILD)/*.o
+	@echo "==> qsh compile-attempt (errors expected, not aborting on failure)"
+	@echo "# qsh compile-attempt log generated $$(date)" > $(QSH_LOG)
+	@: > $(QSH_SYMS)
+	@for src in $(QSH_DIR)/*.c; do \
+	    base=$$(basename $$src .c); \
+	    echo "" >> $(QSH_LOG); \
+	    echo "===== $$src =====" >> $(QSH_LOG); \
+	    $(CC) $(QSH_CFLAGS) -c -o $(QSHBUILD)/$$base.o $$src \
+	        >> $(QSH_LOG) 2>&1 || \
+	        echo "  (compile failed for $$base.c)" >> $(QSH_LOG); \
+	done
+	@echo "==> compile log: $(QSH_LOG) ($$(grep -cE '(fatal )?error:' $(QSH_LOG)) error lines, $$(grep -c '(compile failed' $(QSH_LOG)) failed files)"
+	@echo "==> capturing per-object undefined-symbol set..."
+	@if ls $(QSHBUILD)/*.o >/dev/null 2>&1; then \
+	    : > $(QSH_SYMS); \
+	    for o in $(QSHBUILD)/*.o; do \
+	        $(CROSS)nm -u $$o | awk '{print $$NF}' >> $(QSH_SYMS).raw; \
+	    done; \
+	    sort -u $(QSH_SYMS).raw > $(QSH_SYMS).objs.txt; \
+	    rm -f $(QSH_SYMS).raw; \
+	    echo "==> per-object undefined set: $(QSH_SYMS).objs.txt ($$(wc -l < $(QSH_SYMS).objs.txt) symbols)"; \
+	    echo "==> attempting link against libc.a to see what's STILL unresolved..."; \
+	    $(CC) $(TM_CFLAGS) -static -nostdlib \
+	        -Wl,--warn-unresolved-symbols \
+	        -o $(QSHBUILD)/qsh.elf.attempt \
+	        $(QSHBUILD)/*.o $(LIBC_A) 2>$(QSH_SYMS) || true; \
+	    echo "==> link-time undefined-after-libc: $(QSH_SYMS) ($$(grep -c 'undefined' $(QSH_SYMS)) warning lines)"; \
+	else \
+	    echo "==> no .o files produced; nothing to link"; \
+	fi

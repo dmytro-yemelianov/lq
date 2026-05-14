@@ -5,6 +5,42 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.6.2] — 2026-05-14
+
+### Added
+- **qsh compile-attempt target** (`make qsh`). Pulls QRV's
+  `userland/sh` (mksh-derived QNX shell) via
+  `scripts/pull-qsh.sh` into `userland/qsh/`, then compiles each
+  `.c` independently against musl + libqsoe with errors captured
+  per-file instead of aborting. Also performs a partial link with
+  `--warn-unresolved-symbols` and collects the leftover symbol set.
+- Three artefacts in `build/`:
+  - `qsh.log` — full per-file compile log
+  - `qsh.symbols.txt` — linker undefined-symbol warnings
+  - `qsh.symbols.txt.objs.txt` — `nm -u` per-object set (sorted unique)
+  - `qsh.summary.txt` — human-readable triage summary
+
+### Results
+- **22 of 29 `.c` files compile cleanly** against musl + libqsoe.
+- **7 files fail**, in four categories:
+  1. Missing QRV proprietary header (`sys/qrv_core.h`) in `edit.c`.
+  2. Header-typedef breakage in `histrap.c`, `shf.c` — `sh.h` needs
+     a typedef that lives behind the missing header.
+  3. Missing platform constants (`SIGEMT`, `MKSH_DEFAULT_TMPDIR`)
+     in `histrap.c`, `tempfile.c`.
+  4. Inter-file forward-decl ordering in `eval.c`, `jobs.c`,
+     `misc.c` (e.g. `j_change` referenced before its prototype).
+- **84 link-time undefined symbols**; almost all are mksh-internal
+  names defined IN the 7 fail-to-compile files. The actual missing
+  libc primitives once those files build are roughly 5-10.
+
+### Deliverable for Yuri's analysis
+The compile log + symbol set is the raw material for deciding how
+to proceed in v0.6.x or v0.7+: port what's needed of
+`sys/qrv_core.h`, add the missing platform constants, untangle
+forward-decl ordering, then evaluate which libc/system primitives
+QSOE needs to add (pipes, dup2, termios, etc.).
+
 ## [v0.6.1] — 2026-05-14
 
 ### Added
