@@ -1,41 +1,34 @@
 /*
  * hello — entry point.
  *
- * Spawned by another QSOE process via posix_spawn(). a0 holds the
- * child's pid on entry (set by taskman's WriteRegisters). On return
- * from main(), crt0 falls through to _exit(return_value) so the
- * proper ProcessTerminate wire path runs.
+ * Spawned by another QSOE process via posix_spawn(). The kernel-supplied
+ * sp points at the SysV ABI initial-stack image taskman built; see
+ * tester/start.S for the layout commentary. crt0 just sets up
+ * gp/tp/fp, computes argc/argv/envp into a1/a2/a3, and tail-calls
+ * _qsoe_start_main.
  */
 
 .section .text.start
 .global _start
 _start:
-    /* Initialise gp (RISC-V small data/bss). */
     .option push
     .option norelax
     la gp, __global_pointer$
     .option pop
 
-    /* Plant tp = &qsoe_main_tcb (libqsoe per-thread state). */
     la tp, qsoe_main_tcb
 
-    /* Set up stack. */
-    la sp, _stack_top
-
-    /* Clear frame pointer. */
     li fp, 0
 
-    /* a0 already holds our pid; pass through to main(pid_t). */
-    call main
+    /* a0 = pid (preserved). Stage argc/argv/envp into a1/a2/a3. */
+    ld   a1, 0(sp)
+    addi a2, sp, 8
+    addi t0, a1, 1
+    slli t0, t0, 3
+    add  a3, a2, t0
 
-    /* main returned — funnel its return value into _exit(). */
-    call _exit
+    call _qsoe_start_main
+
 1:  j 1b
 
     .size _start, . - _start
-
-.section .bss
-    .align 12
-_stack_bottom:
-    .skip 8192
-_stack_top:

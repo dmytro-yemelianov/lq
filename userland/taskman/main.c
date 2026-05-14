@@ -114,13 +114,58 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_PROCESS_CREATE: {
-        /* MR0 = path length in bytes. Path bytes ride in
-         * ipcbuf->msg[4..] — the kernel only copies that range across
-         * the IPC, MR0..3 being register-transferred. */
-        unsigned plen = (unsigned)mr0;
-        const char *path = (const char *)&qsoe_ipcbuf->msg[4];
+        /* v0.4.4 wire layout:
+         *   MR0 = argc       MR1 = envc
+         *   MR2 = path_len   MR3 = total_strs_bytes (sum over all strings)
+         *   ipcbuf->msg[4..] = path bytes + argv strings + envp strings,
+         *     each string NUL-terminated.
+         *
+         * The kernel only transfers msg[4..length-1]; MR0..3 are
+         * register-passed. Strings are unpacked into a static staging
+         * area below, scanned for NULs to build argv[]/envp[] pointer
+         * arrays, and handed to tm_process_create_by_name. */
+        int argc = (int)mr0;
+        int envc = (int)mr1;
+        unsigned plen = (unsigned)mr2;
+        unsigned total_strs = (unsigned)mr3;
+
+        static char  s_staging[1024];
+        static const char *s_argv[16];
+        static const char *s_envp[16];
+
+        if (argc < 0 || argc > 16 || envc < 0 || envc > 16 ||
+            plen == 0 || plen >= 64 ||
+            total_strs > sizeof s_staging) {
+            err = (seL4_Word)EINVAL;
+            break;
+        }
+        /* Copy strings out of the IPC buffer into the staging area. */
+        const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+        for (unsigned i = 0; i < total_strs; ++i) s_staging[i] = (char)src[i];
+
+        /* Path comes first; argv strings next; envp strings last. */
+        const char *path = s_staging;
+        unsigned off = plen + 1;  /* one extra byte for the NUL after path */
+        for (int i = 0; i < argc; ++i) {
+            if (off >= total_strs) { err = (seL4_Word)EINVAL; break; }
+            s_argv[i] = &s_staging[off];
+            while (off < total_strs && s_staging[off] != 0) ++off;
+            ++off;  /* skip the NUL */
+        }
+        if (err) break;
+        for (int i = 0; i < envc; ++i) {
+            if (off >= total_strs && envc > 0) { err = (seL4_Word)EINVAL; break; }
+            s_envp[i] = &s_staging[off];
+            while (off < total_strs && s_staging[off] != 0) ++off;
+            ++off;
+        }
+        if (err) break;
+
         pid_t new_pid = 0;
-        int rc = tm_process_create_by_name(path, plen, &new_pid);
+        int rc = tm_process_create_by_name(path, plen,
+                                            argc, s_argv,
+                                            envc, s_envp,
+                                            &new_pid);
         if (rc) { err = (seL4_Word)(-rc); }
         else    { *out_mr0 = (seL4_Word)new_pid; reply_len = 1; }
         break;
@@ -328,7 +373,12 @@ int main(seL4_BootInfo *bi)
         sel4_debug_putchar(d);
     }
     sel4_debug_puts(")...\n");
-    int sr = tm_spawn(elf, elf_size, tester_pid, primary_ep);
+    /* Boot-time spawn of tester: no argv, no envp. */
+    static const char *boot_argv0 = "tester";
+    const char *boot_argv[1] = { boot_argv0 };
+    int sr = tm_spawn(elf, elf_size, tester_pid, primary_ep,
+                       /*argc=*/1, boot_argv,
+                       /*envc=*/0, 0);
     if (sr != 0) {
         sel4_debug_puts("FATAL: tm_spawn returned non-zero\n");
         for (;;) __asm__ volatile("nop");

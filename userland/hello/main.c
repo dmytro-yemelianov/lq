@@ -20,9 +20,6 @@
 #include "../libqsoe/include/qsoe/qrv.h"
 #include "../libqsoe/include/qsoe/slots.h"
 
-/* Same spawn-convention IPC buffer vaddr as tester. */
-#define HELLO_IPC_BUFFER ((seL4_IPCBuffer *)0x1FE000UL)
-
 static void putd(int v)
 {
     char buf[12];
@@ -34,11 +31,24 @@ static void putd(int v)
     for (int i = n - 1; i >= 0; --i) sel4_debug_putchar(buf[i]);
 }
 
-int main(pid_t pid)
+int main(int argc, char **argv, char **envp)
 {
-    qsoe_libqsoe_init(HELLO_IPC_BUFFER, pid);
     sel4_debug_puts("[hello] alive, pid=");
-    putd((int)pid);
+    putd((int)qsoe_self_pid);
+    sel4_debug_puts(" argc=");
+    putd(argc);
+    for (int i = 0; i < argc; ++i) {
+        sel4_debug_puts(" argv[");
+        putd(i);
+        sel4_debug_puts("]=");
+        sel4_debug_puts(argv[i]);
+    }
+    for (int i = 0; envp && envp[i]; ++i) {
+        sel4_debug_puts(" envp[");
+        putd(i);
+        sel4_debug_puts("]=");
+        sel4_debug_puts(envp[i]);
+    }
     sel4_debug_putchar('\n');
 
     int chid = ChannelCreate(0);

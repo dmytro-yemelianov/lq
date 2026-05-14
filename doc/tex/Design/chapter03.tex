@@ -356,3 +356,61 @@ scoids remain in a single global namespace (the per-channel
 namespacing QNX uses is a QNX-faithfulness refinement deferred until
 the 28-bit endpoint-badge space gets uncomfortable, which won't
 happen for the foreseeable future).
+
+\section{argv/envp delivery (v0.4.4)}
+
+The child receives \texttt{argv}/\texttt{envp} via the standard
+RISC-V SysV initial-stack layout.  Taskman allocates two stack pages
+at \texttt{[0x1FC000, 0x1FE000)} in the child's VSpace (directly below
+the IPC buffer), writes the image into the top page with the same
+scratch-page mapping trick used for ELF segments, and points the new
+TCB's \texttt{sp} at \texttt{argc}.
+
+Layout, high to low (\texttt{sp} points at \texttt{argc}):
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Region                                   & Bytes \\
+\hline
+String area: \texttt{argv}/\texttt{envp} concatenated, NUL-separated & variable \\
+Auxv terminator: \texttt{a\_type=AT\_NULL=0}, \texttt{a\_un=0}
+                                         & 16 \\
+\texttt{envp} NULL terminator            & 8 \\
+\texttt{envp[envc-1]} \ldots \texttt{envp[0]}
+                                         & $8 \cdot envc$ \\
+\texttt{argv} NULL terminator            & 8 \\
+\texttt{argv[argc-1]} \ldots \texttt{argv[0]}
+                                         & $8 \cdot argc$ \\
+\texttt{argc}                            & 8 \quad\textbf{$\leftarrow$ \texttt{sp}} \\
+\hline
+\end{tabular}
+\end{center}
+
+The string area is padded so the final \texttt{sp} is 16-byte aligned
+(RISC-V SysV requirement).
+
+\paragraph{Wire path.} \texttt{TM\_REQ\_PROCESS\_CREATE}'s message
+registers carry the counts:
+\begin{itemize}
+    \item \texttt{MR0 = argc}
+    \item \texttt{MR1 = envc}
+    \item \texttt{MR2 = path\_len}
+    \item \texttt{MR3 = total\_strings\_bytes}
+\end{itemize}
+The strings (path NUL-terminated, then each argv element NUL-terminated,
+then each envp element NUL-terminated) are packed into
+\texttt{ipcbuf->msg[4..]}, since the seL4 kernel only transfers the
+spill area --- MR0..3 are register-passed.  Maximum payload is one
+IPC buffer's worth ($\sim$928~bytes); larger argv vectors would need
+shared memory, deferred.
+
+\paragraph{Crt0 contract.}  Each spawnable binary's \texttt{start.S}
+\textbf{does not override} \texttt{sp}.  It computes
+\texttt{argc/argv/envp} from \texttt{sp}, places them in
+\texttt{a1/a2/a3} (\texttt{a0} already holds the pid from taskman's
+\texttt{TCB\_WriteRegisters}), and tail-calls
+\texttt{\_qsoe\_start\_main} (a C shim in
+\texttt{libqsoe/src/start\_main.c}) which performs
+\texttt{qsoe\_libqsoe\_init} and dispatches to the user's
+\texttt{main(int argc, char **argv, char **envp)}.

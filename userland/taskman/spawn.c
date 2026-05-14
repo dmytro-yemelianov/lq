@@ -60,10 +60,16 @@ struct elf64_phdr {
 #define TM_SCRATCH_VADDR 0x100000UL
 
 /* Child VSpace layout. Everything fits in one Sv39 2 MiB region so a
- * single L1 PT + single L0 PT covers it. */
+ * single L1 PT + single L0 PT covers it. The stack lives in two pages
+ * directly below the IPC buffer; sp starts at CHILD_STACK_TOP and grows
+ * down through the two pages [CHILD_STACK_BASE, CHILD_STACK_TOP). The
+ * top page also holds the SysV ABI initial-stack image (argc/argv/
+ * envp/auxv/strings) that the crt0 in start.S reads at entry. */
 #define CHILD_IMAGE_BASE   0x10000UL   /* matches tester's linker script */
-#define CHILD_IPC_BUFFER   0x1FE000UL  /* near top of the 2 MiB region */
-#define CHILD_STACK_TOP    0x1FF000UL  /* one page; sp starts here, grows down into the next page below if needed */
+#define CHILD_STACK_BASE   0x1FC000UL  /* 2 stack pages: [0x1FC000, 0x1FE000) */
+#define CHILD_STACK_TOP    0x1FE000UL  /* sp starts here, grows down */
+#define CHILD_STACK_PAGES  2
+#define CHILD_IPC_BUFFER   0x1FE000UL  /* one page, just above the stack */
 
 /* Image can grow up to one Sv39 L0 PT's coverage — 2 MiB. Beyond that
  * we'd need ensure_l0_pt() to lazily allocate per-2-MiB-region PTs as
@@ -116,8 +122,120 @@ static seL4_CPtr alloc_object(seL4_Word type, seL4_Word size_bits)
     return (err == 0) ? slot : 0;
 }
 
+static unsigned long qstrlen(const char *s)
+{
+    unsigned long n = 0;
+    while (s[n]) ++n;
+    return n;
+}
+
+/* Build the SysV ABI initial-stack image into the top page of the
+ * child's stack region.
+ *
+ * Layout from high to low (the child sees sp pointing at argc):
+ *   [string area: argv[0]\0 argv[1]\0 ... envp[0]\0 envp[1]\0 ...]
+ *   [auxv terminator: a_type = AT_NULL = 0, a_un = 0]   16 bytes
+ *   [envp NULL terminator]                               8 bytes
+ *   [envp[envc-1]]                                       8 bytes
+ *   ...
+ *   [envp[0]]                                            8 bytes
+ *   [argv NULL terminator]                               8 bytes
+ *   [argv[argc-1]]
+ *   ...
+ *   [argv[0]]
+ *   [argc]                                               8 bytes  <-- sp
+ *
+ * sp is held 16-byte aligned per RISC-V SysV by padding the string
+ * area upward as needed.
+ *
+ * The page is mapped temporarily into taskman's vspace at the scratch
+ * vaddr so we can write into it before mapping it into the child.
+ *
+ * Returns the child-vspace address of argc (= initial sp). 0 if the
+ * combined size exceeds one stack page (caller may grow then). */
+static unsigned long build_initial_stack(seL4_CPtr top_frame,
+                                          int argc, const char *const *argv,
+                                          int envc, const char *const *envp)
+{
+    /* Compute total bytes needed for the string area. */
+    unsigned long strs_bytes = 0;
+    for (int i = 0; i < argc; ++i) strs_bytes += qstrlen(argv[i]) + 1;
+    for (int i = 0; i < envc; ++i) strs_bytes += qstrlen(envp[i]) + 1;
+
+    /* Pointer + terminator area below the strings. */
+    unsigned long below = 8 /*argc*/
+                        + 8UL * (unsigned long)(argc + 1) /*argv + NULL*/
+                        + 8UL * (unsigned long)(envc + 1) /*envp + NULL*/
+                        + 16 /*auxv AT_NULL pair*/;
+
+    /* Pad the string area so total is 16-aligned (initial sp 16-aligned). */
+    unsigned long total = strs_bytes + below;
+    unsigned long total_aligned = (total + 15UL) & ~15UL;
+    unsigned long strs_alloc = total_aligned - below;
+
+    if (total_aligned > 0x1000UL) return 0;  /* doesn't fit in one page */
+
+    /* Map the frame into taskman's vspace, then write top-down. */
+    if (scratch_map(top_frame) != 0) return 0;
+    qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
+
+    /* "Top" of the page in taskman's view; the child sees this same
+     * byte at CHILD_STACK_TOP. */
+    unsigned char *scratch_top = (unsigned char *)TM_SCRATCH_VADDR + 0x1000;
+    unsigned long  child_top   = CHILD_STACK_TOP;
+
+    /* String area sits at the very top, occupying strs_alloc bytes. */
+    unsigned char *strs_scratch  = scratch_top - strs_alloc;
+    unsigned long  strs_in_child = child_top   - strs_alloc;
+
+    /* Per-string pointers we'll write into the argv/envp arrays. */
+    unsigned long child_argv[16];
+    unsigned long child_envp[16];
+    /* (16 is enough for v0.4.4 demos; static array keeps stack frame
+     * small. Larger arg lists would overflow the IPC-buffer payload
+     * anyway.) */
+
+    unsigned char *cur = strs_scratch;
+    unsigned long  cur_child = strs_in_child;
+    for (int i = 0; i < argc; ++i) {
+        unsigned long len = qstrlen(argv[i]) + 1;
+        qmemcpy(cur, argv[i], len);
+        child_argv[i] = cur_child;
+        cur += len;
+        cur_child += len;
+    }
+    for (int i = 0; i < envc; ++i) {
+        unsigned long len = qstrlen(envp[i]) + 1;
+        qmemcpy(cur, envp[i], len);
+        child_envp[i] = cur_child;
+        cur += len;
+        cur_child += len;
+    }
+
+    /* Now write the auxv/envp/argv arrays + argc below the strings.
+     * `p` walks downward in 8-byte units. */
+    unsigned long *p = (unsigned long *)strs_scratch;
+    *--p = 0;                                 /* auxv: a_un */
+    *--p = 0;                                 /* auxv: a_type = AT_NULL */
+    *--p = 0;                                 /* envp NULL */
+    for (int i = envc - 1; i >= 0; --i) *--p = child_envp[i];
+    *--p = 0;                                 /* argv NULL */
+    for (int i = argc - 1; i >= 0; --i) *--p = child_argv[i];
+    *--p = (unsigned long)argc;               /* argc — sp points here */
+
+    /* Final sp in child = child_top - total_aligned. */
+    unsigned long sp_in_child = child_top - total_aligned;
+
+    /* fence then unmap. */
+    __asm__ volatile ("fence rw, rw" ::: "memory");
+    if (scratch_unmap(top_frame) != 0) return 0;
+    return sp_in_child;
+}
+
 int tm_spawn(const void *elf_blob, unsigned long elf_len,
-             pid_t pid, seL4_CPtr primary_ep)
+             pid_t pid, seL4_CPtr primary_ep,
+             int argc, const char *const *argv,
+             int envc, const char *const *envp)
 {
     (void)elf_len;
     const struct elf64_hdr *eh = elf_blob;
@@ -242,8 +360,41 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                               QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
     if (err) { sel4_debug_puts("spawn: ipc_frame Page_Map failed\n"); return -ENOMEM; }
 
-    /* (tester's stack is currently part of its .bss — included in the
-     * PT_LOAD walk above. v0.4 will allocate stacks separately.) */
+    /* v0.4.4: allocate the stack region below the IPC buffer.
+     * CHILD_STACK_PAGES pages cover [CHILD_STACK_BASE, CHILD_STACK_TOP).
+     * The top page gets populated with the SysV ABI initial-stack
+     * image (argc/argv/envp/auxv/strings) via scratch_map FIRST, then
+     * all pages are mapped into the child. (Mapping into the child
+     * before the scratch-map would fail with "frame does not belong
+     * to passed address space" — a frame may only be mapped in one
+     * VSpace at a time.) */
+    seL4_CPtr stack_frames[CHILD_STACK_PAGES];
+    for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
+        stack_frames[i] = alloc_object(seL4_RISCV_4K_Page, 0);
+        if (!stack_frames[i]) {
+            sel4_debug_puts("spawn: stack frame alloc failed\n");
+            return -ENOMEM;
+        }
+    }
+    /* Build the SysV initial-stack image in the top stack page
+     * BEFORE mapping it into the child. */
+    unsigned long initial_sp =
+        build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1],
+                            argc, argv, envc, envp);
+    if (!initial_sp) {
+        sel4_debug_puts("spawn: build_initial_stack failed\n");
+        return -E2BIG;
+    }
+    /* Now map all stack pages into the child. */
+    for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
+        unsigned long va = CHILD_STACK_BASE + (unsigned long)i * 0x1000UL;
+        err = qsoe_riscv_page_map(stack_frames[i], vspace, va,
+                                  QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
+        if (err) {
+            sel4_debug_puts("spawn: stack Page_Map failed\n");
+            return -ENOMEM;
+        }
+    }
 
     /* 5. Populate the child's CSpace. Slot 1 = Send cap to taskman's
      *    primary endpoint, badged with the child's pid. The child's
@@ -287,14 +438,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB, 254);
     if (err) { sel4_debug_puts("spawn: TCB_SetPriority failed\n"); return -ENOMEM; }
 
-    /* 7. WriteRegisters: pc=e_entry, a0=pid, sp=stack (tester's start.S
-     *    immediately overrides sp with its own _stack_top, so we just
-     *    need a sane initial sp — middle of the IPC buffer page works).
-     *    gp=0 because tester's start.S sets it itself. */
+    /* 7. WriteRegisters: pc=e_entry, a0=pid, sp=initial_sp (pointing
+     *    at argc in the SysV image we just wrote into the top stack
+     *    page). gp=0 because the binary's start.S sets it itself. */
     qsoe_user_ctx_t ctx;
     qmemset(&ctx, 0, sizeof ctx);
     ctx.pc = eh->e_entry;
-    ctx.sp = CHILD_STACK_TOP;
+    ctx.sp = initial_sp;
     ctx.gp = 0;
     ctx.a0 = (seL4_Word)pid;
     err = qsoe_tcb_write_registers(tcb, 0, &ctx);

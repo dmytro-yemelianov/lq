@@ -16,10 +16,6 @@
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
 
-/* Spawn convention from spawn.c: the kernel maps the IPC buffer at
- * this virtual address in the child's VSpace. */
-#define TESTER_IPC_BUFFER ((seL4_IPCBuffer *)0x1FE000UL)
-
 static void puthex(unsigned long x)
 {
     char buf[19];
@@ -44,12 +40,20 @@ static void putd(int v)
     for (int i = n - 1; i >= 0; --i) sel4_debug_putchar(buf[i]);
 }
 
-int main(pid_t pid)
+int main(int argc, char **argv, char **envp)
 {
-    qsoe_libqsoe_init(TESTER_IPC_BUFFER, pid);
-
     sel4_debug_puts("[tester] alive, pid=");
-    putd(pid);
+    putd((int)qsoe_self_pid);
+    sel4_debug_puts(" argc=");
+    putd(argc);
+    if (argc > 0 && argv[0]) {
+        sel4_debug_puts(" argv[0]=");
+        sel4_debug_puts(argv[0]);
+    }
+    if (envp && envp[0]) {
+        sel4_debug_puts(" envp[0]=");
+        sel4_debug_puts(envp[0]);
+    }
     sel4_debug_putchar('\n');
 
     /* --- 1. Round-trip on SYSMGR_COID (no ConnectAttach needed) --- */
@@ -272,7 +276,10 @@ int main(pid_t pid)
      *         the server identity (pid != taskman). --- */
     {
         pid_t hpid = 0;
-        int rc = posix_spawn(&hpid, "hello.elf", 0, 0, 0, 0);
+        /* v0.4.4: pass argv/envp; hello prints them at startup. */
+        char *hargv[] = { "hello", "world", 0 };
+        char *henvp[] = { "FOO=bar", "QSOE_VER=0.4.4", 0 };
+        int rc = posix_spawn(&hpid, "hello.elf", 0, 0, hargv, henvp);
         sel4_debug_puts("[tester] posix_spawn(hello.elf) -> rc=");
         putd(rc);
         sel4_debug_puts(" pid=");

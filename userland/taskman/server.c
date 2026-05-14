@@ -74,6 +74,8 @@ void tm_set_primary_ep(seL4_CPtr ep)
 }
 
 int tm_process_create_by_name(const char *path, unsigned path_len,
+                              int argc, const char *const *argv,
+                              int envc, const char *const *envp,
                               pid_t *out_pid)
 {
     if (path_len == 0 || path_len >= 64) return -EINVAL;
@@ -91,7 +93,8 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
     pid_t new_pid = tm_pid_alloc();
     if (!new_pid) return -ENOMEM;
 
-    int sr = tm_spawn(elf, elf_size, new_pid, s_primary_ep);
+    int sr = tm_spawn(elf, elf_size, new_pid, s_primary_ep,
+                       argc, argv, envc, envp);
     if (sr) {
         tm_pid_free(new_pid);
         return sr;

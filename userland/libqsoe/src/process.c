@@ -30,29 +30,55 @@ static unsigned qstrlen(const char *s)
     return n;
 }
 
-int ProcessCreate(const char *path)
+/* Internal: do a ProcessCreate with explicit argv/envp arrays. */
+static int process_create_with_args(const char *path,
+                                     char *const argv[], int argc,
+                                     char *const envp[], int envc)
 {
     if (!path) { qsoe_errno = EINVAL; return -1; }
     unsigned plen = qstrlen(path);
     if (plen == 0 || plen >= 64) { qsoe_errno = EINVAL; return -1; }
+    if (argc < 0 || argc > 16 || envc < 0 || envc > 16) {
+        qsoe_errno = EINVAL;
+        return -1;
+    }
 
 #ifdef QSOE_LIBQSOE_IN_TASKMAN
     pid_t new_pid = 0;
-    int rc = tm_process_create_by_name(path, plen, &new_pid);
+    int rc = tm_process_create_by_name(path, plen,
+                                        argc, (const char *const *)argv,
+                                        envc, (const char *const *)envp,
+                                        &new_pid);
     if (rc) { qsoe_errno = -rc; return -1; }
     return (int)new_pid;
 #else
-    /* Pack the path bytes into the IPC buffer starting at msg[4]. MR0..3
-     * (= ipcbuf->msg[0..3]) are register-transferred on the wire and
-     * don't reach the receiver's ipcbuf in transit; the kernel only
-     * copies msg[4..length-1] from sender's to receiver's ipcbuf. */
+    /* Pack the path + all argv/envp strings into the IPC buffer
+     * starting at msg[4]. Each string is NUL-terminated. The kernel
+     * only transfers msg[4..length-1] across IPC; MR0..3 carry the
+     * counts and total byte length. */
     unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
-    for (unsigned i = 0; i < plen; ++i) dst[i] = (unsigned char)path[i];
+    unsigned off = 0;
+    /* path. */
+    for (unsigned i = 0; i < plen; ++i) dst[off++] = (unsigned char)path[i];
+    dst[off++] = 0;
+    /* argv strings. */
+    for (int i = 0; i < argc; ++i) {
+        unsigned len = qstrlen(argv[i]);
+        for (unsigned j = 0; j < len; ++j) dst[off++] = (unsigned char)argv[i][j];
+        dst[off++] = 0;
+    }
+    /* envp strings. */
+    for (int i = 0; i < envc; ++i) {
+        unsigned len = qstrlen(envp[i]);
+        for (unsigned j = 0; j < len; ++j) dst[off++] = (unsigned char)envp[i][j];
+        dst[off++] = 0;
+    }
 
-    seL4_Word mr0 = plen;
-    seL4_Word mr1 = 0, mr2 = 0, mr3 = 0;
-    /* Total words: 4 register-MRs + ceil(plen/8) words for the path. */
-    unsigned nwords = 4 + (plen + 7) / 8;
+    seL4_Word mr0 = (seL4_Word)argc;
+    seL4_Word mr1 = (seL4_Word)envc;
+    seL4_Word mr2 = (seL4_Word)plen;
+    seL4_Word mr3 = (seL4_Word)off;  /* total_strs_bytes */
+    unsigned nwords = 4 + (off + 7) / 8;
     seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_PROCESS_CREATE,
                                                    0, 0, nwords);
     seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
@@ -63,15 +89,30 @@ int ProcessCreate(const char *path)
 #endif
 }
 
-/* POSIX surface. v0.4.1 ignores everything but path/pid. */
+int ProcessCreate(const char *path)
+{
+    /* v0.4.4: pass argv0 = path basename so the child sees argc>=1. */
+    char *argv[1];
+    argv[0] = (char *)path;
+    return process_create_with_args(path, argv, 1, 0, 0);
+}
+
+/* POSIX surface. v0.4.4: argv/envp now flow through to the child. */
 int posix_spawn(pid_t *pid_out, const char *path,
                 const void *file_actions,
                 const void *attr,
                 char *const argv[],
                 char *const envp[])
 {
-    (void)file_actions; (void)attr; (void)argv; (void)envp;
-    int p = ProcessCreate(path);
+    (void)file_actions; (void)attr;
+
+    /* Count argv / envp (POSIX: both arrays NULL-terminated). */
+    int argc = 0;
+    if (argv) while (argv[argc]) ++argc;
+    int envc = 0;
+    if (envp) while (envp[envc]) ++envc;
+
+    int p = process_create_with_args(path, argv, argc, envp, envc);
     if (p < 0) return qsoe_errno;
     if (pid_out) *pid_out = (pid_t)p;
     return 0;

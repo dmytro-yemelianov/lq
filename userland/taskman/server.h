@@ -123,6 +123,8 @@ void           tm_pid_free(pid_t pid);
 void           tm_set_userland_cpio(const void *start, unsigned long len);
 void           tm_set_primary_ep(seL4_CPtr ep);
 int            tm_process_create_by_name(const char *path, unsigned path_len,
+                                         int argc, const char *const *argv,
+                                         int envc, const char *const *envp,
                                          pid_t *out_pid);
 
 /* v0.4.1 ProcessTerminate. Revokes the target process's master caps

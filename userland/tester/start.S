@@ -1,10 +1,23 @@
 /*
  * tester — entry point.
  *
- * Spawned by taskman (see userland/taskman/spawn.c). Per QSOE's
- * convention, taskman writes the new process's pid into a0 before
- * resuming the TCB, so a0 holds our pid on entry. We pass it through
- * to main().
+ * Spawned by taskman (see userland/taskman/spawn.c).
+ *
+ * Register state on entry (v0.4.4):
+ *   a0 = pid       (set by taskman's TCB_WriteRegisters)
+ *   sp = top of the SysV ABI initial-stack image:
+ *          0(sp)        argc
+ *          8(sp)        argv[0]
+ *          ...          argv[argc-1]
+ *          .            argv NULL terminator
+ *          .            envp[0]
+ *          ...          envp[envc-1]
+ *          .            envp NULL terminator
+ *          .            auxv (AT_NULL terminator)
+ *          .            argv/envp string area
+ *
+ * crt0 just initialises gp/tp/fp, computes argc/argv/envp into a1/a2/a3,
+ * and calls the shared _qsoe_start_main C shim (libqsoe/src/start_main.c).
  */
 
 .section .text.start
@@ -20,26 +33,22 @@ _start:
     /* Plant tp = &qsoe_main_tcb (see taskman/start.S for rationale). */
     la tp, qsoe_main_tcb
 
-    /* Set up stack pointer. */
-    la sp, _stack_top
-
     /* Clear frame pointer (no caller). */
     li fp, 0
 
-    /* a0 already holds our pid (passed by taskman's WriteRegisters);
-     * leave it as the first arg to main(pid_t). */
-    call main
+    /* Re-arrange registers for _qsoe_start_main(pid, argc, argv, envp).
+     * a0 already holds pid from the kernel. Compute argc/argv/envp from
+     * sp and stage them into a1/a2/a3. */
+    ld   a1, 0(sp)          /* argc */
+    addi a2, sp, 8          /* argv = &sp[1] */
+    addi t0, a1, 1          /* argc + 1 (for argv's NULL terminator) */
+    slli t0, t0, 3          /* (argc+1) * 8 */
+    add  a3, a2, t0         /* envp = argv + (argc+1)*8 */
 
-    /* main returned — funnel its return value into _exit() to drive
-     * the proper ProcessTerminate wire path. a0 already holds main's
-     * return value per RISC-V SysV ABI. */
-    call _exit
+    call _qsoe_start_main
+
+    /* _qsoe_start_main calls _exit and does not return; this is just
+     * a guard against a future code path that might. */
 1:  j 1b
 
     .size _start, . - _start
-
-.section .bss
-    .align 12
-_stack_bottom:
-    .skip 8192
-_stack_top:

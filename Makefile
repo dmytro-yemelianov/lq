@@ -369,6 +369,10 @@ $(TESTBUILD)/libqsoe/process.o: $(LIBQSOE_DIR)/src/process.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TESTBUILD)/libqsoe/start_main.o: $(LIBQSOE_DIR)/src/start_main.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 TESTER_OBJS := \
     $(TESTBUILD)/start.o \
     $(TESTBUILD)/main.o \
@@ -377,7 +381,8 @@ TESTER_OBJS := \
     $(TESTBUILD)/libqsoe/state.o \
     $(TESTBUILD)/libqsoe/msg.o \
     $(TESTBUILD)/libqsoe/thread.o \
-    $(TESTBUILD)/libqsoe/process.o
+    $(TESTBUILD)/libqsoe/process.o \
+    $(TESTBUILD)/libqsoe/start_main.o
 
 $(TESTER_ELF): $(TESTER_OBJS)
 	@mkdir -p $(@D)
@@ -427,6 +432,10 @@ $(HELLOBUILD)/libqsoe/connect.o: $(LIBQSOE_DIR)/src/connect.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(HELLOBUILD)/libqsoe/start_main.o: $(LIBQSOE_DIR)/src/start_main.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 HELLO_OBJS := \
     $(HELLOBUILD)/start.o \
     $(HELLOBUILD)/main.o \
@@ -435,7 +444,8 @@ HELLO_OBJS := \
     $(HELLOBUILD)/libqsoe/process.o \
     $(HELLOBUILD)/libqsoe/thread.o \
     $(HELLOBUILD)/libqsoe/channel.o \
-    $(HELLOBUILD)/libqsoe/connect.o
+    $(HELLOBUILD)/libqsoe/connect.o \
+    $(HELLOBUILD)/libqsoe/start_main.o
 
 $(HELLO_ELF): $(HELLO_OBJS)
 	@mkdir -p $(@D)
