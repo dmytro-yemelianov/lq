@@ -58,6 +58,8 @@ typedef unsigned int  gid_t;
 #define ENOMEM        12
 #define EINVAL        22
 #define E2BIG          7
+#define ESPIPE        29
+#define ENOTTY        25
 #define ENOSYS        89
 #define EHOSTUNREACH 113
 

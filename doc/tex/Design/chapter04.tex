@@ -598,3 +598,113 @@ Standard C/POSIX functions (\texttt{printf}, \texttt{malloc},
 to route system calls through seL4 IPC to \texttt{taskman} or the
 appropriate resource manager rather than through Linux \texttt{ecall}
 traps.
+
+\subsection{The \texttt{\_\_sysinfo} bridge (v0.5.1)}
+
+Upstream musl on Linux issues syscalls via an inline \texttt{ecall}
+in \texttt{arch/riscv64/syscall\_arch.h}.  QSOE replaces that file
+with a patched variant at
+\texttt{core/userland/libc/patches/arch/riscv64/syscall\_arch.h},
+included earlier in the libc build's include path, which redefines
+every \texttt{\_\_syscallN} stub to call through a global function
+pointer:
+
+\begin{lstlisting}[language=C]
+#define CALL_SYSINFO(n, ...) \
+    ((long(*)(long, ...))__sysinfo)(n, ##__VA_ARGS__)
+\end{lstlisting}
+
+\texttt{\_\_sysinfo} is a \texttt{size\_t} global defined by musl
+itself in \texttt{src/internal/defsysinfo.c}.  In Linux musl,
+\texttt{\_\_libc\_start\_main} reads its address from the kernel's
+\texttt{AT\_SYSINFO} auxv entry (the vDSO entrypoint).  QSOE skips
+\texttt{\_\_libc\_start\_main} entirely; instead, \texttt{\_qsoe\_start\_main}
+in \texttt{libqsoe/src/start\_main.c} assigns
+\texttt{\_\_sysinfo = (size\_t)qsoe\_syscall\_dispatch} before
+control reaches the user's \texttt{main}.
+
+\texttt{qsoe\_syscall\_dispatch} lives in
+\texttt{libqsoe/src/syscall\_dispatch.c} --- a single C function
+that switches on the Linux RISC-V syscall number and routes:
+
+\begin{tabular}{lll}
+\hline
+Linux \texttt{SYS\_*} & Number & libqsoe handler \\
+\hline
+\texttt{write}, \texttt{writev}   & 64, 66  & \texttt{qsoe\_write} \\
+\texttt{read},  \texttt{readv}    & 63, 65  & \texttt{qsoe\_read} \\
+\texttt{openat}                   & 56      & \texttt{qsoe\_open} \\
+\texttt{close}                    & 57      & \texttt{qsoe\_close} \\
+\texttt{brk}                      & 214     & \texttt{qsoe\_brk} \\
+\texttt{exit}, \texttt{exit\_group} & 93, 94 & \texttt{\_exit} \\
+\texttt{ioctl}                    & 29      & returns \texttt{-ENOTTY} \\
+\texttt{set\_tid\_address}        & 96      & returns \texttt{1} \\
+\hline
+\end{tabular}
+
+Anything else returns \texttt{-ENOSYS}.
+
+\subsection{Heap and \texttt{brk()} (v0.5.1)}
+
+Each spawned process gets a 2 MiB Mega\_Page mapped at
+\texttt{[0x800000, 0xA00000)} in its VSpace.  taskman retypes the
+megapage during \texttt{spawn.c} just before configuring the TCB.
+
+Inside the process, \texttt{libqsoe/src/syscall\_dispatch.c} tracks
+the current break pointer in a static variable initialised to
+\texttt{0x800000}.  \texttt{qsoe\_brk(NULL)} returns the current
+break (matches Linux's \texttt{brk(0)} convention); a non-NULL
+argument moves the break within the megapage and returns the new
+value, or returns the current break unchanged if the request lies
+outside \texttt{[0x800000, 0xA00000)}.
+
+musl's \texttt{lite\_malloc} (\texttt{src/malloc/lite\_malloc.c})
+uses brk as its bump allocator.  printf's working set is well under
+2 MiB, so the fixed-size megapage suffices for v0.5.1.  Growable
+heap via on-demand mmap is deferred.
+
+\subsection{Soft-float linker stubs (v0.5.1)}
+
+QSOE builds with \texttt{-mabi=lp64} (soft-float).  The
+cross-compiler's prebuilt \texttt{libgcc.a} is compiled for
+\texttt{-mabi=lp64d} (double-float) and rejects soft-float objects
+at link time, even when the actual instructions never use the FPU.
+
+musl's \texttt{vfprintf} statically references soft-float helpers
+(\texttt{\_\_addtf3}, \texttt{\_\_multf3}, \texttt{\_\_netf2}, etc.)
+for the \texttt{\%f} / \texttt{\%g} / \texttt{\%e} code paths, even
+when the format string contains no floating-point conversions.
+\texttt{libqsoe/src/float128\_stubs.c} provides empty aliases for
+those symbols so the linker is satisfied; if a caller ever does
+print a \texttt{\%f}, the stub spins.
+
+A real soft-float-compatible \texttt{compiler-rt} build is the
+proper fix, deferred until QSOE actually wants floating-point
+output.
+
+\subsection{Bypassed musl init paths}
+
+The full musl on Linux runs \texttt{\_\_libc\_start\_main} to do
+locale init, atexit registration, env parsing, vDSO discovery, etc.
+QSOE binaries enter through \texttt{\_qsoe\_start\_main} (in
+\texttt{libqsoe/src/start\_main.c}) which performs only the QSOE-
+relevant subset:
+
+\begin{enumerate}
+    \item \texttt{qsoe\_libqsoe\_init} --- planted IPC-buffer pointer
+          and self-pid into the main thread's TLS.
+    \item Set \texttt{\_\_sysinfo} so musl syscalls route through
+          QSOE.
+    \item Bind fds 0/1/2 to the inherited console connections (see
+          \S~3 ``File descriptors and stdio inheritance'').
+    \item Call the user's \texttt{main(argc, argv, envp)}.
+    \item \texttt{\_exit(rc)} --- bypasses musl's stdio cleanup
+          (\texttt{fflush\_on\_exit}), so v0.5.1 programs must
+          explicitly \texttt{fflush} before returning if they care.
+          Hello does this.
+\end{enumerate}
+
+\texttt{\_\_errno\_location} is overridden by a libqsoe stub
+returning a single static \texttt{int}, since the per-thread
+\texttt{errno} musl normally provides via TLS-on-pthread requires a
+full pthread bootstrap that v0.5.1 doesn't run.

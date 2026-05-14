@@ -5,6 +5,53 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.5.1] — 2026-05-14
+
+### Added
+- **musl libc linked into spawned binaries.** The vendored musl tree
+  at `core/userland/libc/` is compiled into `build/libc.a` (~1260
+  object files), then linked into tester and hello. The Makefile
+  generates the `bits/alltypes.h` and `bits/syscall.h` headers from
+  musl's own `.h.in` templates via the upstream `tools/mkalltypes.sed`
+  script (extracted via placement.txt).
+- **`__sysinfo` bridge** in `libqsoe/src/syscall_dispatch.c`. The
+  patched `syscall_arch.h` at `core/userland/libc/patches/arch/riscv64/`
+  routes every musl syscall through an indirect call on the global
+  `__sysinfo` function pointer; `_qsoe_start_main` assigns it to
+  `qsoe_syscall_dispatch` before user `main()` runs. Linux RISC-V
+  syscall numbers (write=64, writev=66, read=63, openat=56, close=57,
+  brk=214, exit=93, exit_group=94, plus a handful of no-op stubs)
+  route to libqsoe's POSIX wrappers.
+- **Heap region per process.** `spawn.c` reserves a 2 MiB
+  `seL4_RISCV_Mega_Page` mapped at `[0x800000, 0xA00000)` in the
+  child's VSpace. `qsoe_brk` tracks the current break pointer within
+  this region; musl's `lite_malloc` uses it as a bump allocator.
+- **Soft-float linker stubs** in `libqsoe/src/float128_stubs.c`.
+  Empty aliases for `__addtf3`, `__multf3`, `__netf2`, etc.; the
+  cross-compiler's libgcc.a is built for `lp64d` and won't link
+  against our `lp64` (soft-float) objects, but musl's `vfprintf`
+  references those symbols even on non-`%f` paths. The stubs satisfy
+  the linker without dragging in a real soft-float runtime.
+- **`__errno_location` override** — single static int rather than
+  musl's per-thread TLS lookup (which needs full pthread init we
+  don't run).
+- **printf demo in hello.** Replaced the raw `sel4_debug_puts` calls
+  with musl `printf` / `fprintf(stderr, ...)`. Output traverses the
+  full stack: musl stdio → `writev` syscall → `__sysinfo` →
+  `qsoe_syscall_dispatch` → `qsoe_writev` → `MsgSend(TM_REQ_IO_WRITE)`
+  → taskman's `/dev/console` handler → `sel4_debug_putchar`.
+
+### Known limitations
+- No `%f` / `%Lf` printf — would need a real soft-float libgcc
+  replacement or a switch to `lp64d` ABI.
+- musl's `__libc_start_main` is bypassed entirely; the program
+  doesn't get locale init, atexit handlers, stdio teardown on
+  return. Programs must `fflush(stdout)` explicitly before `main`
+  returns.
+- pthread bootstrap is not run; `pthread_*` won't work yet.
+- Heap is fixed at 2 MiB per process; growable heap via mmap is
+  deferred.
+
 ## [v0.5.0] — 2026-05-14
 
 ### Added

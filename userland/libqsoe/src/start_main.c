@@ -22,10 +22,25 @@
 
 extern int main(int argc, char **argv, char **envp);
 
+/* musl's "syscall" indirection target. The patched syscall_arch.h
+ * routes every musl libc syscall through this global function pointer
+ * instead of an ecall. We assign it below before main() runs so by
+ * the time printf / write / open are called, the dispatcher is wired
+ * up. Defined as `size_t __sysinfo;` in musl's defsysinfo.c, pulled
+ * into the link via the chain of musl uses. */
+extern unsigned long __sysinfo;
+extern long qsoe_syscall_dispatch(long n, long a, long b, long c,
+                                  long d, long e, long f);
+
 void _qsoe_start_main(pid_t pid, int argc, char **argv, char **envp);
 void _qsoe_start_main(pid_t pid, int argc, char **argv, char **envp)
 {
     qsoe_libqsoe_init((void *)0x1FE000UL, pid);
+
+    /* v0.5.1: wire musl's "syscall" function pointer to libqsoe's
+     * dispatcher BEFORE the user's main runs. After this, every
+     * musl libc call (printf, fopen, ...) routes through QSOE. */
+    __sysinfo = (unsigned long)qsoe_syscall_dispatch;
 
     /* v0.5.0: pre-bind stdio fds (0/1/2) to the console connections
      * taskman minted into our CSpace at spawn time. After this,

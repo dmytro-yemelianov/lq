@@ -52,6 +52,14 @@ LIBQSOE_DIR := $(TOP)/userland/libqsoe
 TESTER_DIR  := $(TOP)/userland/tester
 TESTBUILD   := $(BUILD)/tester
 
+# v0.5.1: musl libc. Vendored at core/userland/libc/; built into a
+# static archive that gets linked into spawnable QSOE binaries.
+MUSL_DIR     := $(CORE)/userland/libc
+MUSL_PATCHES := $(MUSL_DIR)/patches
+MUSL_GEN     := $(BUILD)/libc-gen
+LIBC_BUILD   := $(BUILD)/libc-obj
+LIBC_A       := $(BUILD)/libc.a
+
 SEL4TEST    := $(TOP)/sel4test-full
 SEL4BUILD   := $(SEL4TEST)/build-qsoe-riscv64
 KERNEL_SRC  := $(SEL4BUILD)/kernel/kernel.elf
@@ -254,6 +262,108 @@ $(GEN)/qsoe/sys_version.h: $(wildcard .git/HEAD .git/index)
 	 printf '#define QSOE_BUILD_DATE "%s"\n\n' "$$(date +%Y-%m-%d)" >> $@; \
 	 printf '#endif\n' >> $@
 
+# ----------------------------------------------------------------------------
+# musl libc (v0.5.1+): build $(LIBC_A) from the vendored upstream tree at
+# core/userland/libc/. The patched syscall_arch.h at patches/arch/riscv64/
+# routes every musl syscall through the __sysinfo function pointer, which
+# _qsoe_start_main initialises to qsoe_syscall_dispatch.
+# ----------------------------------------------------------------------------
+
+# Match upstream musl CFLAGS as closely as possible; add our RISC-V flags
+# and -nostdinc so we never accidentally pick up host /usr/include headers.
+MUSL_CFLAGS := $(ARCH_CFLAGS) \
+    -std=c99 -ffreestanding -nostdinc \
+    -fno-pic -fno-pie -fno-common \
+    -fno-stack-protector -fno-builtin \
+    -fexcess-precision=standard -frounding-math \
+    -D_XOPEN_SOURCE=700 \
+    -Wa,--noexecstack \
+    -Os
+
+# Include order: patched headers (so syscall_arch.h indirect-call variant
+# wins over the stock ecall one), then arch-specific, generic, generated
+# (bits/alltypes.h, bits/syscall.h, version.h), and finally the public
+# include tree.
+MUSL_INCLUDES := \
+    -I$(MUSL_PATCHES)/arch/riscv64 \
+    -I$(MUSL_DIR)/arch/riscv64 \
+    -I$(MUSL_DIR)/arch/generic \
+    -I$(MUSL_GEN)/src/internal \
+    -I$(MUSL_DIR)/src/include \
+    -I$(MUSL_DIR)/src/internal \
+    -I$(MUSL_GEN)/include \
+    -I$(MUSL_DIR)/include
+
+# Generated headers. The two sed transforms below replicate what upstream
+# musl does in its own Makefile.
+$(MUSL_GEN)/include/bits/alltypes.h: $(MUSL_DIR)/tools/mkalltypes.sed \
+                                      $(MUSL_DIR)/arch/riscv64/bits/alltypes.h.in \
+                                      $(MUSL_DIR)/include/alltypes.h.in
+	@mkdir -p $(@D)
+	sed -f $(MUSL_DIR)/tools/mkalltypes.sed \
+	    $(MUSL_DIR)/arch/riscv64/bits/alltypes.h.in \
+	    $(MUSL_DIR)/include/alltypes.h.in > $@
+
+$(MUSL_GEN)/include/bits/syscall.h: $(MUSL_DIR)/arch/riscv64/bits/syscall.h.in
+	@mkdir -p $(@D)
+	cp $< $@
+	sed -n -e s/__NR_/SYS_/p < $< >> $@
+
+# Static stand-in for upstream's git-derived version string.
+$(MUSL_GEN)/src/internal/version.h:
+	@mkdir -p $(@D)
+	@printf '#define VERSION "qsoe-vendored"\n' > $@
+
+MUSL_GEN_HDRS := $(MUSL_GEN)/include/bits/alltypes.h \
+                 $(MUSL_GEN)/include/bits/syscall.h \
+                 $(MUSL_GEN)/src/internal/version.h
+
+# Enumerate musl sources. We pull every .c in src/ except subtrees that
+# would drag in features QSOE doesn't have yet (dynlinker, SysV IPC,
+# Linux-specific syscalls, async I/O, mqueue). The linker prunes any
+# unused archive members from the final binary so over-building is fine.
+# Per-arch subdirs other than riscv64 are also excluded — they contain
+# hand-rolled assembly for other ISAs that won't even parse.
+MUSL_SRCS_ALL := $(shell find $(MUSL_DIR)/src -name '*.c' \
+    -not -path '*/ldso/*' \
+    -not -path '*/ipc/*' \
+    -not -path '*/linux/*' \
+    -not -path '*/mq/*' \
+    -not -path '*/aio/*' \
+    -not -path '*/aarch64/*' \
+    -not -path '*/arm/*' \
+    -not -path '*/i386/*' \
+    -not -path '*/x86_64/*' \
+    -not -path '*/x32/*' \
+    -not -path '*/m68k/*' \
+    -not -path '*/microblaze/*' \
+    -not -path '*/mips/*' \
+    -not -path '*/mips64/*' \
+    -not -path '*/mipsn32/*' \
+    -not -path '*/or1k/*' \
+    -not -path '*/powerpc/*' \
+    -not -path '*/powerpc64/*' \
+    -not -path '*/riscv32/*' \
+    -not -path '*/s390x/*' \
+    -not -path '*/sh/*' \
+    -not -path '*/loongarch64/*')
+
+MUSL_OBJS := $(patsubst $(MUSL_DIR)/%.c,$(LIBC_BUILD)/%.o,$(MUSL_SRCS_ALL))
+
+# Per-file compile rule. Header deps are coarse — every .c depends on
+# the three generated headers — but that keeps the build correct.
+$(LIBC_BUILD)/%.o: $(MUSL_DIR)/%.c $(MUSL_GEN_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(MUSL_CFLAGS) $(MUSL_INCLUDES) -c -o $@ $<
+
+AR := $(CROSS)ar
+$(LIBC_A): $(MUSL_OBJS)
+	@echo "  AR  $@ ($(words $(MUSL_OBJS)) objects)"
+	@$(AR) rcs $@ $(MUSL_OBJS)
+
+.PHONY: libc
+libc: $(LIBC_A)
+
 # libqsoe is compiled into taskman with -DQSOE_LIBQSOE_IN_TASKMAN so its
 # entrypoints call tm_* handlers directly instead of doing self-IPC.
 LIBQSOE_CFLAGS := $(TM_CFLAGS) -DQSOE_LIBQSOE_IN_TASKMAN -I$(TASKMAN_DIR)
@@ -394,6 +504,14 @@ $(TESTBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(TESTBUILD)/libqsoe/syscall_dispatch.o: $(LIBQSOE_DIR)/src/syscall_dispatch.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(TESTBUILD)/libqsoe/float128_stubs.o: $(LIBQSOE_DIR)/src/float128_stubs.c
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 TESTER_OBJS := \
     $(TESTBUILD)/start.o \
     $(TESTBUILD)/main.o \
@@ -404,14 +522,16 @@ TESTER_OBJS := \
     $(TESTBUILD)/libqsoe/thread.o \
     $(TESTBUILD)/libqsoe/process.o \
     $(TESTBUILD)/libqsoe/start_main.o \
-    $(TESTBUILD)/libqsoe/io.o
+    $(TESTBUILD)/libqsoe/io.o \
+    $(TESTBUILD)/libqsoe/syscall_dispatch.o \
+    $(TESTBUILD)/libqsoe/float128_stubs.o
 
-$(TESTER_ELF): $(TESTER_OBJS)
+$(TESTER_ELF): $(TESTER_OBJS) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $^
+	    -o $@ $(TESTER_OBJS) $(LIBC_A)
 
 # ----------------------------------------------------------------------------
 # hello — first non-taskman/non-tester userland program. Spawned by
@@ -426,9 +546,14 @@ $(HELLOBUILD)/start.o: $(HELLO_DIR)/start.S
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-$(HELLOBUILD)/main.o: $(HELLO_DIR)/main.c $(TM_HEADERS)
+$(HELLOBUILD)/main.o: $(HELLO_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS)
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+	$(CC) $(TM_CFLAGS) \
+	    -isystem $(MUSL_GEN)/include \
+	    -isystem $(MUSL_DIR)/include \
+	    -isystem $(MUSL_DIR)/arch/riscv64 \
+	    -isystem $(MUSL_DIR)/arch/generic \
+	    -c -o $@ $<
 
 $(HELLOBUILD)/libqsoe/state.o: $(LIBQSOE_DIR)/src/state.c $(TM_HEADERS)
 	@mkdir -p $(@D)
@@ -462,6 +587,14 @@ $(HELLOBUILD)/libqsoe/io.o: $(LIBQSOE_DIR)/src/io.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
 
+$(HELLOBUILD)/libqsoe/syscall_dispatch.o: $(LIBQSOE_DIR)/src/syscall_dispatch.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+$(HELLOBUILD)/libqsoe/float128_stubs.o: $(LIBQSOE_DIR)/src/float128_stubs.c
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
 HELLO_OBJS := \
     $(HELLOBUILD)/start.o \
     $(HELLOBUILD)/main.o \
@@ -472,14 +605,16 @@ HELLO_OBJS := \
     $(HELLOBUILD)/libqsoe/channel.o \
     $(HELLOBUILD)/libqsoe/connect.o \
     $(HELLOBUILD)/libqsoe/start_main.o \
-    $(HELLOBUILD)/libqsoe/io.o
+    $(HELLOBUILD)/libqsoe/io.o \
+    $(HELLOBUILD)/libqsoe/syscall_dispatch.o \
+    $(HELLOBUILD)/libqsoe/float128_stubs.o
 
-$(HELLO_ELF): $(HELLO_OBJS)
+$(HELLO_ELF): $(HELLO_OBJS) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $^
+	    -o $@ $(HELLO_OBJS) $(LIBC_A)
 
 # ----------------------------------------------------------------------------
 # Userland CPIO — packs all spawnable binaries (tester + hello) and gets

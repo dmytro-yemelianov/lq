@@ -60,17 +60,17 @@ struct elf64_phdr {
  * (everything in the same Sv39 2 MiB region). */
 #define TM_SCRATCH_VADDR 0x100000UL
 
-/* Child VSpace layout. Everything fits in one Sv39 2 MiB region so a
- * single L1 PT + single L0 PT covers it. The stack lives in two pages
- * directly below the IPC buffer; sp starts at CHILD_STACK_TOP and grows
- * down through the two pages [CHILD_STACK_BASE, CHILD_STACK_TOP). The
- * top page also holds the SysV ABI initial-stack image (argc/argv/
- * envp/auxv/strings) that the crt0 in start.S reads at entry. */
+/* Child VSpace layout. Image, stack, and IPC buffer share the first
+ * 2 MiB region [0, 0x200000) and use one L1 + one L0 PT. The heap
+ * (v0.5.1+) gets its own 2 MiB Mega_Page at the next L1 slot, mapped
+ * at 0x800000. Worker thread regions sit way out at 0x40000000+. */
 #define CHILD_IMAGE_BASE   0x10000UL   /* matches tester's linker script */
 #define CHILD_STACK_BASE   0x1FC000UL  /* 2 stack pages: [0x1FC000, 0x1FE000) */
 #define CHILD_STACK_TOP    0x1FE000UL  /* sp starts here, grows down */
 #define CHILD_STACK_PAGES  2
 #define CHILD_IPC_BUFFER   0x1FE000UL  /* one page, just above the stack */
+#define CHILD_HEAP_BASE    0x800000UL  /* one 2-MiB Mega_Page maps here */
+#define CHILD_HEAP_BYTES   0x200000UL  /* 2 MiB — enough for musl printf */
 
 /* Image can grow up to one Sv39 L0 PT's coverage — 2 MiB. Beyond that
  * we'd need ensure_l0_pt() to lazily allocate per-2-MiB-region PTs as
@@ -422,6 +422,29 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                           s_cnode_root, child_untyped, 64,
                           QSOE_RIGHTS_ALL);
     if (err) { sel4_debug_puts("spawn: copy OWN_UNTYPED failed\n"); return -ENOMEM; }
+
+    /* 4c. v0.5.1: heap region. Allocate one 2 MiB Mega_Page and map
+     *     it at CHILD_HEAP_BASE. musl's lite_malloc uses brk to grow
+     *     a heap inside this region; our qsoe_brk in syscall_dispatch
+     *     gates the break pointer to stay within bounds. The page
+     *     gets zeroed via scratch_map BEFORE mapping into the child
+     *     (frames can only be mapped in one VSpace at a time, same
+     *     constraint as the stack). */
+    seL4_CPtr heap_frame = alloc_object(seL4_RISCV_Mega_Page, 0);
+    if (!heap_frame) {
+        sel4_debug_puts("spawn: heap frame alloc failed\n");
+        return -ENOMEM;
+    }
+    /* Don't bother zeroing the heap page via scratch_map — Mega_Pages
+     * are 2 MiB and our scratch slot is one 4 KiB page; would require
+     * 512 map/unmap cycles. seL4 retypes objects zero-initialised, so
+     * the fresh Mega_Page is already zero. */
+    err = qsoe_riscv_page_map(heap_frame, vspace, CHILD_HEAP_BASE,
+                              QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
+    if (err) {
+        sel4_debug_puts("spawn: heap Page_Map failed\n");
+        return -ENOMEM;
+    }
 
     /* 5c. v0.5.0: stdio inheritance. Mint three badged Send-caps on
      *     (taskman, TM_CONSOLE_CHID) — which shares primary_ep — into

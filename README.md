@@ -72,7 +72,7 @@ incremental builds are seconds.
 ## Current status
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
-of **v0.5.0**:
+of **v0.5.1**:
 
 - QNX-style synchronous IPC: `ChannelCreate`/`Destroy`,
   `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`
@@ -89,6 +89,10 @@ of **v0.5.0**:
 - **`/dev/console`** as the first registered resource manager
 - POSIX-style `open`/`close`/`read`/`write` via libqsoe; spawned
   processes inherit fds 0/1/2 bound to `/dev/console`
+- **musl libc** linked into spawned binaries; `__sysinfo` indirection
+  routes musl's "syscalls" into libqsoe; `printf` works end-to-end
+- Per-process heap (2 MiB Mega_Page) backing musl's `lite_malloc`
+  via `brk()`
 
 ## Documentation
 

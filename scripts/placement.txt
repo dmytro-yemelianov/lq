@@ -288,6 +288,9 @@ projects/musllibc/crt/crtn.c                        userland/libc/crt/crtn.c
 projects/musllibc/crt/rcrt1.c                       userland/libc/crt/rcrt1.c
 projects/musllibc/crt/Scrt1.c                       userland/libc/crt/Scrt1.c
 
+# === musllibc: Generator scripts (sed transforms for bits/alltypes.h) ===
+projects/musllibc/tools/mkalltypes.sed              userland/libc/tools/mkalltypes.sed
+
 # === musllibc: Dynamic linker ===
 projects/musllibc/ldso/                             userland/libc/ldso/
 
