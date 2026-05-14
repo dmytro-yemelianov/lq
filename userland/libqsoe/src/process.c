@@ -189,6 +189,7 @@ int waitpid(pid_t pid, int *status, int options)
     (void)options;  /* WNOHANG and friends are v0.7+ */
 #ifdef QSOE_LIBQSOE_IN_TASKMAN
     /* taskman itself doesn't waitpid anything. */
+    (void)pid; (void)status;
     qsoe_errno = ENOSYS;
     return -1;
 #else

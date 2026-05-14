@@ -829,6 +829,7 @@ $(IMAGE): $(EL_OBJS) $(ELFBUILD)/archive.o $(ELFBUILD)/linker.lds_pp
 	$(CC) $(EL_CFLAGS) -static -nostdlib \
 	    -Wl,-T,$(ELFBUILD)/linker.lds_pp \
 	    -Wl,--build-id=none \
+	    -Wl,--no-warn-rwx-segments \
 	    -o $@ $(EL_OBJS) $(ELFBUILD)/archive.o
 
 # ----------------------------------------------------------------------------

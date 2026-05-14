@@ -26,7 +26,10 @@ static void qsoe_softfloat_unimpl(void)
     while (1) ;
 }
 
+/* The alias must inherit qsoe_softfloat_unimpl's noreturn attribute
+ * explicitly — gcc warns under -Wmissing-attributes otherwise. */
 #define STUB(name) \
+    __attribute__((noreturn)) \
     void name(void) __attribute__((weak, alias("qsoe_softfloat_unimpl")))
 
 STUB(__addtf3);
