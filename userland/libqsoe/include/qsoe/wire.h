@@ -42,6 +42,24 @@ enum {
     TM_REQ_CLOSE                = 0x21,
     TM_REQ_IO_WRITE             = 0x22,
     TM_REQ_IO_READ              = 0x23,
+    /* v0.6.1: parent <-> child sync, QNX/QRV-style.
+     * PROC_DETACH: child signals "I am ready as a daemon"; taskman
+     *              delivers the status to any parent parked in
+     *              waitpid() and reparents the child to pid 1.
+     * WAITPID:     parent blocks until the named child detaches or
+     *              exits; reply MR0 = status, label = 0 on success.
+     */
+    TM_REQ_PROC_DETACH          = 0x26,
+    TM_REQ_WAITPID              = 0x27,
+    /* v0.6.1: runtime path manager mutation.
+     * REGISTER: a resmgr announces itself at a path (path_len in MR0,
+     *           chid in MR1; the resmgr's pid is taken from the
+     *           caller badge).
+     * REPATH:   change an existing path entry to point at a different
+     *           (pid, chid). Used by init to swap /dev/console from
+     *           the in-taskman handler to a real UART driver. */
+    TM_REQ_PATHMGR_REGISTER     = 0x28,
+    TM_REQ_PATHMGR_REPATH       = 0x29,
 };
 
 /* Reply label conventions: 0 on success, positive QNX errno on failure.

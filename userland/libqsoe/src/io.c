@@ -158,3 +158,48 @@ long qsoe_writev(int fd, const struct qsoe_iovec *iov, int iovcnt)
     }
     return (long)total;
 }
+
+/* v0.6.1 pathmgr mutation wire wrappers. Resmgrs use these to
+ * announce themselves at boot; init uses repath to redirect existing
+ * mounts (e.g. /dev/console -> a real UART driver). */
+int qsoe_pathmgr_register(const char *path, int chid)
+{
+    if (!path) { qsoe_errno = EINVAL; return -1; }
+    unsigned plen = io_strlen(path);
+    if (plen == 0 || plen >= 128) { qsoe_errno = EINVAL; return -1; }
+
+    unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+    for (unsigned i = 0; i < plen; ++i) dst[i] = (unsigned char)path[i];
+
+    seL4_Word mr0 = plen, mr1 = (seL4_Word)chid, mr2 = 0, mr3 = 0;
+    unsigned nwords = 4 + (plen + 7) / 8;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_PATHMGR_REGISTER,
+                                                   0, 0, nwords);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    return 0;
+}
+
+int qsoe_pathmgr_repath(const char *path, pid_t new_pid,
+                        int new_chid, unsigned handler_kind)
+{
+    if (!path) { qsoe_errno = EINVAL; return -1; }
+    unsigned plen = io_strlen(path);
+    if (plen == 0 || plen >= 128) { qsoe_errno = EINVAL; return -1; }
+
+    unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+    for (unsigned i = 0; i < plen; ++i) dst[i] = (unsigned char)path[i];
+
+    seL4_Word mr0 = plen, mr1 = (seL4_Word)new_pid,
+              mr2 = (seL4_Word)new_chid, mr3 = (seL4_Word)handler_kind;
+    unsigned nwords = 4 + (plen + 7) / 8;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_PATHMGR_REPATH,
+                                                   0, 0, nwords);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    return 0;
+}

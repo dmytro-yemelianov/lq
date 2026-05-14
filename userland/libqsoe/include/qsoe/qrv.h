@@ -63,6 +63,8 @@ typedef unsigned int  gid_t;
 #define EROFS         30
 #define EISDIR        21
 #define EFBIG         27
+#define ECHILD        10
+#define ENODEV        19
 #define ENOSYS        89
 #define EHOSTUNREACH 113
 
@@ -288,6 +290,37 @@ long  qsoe_read  (int fd, void *buf, unsigned long count);
 int  ProcessTerminate(pid_t pid, int status);
 void _exit(int status) __attribute__((noreturn));
 void exit (int status) __attribute__((noreturn));
+
+/* v0.6.1 procmgr_detach / waitpid (QNX/QRV-style "stay resident").
+ *
+ *   procmgr_detach(status) — call from a daemon's main() once it's
+ *     ready to serve. taskman delivers `status` to the parent's
+ *     parked waitpid() and reparents this process to pid 1 (taskman),
+ *     after which this thread keeps running.
+ *
+ *   waitpid(child_pid, *status, 0) — block until `child_pid` calls
+ *     procmgr_detach() or exits. *status receives the value the
+ *     child supplied. Returns child_pid on success, -1 on error.
+ *     (v0.6.1 ignores the options arg; WNOHANG is v0.7+.)
+ */
+int  procmgr_detach(int status);
+int  waitpid(pid_t pid, int *status, int options);
+
+/* v0.6.1: path-manager mutation primitives.
+ *
+ * qsoe_pathmgr_register(path, chid) — a resmgr announces that any
+ *   open(path) should ConnectAttach to (self_pid, chid). The
+ *   announcing process IS the resmgr; taskman picks up its pid
+ *   from the badge.
+ *
+ * qsoe_pathmgr_repath(path, new_pid, new_chid, handler_kind) —
+ *   rewrite an already-registered entry to point somewhere else.
+ *   Used by init to swap /dev/console after the real UART driver
+ *   comes up. handler_kind=0 for external (the normal case);
+ *   1/2 for the in-taskman special cases. */
+int qsoe_pathmgr_register(const char *path, int chid);
+int qsoe_pathmgr_repath  (const char *path, pid_t new_pid,
+                          int new_chid, unsigned handler_kind);
 
 /*
  * libqsoe init hook. Each spawned process calls this exactly once at

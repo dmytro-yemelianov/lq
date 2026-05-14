@@ -161,3 +161,44 @@ void exit(int status)
     /* No atexit/stdio teardown yet in v0.4.1 — go straight to _exit. */
     _exit(status);
 }
+
+/* v0.6.1: procmgr_detach — daemon's "I am ready" signal. taskman
+ * delivers `status` to the parent's parked waitpid() and reparents
+ * us to pid 1. Returns 0 on success, -1 on error. */
+int procmgr_detach(int status)
+{
+#ifdef QSOE_LIBQSOE_IN_TASKMAN
+    /* No-op for taskman itself — it has no parent in the QSOE model. */
+    (void)status;
+    return 0;
+#else
+    seL4_Word mr0 = (seL4_Word)status, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_PROC_DETACH,
+                                                   0, 0, 1);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    return 0;
+#endif
+}
+
+/* v0.6.1: waitpid — block until `pid` detaches or exits, fill *status. */
+int waitpid(pid_t pid, int *status, int options)
+{
+    (void)options;  /* WNOHANG and friends are v0.7+ */
+#ifdef QSOE_LIBQSOE_IN_TASKMAN
+    /* taskman itself doesn't waitpid anything. */
+    qsoe_errno = ENOSYS;
+    return -1;
+#else
+    seL4_Word mr0 = (seL4_Word)pid, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_WAITPID, 0, 0, 1);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    if (status) *status = (int)mr0;
+    return (int)pid;
+#endif
+}

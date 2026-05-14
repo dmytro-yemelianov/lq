@@ -233,10 +233,31 @@ static unsigned long build_initial_stack(seL4_CPtr top_frame,
     return sp_in_child;
 }
 
+/* v0.6.1: UART device-untyped slot in taskman's CSpace, set by
+ * main.c at boot after scanning BootInfo. spawn.c uses it to grant
+ * UART MMIO + IRQHandler + Notification caps to devc-ser8250. */
+static seL4_CPtr s_uart_dev_ut;
+
+void tm_set_uart_untyped(seL4_CPtr ut_slot)
+{
+    s_uart_dev_ut = ut_slot;
+}
+
+/* Match an elf_name against a constant string. */
+static int spawn_name_eq(const char *a, const char *b)
+{
+    if (!a || !b) return 0;
+    for (unsigned i = 0;; ++i) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == 0) return 1;
+    }
+}
+
 int tm_spawn(const void *elf_blob, unsigned long elf_len,
              pid_t pid, seL4_CPtr primary_ep,
              int argc, const char *const *argv,
-             int envc, const char *const *envp)
+             int envc, const char *const *envp,
+             const char *elf_name)
 {
     (void)elf_len;
     const struct elf64_hdr *eh = elf_blob;
@@ -446,16 +467,28 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         return -ENOMEM;
     }
 
-    /* 5c. v0.5.0: stdio inheritance. Mint three badged Send-caps on
-     *     (taskman, TM_CONSOLE_CHID) — which shares primary_ep — into
-     *     the child's CSpace at slots QSOE_CAP_STDIN/OUT/ERR_CONNECT.
-     *     Each gets its own scoid badge so taskman's dispatch can
-     *     distinguish them (and ConnectClientInfo can answer). The
-     *     console channel must already be registered in taskman's
-     *     channel table; main.c does this at boot. */
-    int console_idx = tm_channel_index(QSOE_PID_TASKMAN, TM_CONSOLE_CHID);
+    /* 5c. v0.5.0/v0.6.1: stdio inheritance. Resolve the CURRENT
+     *     /dev/console binding via the path manager — early in boot
+     *     this is (taskman, TM_CONSOLE_CHID, in-taskman handler);
+     *     after init runs pathmgr_repath it points at the real UART
+     *     driver's channel. Mint three badged Send-caps on whatever
+     *     channel master is currently registered, then record each
+     *     connection in taskman's table. */
+    tm_pathmgr_obj_t console_obj;
+    unsigned cons_consumed = 0;
+    if (tm_pathmgr_resolve("/dev/console", &console_obj, &cons_consumed) != 0) {
+        sel4_debug_puts("spawn: /dev/console not in pathmgr\n");
+        return -EINVAL;
+    }
+    int console_idx = tm_channel_index(console_obj.server_pid,
+                                        console_obj.server_chid);
     if (console_idx < 0) {
-        sel4_debug_puts("spawn: console channel not registered\n");
+        sel4_debug_puts("spawn: /dev/console channel not registered\n");
+        return -EINVAL;
+    }
+    seL4_CPtr console_master = tm_channel_master(console_idx);
+    if (!console_master) {
+        sel4_debug_puts("spawn: /dev/console master cap missing\n");
         return -EINVAL;
     }
     static const seL4_CPtr stdio_slots[3] = {
@@ -466,7 +499,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     for (int i = 0; i < 3; ++i) {
         seL4_Word scoid = tm_alloc_scoid();
         err = qsoe_cnode_mint(cnode, stdio_slots[i], 12,
-                              s_cnode_root, primary_ep, 64,
+                              s_cnode_root, console_master, 64,
                               QSOE_RIGHTS_SEND, scoid);
         if (err) {
             sel4_debug_puts("spawn: mint stdio cap failed\n");
@@ -475,6 +508,84 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         if (tm_connection_register_existing(pid, stdio_slots[i],
                                              console_idx, scoid, 0) != 0) {
             sel4_debug_puts("spawn: register stdio connection failed\n");
+            return -ENOMEM;
+        }
+    }
+
+    /* 5d. v0.6.1: driver-cap inheritance. If this child is the
+     *     16550 UART driver, grant it (a) an IRQHandler for PLIC
+     *     line 10 minted into child slot QSOE_CAP_IRQ_HANDLER,
+     *     (b) a 4 KiB device-untyped covering 0x10000000 copied
+     *     into QSOE_CAP_UART_FRAME, (c) a fresh Notification minted
+     *     into QSOE_CAP_IRQ_NTFN that the IRQHandler will signal
+     *     on each rising edge. Manifest-driven cap granting is
+     *     v0.7+; for v0.6.1 the special case is gated by ELF name. */
+    if (spawn_name_eq(elf_name, "devc-ser8250.elf")) {
+        const seL4_Word PLIC_UART_IRQ = 10;
+        const seL4_Word TRIGGER_LEVEL = 0;
+        const unsigned long UART_VADDR  = 0xA00000UL;  /* L1 slot 5 */
+        if (!s_uart_dev_ut) {
+            sel4_debug_puts("spawn: no UART device untyped registered\n");
+            return -ENODEV;
+        }
+        /* (1) Allocate an L0 PT for the 2 MiB region containing
+         *     the UART vaddr, then attach it under the child's L1. */
+        seL4_CPtr uart_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
+        if (!uart_l0) return -ENOMEM;
+        err = qsoe_riscv_pagetable_map(uart_l0, vspace, UART_VADDR,
+                                        QSOE_VM_ATTR_DEFAULT);
+        if (err) {
+            sel4_debug_puts("spawn: UART L0 PageTable_Map failed\n");
+            return -ENOMEM;
+        }
+        /* (2) Retype the UART device-untyped into a 4 KiB frame in
+         *     taskman's CSpace. We need the cap here to invoke
+         *     Page_Map (the frame must be in our CSpace to be the
+         *     invocation target, with the *child's* vspace as the
+         *     map target). After mapping we'll mint a copy into the
+         *     child's CSpace. */
+        seL4_CPtr uart_dev_frame = s_next_slot++;
+        err = qsoe_untyped_retype(s_uart_dev_ut, seL4_RISCV_4K_Page, 0,
+                                    s_cnode_root, 0, 0,
+                                    uart_dev_frame, 1);
+        if (err) {
+            sel4_debug_puts("spawn: UART device retype failed\n");
+            return -ENOMEM;
+        }
+        /* (3) Map the device frame at UART_VADDR in the child. */
+        err = qsoe_riscv_page_map(uart_dev_frame, vspace, UART_VADDR,
+                                   QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
+        if (err) {
+            sel4_debug_puts("spawn: UART Page_Map failed\n");
+            return -ENOMEM;
+        }
+        /* (4) Mint a copy of the frame cap into the child's CSpace
+         *     (handy for future revoke / re-map). */
+        err = qsoe_cnode_copy(cnode, QSOE_CAP_UART_FRAME, 12,
+                               s_cnode_root, uart_dev_frame, 64,
+                               QSOE_RIGHTS_ALL);
+        if (err) {
+            sel4_debug_puts("spawn: UART frame copy failed\n");
+            return -ENOMEM;
+        }
+        /* (5) IRQHandler — mint into child slot QSOE_CAP_IRQ_HANDLER. */
+        err = qsoe_irq_control_get(seL4_CapIRQControl,
+                                    PLIC_UART_IRQ, TRIGGER_LEVEL,
+                                    cnode, QSOE_CAP_IRQ_HANDLER, 12);
+        if (err) {
+            sel4_debug_puts("spawn: IRQControl_GetTrigger failed\n");
+            return -ENOMEM;
+        }
+        /* (6) IRQ Notification — retype from RAM untyped directly
+         *     into child's slot QSOE_CAP_IRQ_NTFN. node_depth=0 means
+         *     "use cnode as the dest CNode itself"; node_offset is the
+         *     slot inside. */
+        err = qsoe_untyped_retype(s_untyped, seL4_NotificationObject,
+                                    seL4_NotificationBits,
+                                    cnode, 0, 0,
+                                    QSOE_CAP_IRQ_NTFN, 1);
+        if (err) {
+            sel4_debug_puts("spawn: IRQ Notification retype failed\n");
             return -ENOMEM;
         }
     }

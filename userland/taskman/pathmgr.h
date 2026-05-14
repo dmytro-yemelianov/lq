@@ -58,4 +58,11 @@ int tm_pathmgr_resolve(const char *path,
                        tm_pathmgr_obj_t *out,
                        unsigned *out_consumed_bytes);
 
+/* v0.6.1: update an existing path's attached object to point at a
+ * different server. Used to swap /dev/console between handlers
+ * after a real driver comes up. Returns 0 on success, -ENOENT if
+ * the path doesn't exist, -EINVAL on bad input. The path must
+ * already be registered; this isn't a create-or-update. */
+int tm_pathmgr_repath(const char *path, const tm_pathmgr_obj_t *new_obj);
+
 #endif /* QSOE_TASKMAN_PATHMGR_H */

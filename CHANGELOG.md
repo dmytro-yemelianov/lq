@@ -5,6 +5,76 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.6.1] — 2026-05-14
+
+### Added
+- **`/sbin/init` takes over boot.** taskman now spawns init as the
+  first userland process; init is responsible for spawning everything
+  else (drivers, getty, etc.). Standard Unix-style boot chain.
+- **`procmgr_detach(status)` + `waitpid(pid, *status, 0)`** —
+  QNX/QRV-style "daemon stays resident" synchronisation. Child calls
+  `procmgr_detach` when ready to serve; the parent's `waitpid`
+  unblocks with the status; the child is reparented to pid 1 and
+  keeps running. waitpid blocking uses `seL4_CNode_SaveCaller` to
+  park the parent's reply cap. `_exit` also delivers status to any
+  parked waiter (so non-daemon children work too).
+- **`tm_process_t.parent_pid` + exit-state machine.** Tracks parent
+  pid (set at spawn time from the calling pid), exit_state
+  (alive / detached / exited), exit_status, and a per-child
+  `waiter_reply_slot` for the parked SaveCaller cap.
+- **IRQ invocation wrappers** in `qsoe_invoke.h`:
+  `qsoe_irq_control_get` (RISC-V-specific Get-with-trigger variant),
+  `qsoe_irq_handler_set_notification`, `qsoe_irq_handler_ack`.
+- **Device-untyped scan** at boot — `find_device_untyped_for_paddr`
+  walks `bi->untypedList[]` for the untyped covering a given paddr.
+  taskman resolves the 16550 UART at `0x10000000` and stores its
+  cap slot for later granting.
+- **Driver-special-case in spawn.c.** When the ELF name is
+  `devc-ser8250.elf`, also grant: IRQHandler for PLIC line 10
+  (`QSOE_CAP_IRQ_HANDLER`), 4 KiB UART device frame mapped at
+  `0xA00000` in the child's VSpace (`QSOE_CAP_UART_FRAME`), and a
+  fresh Notification for IRQ-thread wakeups (`QSOE_CAP_IRQ_NTFN`).
+- **`TM_REQ_PATHMGR_REGISTER` + `TM_REQ_PATHMGR_REPATH`** — runtime
+  path-namespace mutation. Resmgrs announce themselves via
+  REGISTER; init uses REPATH to swap `/dev/console` to the real
+  UART driver once it's ready.
+- **devc-ser8250** — QSOE's first userland-process resource manager.
+  Split-thread architecture: main thread dispatches client I/O on
+  its channel; dedicated IRQ thread (pinned to hart 1) blocks on
+  the bound Notification and drains the UART RX FIFO into a shared
+  ring buffer protected by a spinlock. Polled TX (the 16-byte UART
+  FIFO absorbs writes). After init it calls `procmgr_detach(0)` to
+  unblock its parent.
+- **Stdio inheritance respects the current `/dev/console` binding.**
+  `spawn.c` resolves the path manager at spawn time, so children
+  spawned after `init`'s repath get stdio bound directly to
+  devc-ser8250's channel — their `printf` bytes flow through the
+  real driver's `uart_tx_byte`.
+
+### Demo (boot transcript)
+```
+[init] alive, pid=2
+[init] spawned devc-ser8250, pid=3
+[devc-ser8250] 16550 initialised @ vaddr 0xA00000
+[devc-ser8250] IRQ thread spawned, tid=2
+[devc-ser8250] /dev/ser1 registered (chid=1)
+[init] devc-ser8250 ready (detached with status 0)
+[init] /dev/console now -> (3, 1) [devc-ser8250]
+[init] spawned tester, pid=4
+[tester] alive ... <full v0.6.0 test suite>  ← all via devc-ser8250
+[init] tester exited, status=0
+```
+
+### Known limitations
+- Cooked-mode line discipline (ICANON, echo, BS/erase) deferred.
+  Raw 8N1 only — `read` returns whatever's in the ring buffer or 0.
+- TX is polled. TX-via-interrupt for higher throughput is v0.7+.
+- Driver cap granting is hardcoded (string-match on ELF name). A
+  proper manifest-driven scheme is v0.7+.
+- Kernel debug-putchar continues writing to the same UART via
+  OpenSBI — output from before the console-switch (init's own
+  early prints) interleaves with output via the real driver path.
+
 ## [v0.6.0] — 2026-05-14
 
 ### Added

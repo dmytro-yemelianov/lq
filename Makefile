@@ -623,19 +623,127 @@ $(HELLO_ELF): $(HELLO_OBJS) $(LIBC_A)
 	    -o $@ $(HELLO_OBJS) $(LIBC_A)
 
 # ----------------------------------------------------------------------------
-# Userland CPIO — packs all spawnable binaries (tester + hello) and gets
-# embedded in taskman.elf via .incbin so taskman can fetch them at
+# init — /sbin/init (v0.6.1+). Spawned by taskman at boot; orchestrates
+# the rest of userland (resmgrs, getty, etc.). Same build shape as hello.
+# ----------------------------------------------------------------------------
+
+INIT_DIR   := $(TOP)/userland/init
+INITBUILD  := $(BUILD)/init
+INIT_ELF   := $(BUILD)/init.elf
+
+$(INITBUILD)/start.o: $(INIT_DIR)/start.S
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(INITBUILD)/main.o: $(INIT_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) \
+	    -isystem $(MUSL_GEN)/include \
+	    -isystem $(MUSL_DIR)/include \
+	    -isystem $(MUSL_DIR)/arch/riscv64 \
+	    -isystem $(MUSL_DIR)/arch/generic \
+	    -c -o $@ $<
+
+$(INITBUILD)/libqsoe/%.o: $(LIBQSOE_DIR)/src/%.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+INIT_OBJS := \
+    $(INITBUILD)/start.o \
+    $(INITBUILD)/main.o \
+    $(INITBUILD)/libqsoe/state.o \
+    $(INITBUILD)/libqsoe/msg.o \
+    $(INITBUILD)/libqsoe/process.o \
+    $(INITBUILD)/libqsoe/thread.o \
+    $(INITBUILD)/libqsoe/channel.o \
+    $(INITBUILD)/libqsoe/connect.o \
+    $(INITBUILD)/libqsoe/start_main.o \
+    $(INITBUILD)/libqsoe/io.o \
+    $(INITBUILD)/libqsoe/syscall_dispatch.o \
+    $(INITBUILD)/libqsoe/float128_stubs.o
+
+$(INIT_ELF): $(INIT_OBJS) $(LIBC_A)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -static -nostdlib \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext-segment=0x10000 \
+	    -o $@ $(INIT_OBJS) $(LIBC_A)
+
+# ----------------------------------------------------------------------------
+# devc-ser8250 — 16550 UART driver / resource manager (v0.6.1+).
+# QSOE's first userland resmgr. Spawned by init. Receives PLIC IRQs
+# on a dedicated thread bound to a kernel-signaled Notification.
+# ----------------------------------------------------------------------------
+
+DSER_DIR   := $(TOP)/userland/devc-ser8250
+DSERBUILD  := $(BUILD)/devc-ser8250
+DSER_ELF   := $(BUILD)/devc-ser8250.elf
+
+$(DSERBUILD)/start.o: $(DSER_DIR)/start.S
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(DSERBUILD)/main.o: $(DSER_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS) \
+                     $(DSER_DIR)/uart.h $(DSER_DIR)/ring.h
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) \
+	    -isystem $(MUSL_GEN)/include \
+	    -isystem $(MUSL_DIR)/include \
+	    -isystem $(MUSL_DIR)/arch/riscv64 \
+	    -isystem $(MUSL_DIR)/arch/generic \
+	    -c -o $@ $<
+
+$(DSERBUILD)/uart.o: $(DSER_DIR)/uart.c $(DSER_DIR)/uart.h $(DSER_DIR)/ring.h
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(DSERBUILD)/ring.o: $(DSER_DIR)/ring.c $(DSER_DIR)/ring.h
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
+
+$(DSERBUILD)/libqsoe/%.o: $(LIBQSOE_DIR)/src/%.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TESTER_LIBQSOE_CFLAGS) -c -o $@ $<
+
+DSER_OBJS := \
+    $(DSERBUILD)/start.o \
+    $(DSERBUILD)/main.o \
+    $(DSERBUILD)/uart.o \
+    $(DSERBUILD)/ring.o \
+    $(DSERBUILD)/libqsoe/state.o \
+    $(DSERBUILD)/libqsoe/msg.o \
+    $(DSERBUILD)/libqsoe/process.o \
+    $(DSERBUILD)/libqsoe/thread.o \
+    $(DSERBUILD)/libqsoe/channel.o \
+    $(DSERBUILD)/libqsoe/connect.o \
+    $(DSERBUILD)/libqsoe/start_main.o \
+    $(DSERBUILD)/libqsoe/io.o \
+    $(DSERBUILD)/libqsoe/syscall_dispatch.o \
+    $(DSERBUILD)/libqsoe/float128_stubs.o
+
+$(DSER_ELF): $(DSER_OBJS) $(LIBC_A)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -static -nostdlib \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext-segment=0x10000 \
+	    -o $@ $(DSER_OBJS) $(LIBC_A)
+
+# ----------------------------------------------------------------------------
+# Userland CPIO — packs all spawnable binaries (init + tester + hello) and
+# gets embedded in taskman.elf via .incbin so taskman can fetch them at
 # runtime through libcpio. See plan §2.
 # ----------------------------------------------------------------------------
 
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
-$(USERLAND_CPIO): $(TESTER_ELF) $(HELLO_ELF)
+$(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF)
 	@mkdir -p $(BUILD)/cpio-root/bin
+	@cp $(INIT_ELF)   $(BUILD)/cpio-root/bin/init.elf
 	@cp $(TESTER_ELF) $(BUILD)/cpio-root/bin/tester.elf
 	@cp $(HELLO_ELF)  $(BUILD)/cpio-root/bin/hello.elf
+	@cp $(DSER_ELF)   $(BUILD)/cpio-root/bin/devc-ser8250.elf
 	@cd $(BUILD)/cpio-root && \
-	    printf '%s\n' bin/tester.elf bin/hello.elf | \
+	    printf '%s\n' bin/init.elf bin/tester.elf bin/hello.elf bin/devc-ser8250.elf | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)

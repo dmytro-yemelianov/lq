@@ -592,3 +592,153 @@ from bare \texttt{tester.elf} / \texttt{hello.elf} to
 filesystem-style hierarchy.  taskman's \texttt{tm\_process\_create\_by\_name}
 canonicalises by internally prepending \texttt{bin/}, so the wire
 protocol still accepts the bare name.
+
+\section{/sbin/init and procmgr\_detach (v0.6.1)}
+
+v0.6.1 introduces the standard Unix-style boot chain:
+taskman~$\to$~\texttt{/sbin/init}~$\to$~everything else.  taskman
+itself spawns only one userland program (init); init takes
+responsibility for spawning drivers and other system programs in
+dependency order.
+
+\subsection{The detach handshake}
+
+QSOE inherits QNX's \texttt{procmgr\_detach} primitive for the
+``daemon stays resident'' pattern:
+
+\begin{enumerate}
+    \item Parent (init) calls \texttt{posix\_spawn(child)} —
+          non-blocking, returns the child's pid.
+    \item Parent calls \texttt{waitpid(pid, \&status, 0)} — blocks.
+    \item Child initialises (UART hardware, registers
+          \texttt{/dev/ser1} in pathmgr, etc.).
+    \item Child calls \texttt{procmgr\_detach(EXIT\_SUCCESS)}.
+    \item taskman delivers status to the parent's parked
+          \texttt{waitpid} (unblocks it) and reparents the child to
+          pid 1.  The child stays running as a daemon.
+    \item Parent's \texttt{waitpid} returns; parent proceeds knowing
+          the daemon is ready.
+\end{enumerate}
+
+\paragraph{Parent-side blocking.}  taskman implements \texttt{waitpid}
+using \texttt{seL4\_CNode\_SaveCaller}: if the named child hasn't
+exited or detached yet, taskman saves the parent's implicit reply
+cap into a slot in its own CSpace and returns from dispatch with
+\texttt{out\_no\_reply = 1}.  The dispatch loop moves on to other
+clients.  Later, when the child calls \texttt{procmgr\_detach} or
+\texttt{\_exit}, taskman \texttt{seL4\_Send}s the deferred reply
+through the saved slot.
+
+\paragraph{Reparenting.}  After detach, the child's
+\texttt{parent\_pid} field in \texttt{tm\_process\_t} is set to
+\texttt{QSOE\_PID\_TASKMAN} (pid 1) so the original parent can't
+waitpid on it again (returns \texttt{ECHILD}).  The child continues
+servicing its channel until it eventually exits — whose status
+ends up nowhere (taskman is its parent now and doesn't waitpid).
+
+\section{IRQ caps and the first userland driver (v0.6.1)}
+
+\subsection{seL4 interrupt model recap}
+
+seL4 doesn't have kernel-mode interrupt handlers.  Each IRQ source
+is represented by an \texttt{IRQHandler} capability minted from
+the singleton \texttt{IRQControl}.  Binding a \texttt{Notification}
+to an \texttt{IRQHandler} tells the kernel to signal that
+notification on every IRQ rising edge.  A user-space thread
+\texttt{seL4\_Wait}s on the notification, services the device,
+then \texttt{seL4\_IRQHandler\_Ack}s to re-arm.
+
+For RISC-V, the mint goes through \texttt{seL4\_RISCV\_IRQControl\_GetTrigger}
+(the generic \texttt{IRQIssueIRQHandler} isn't exposed) because the
+PLIC needs to know whether each line is edge- or level-triggered.
+For the 16550 UART on QEMU virt, the answer is level (trigger=0).
+
+\subsection{spawn.c driver special-case}
+
+When the spawned ELF is named \texttt{devc-ser8250.elf},
+\texttt{spawn.c} grants three extra caps to the child:
+
+\begin{itemize}
+    \item slot \texttt{QSOE\_CAP\_IRQ\_HANDLER} (6) — IRQHandler for
+          PLIC line 10 (16550 UART), minted via
+          \texttt{qsoe\_irq\_control\_get}.
+    \item slot \texttt{QSOE\_CAP\_UART\_FRAME} (7) — copy of a
+          retyped 4\,KiB device frame covering physical
+          \texttt{0x10000000}, also mapped into the child's VSpace
+          at \texttt{0xA00000}.
+    \item slot \texttt{QSOE\_CAP\_IRQ\_NTFN} (8) — a fresh
+          Notification the driver uses for IRQ-thread wakeups.
+\end{itemize}
+
+A manifest-driven mechanism for granting caps to drivers
+generally — rather than a per-driver if-string-equals match in
+\texttt{spawn.c} — is v0.7+ work.
+
+\subsection{Path manager mutation: register and repath}
+
+Two new wire requests let userland modify the namespace at runtime:
+
+\begin{itemize}
+    \item \texttt{TM\_REQ\_PATHMGR\_REGISTER} — a resmgr announces
+          itself at a path.  devc-ser8250 calls this to publish
+          \texttt{/dev/ser1} pointing at its own channel.
+    \item \texttt{TM\_REQ\_PATHMGR\_REPATH} — atomically rewire an
+          existing path to point somewhere else.  init uses this to
+          flip \texttt{/dev/console} from the in-taskman handler to
+          devc-ser8250 once the driver is ready.
+\end{itemize}
+
+\paragraph{Stdio inheritance respects the current binding.}
+When taskman's \texttt{spawn.c} mints inherited stdio caps for a
+new child, it now resolves \texttt{/dev/console} via the path
+manager at spawn time.  Early-boot children (devc-ser8250 itself)
+get stdio bound to the in-taskman console; children spawned by
+init after the repath get stdio bound directly to devc-ser8250's
+channel.  Existing fds keep working (their caps are on the channel
+they were minted from); only \emph{new} opens see the redirect.
+
+\section{devc-ser8250 (v0.6.1)}
+
+QSOE's first userland-process resource manager.  Drives the 16550
+UART on QEMU virt's PLIC line 10.
+
+\subsection{Split-thread architecture}
+
+devc-ser8250 runs two threads:
+
+\begin{itemize}
+    \item \textbf{Main dispatch thread}.  Listens on the driver's
+          own channel for client \texttt{TM\_REQ\_IO\_WRITE} and
+          \texttt{IO\_READ} traffic.  Polls
+          \texttt{LSR.TX\_IDLE} and writes \texttt{THR} for each
+          outgoing byte (TX is polled — the FIFO absorbs the
+          burst cheaply).  IO\_READ pops from a software ring
+          buffer the IRQ thread fills.
+    \item \textbf{IRQ thread}.  Spawned via \texttt{ThreadCreate}
+          pinned to hart 1 (away from main on hart 0).  Tight loop:
+          \texttt{seL4\_Wait(IRQ\_NTFN)} blocks until the kernel
+          signals an interrupt; \texttt{uart\_drain\_rx} reads the
+          UART's hardware FIFO into the SPSC ring buffer;
+          \texttt{qsoe\_irq\_handler\_ack} re-arms.
+\end{itemize}
+
+The two threads share a 256-byte ring buffer protected by a
+\texttt{qsoe\_spinlock\_t} (we're on SMP so unlocked SPSC isn't
+safe).  No cooked-mode line discipline yet — bytes pass through
+raw; programs that want echo / BS handling / line buffering need
+their own editor.
+
+\paragraph{Startup sequence.}
+\begin{enumerate}
+    \item \texttt{uart\_init()} — DLAB on, baud divisor written,
+          DLAB off + 8N1, FIFOs cleared and enabled, OUT2 strap to
+          route IRQs to PLIC, IER set for RX-data interrupt.
+    \item \texttt{qsoe\_irq\_handler\_set\_notification} — bind the
+          inherited Notification to the inherited IRQHandler.
+    \item \texttt{ThreadCreate} the IRQ thread on hart 1.
+    \item \texttt{ChannelCreate} the driver's own channel.
+    \item \texttt{qsoe\_pathmgr\_register("/dev/ser1", chid)}.
+    \item \texttt{procmgr\_detach(0)} — unblocks init.
+    \item Enter the main \texttt{seL4\_Recv} / \texttt{ReplyRecv}
+          dispatch loop.
+\end{enumerate}

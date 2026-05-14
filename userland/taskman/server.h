@@ -39,6 +39,24 @@ typedef struct {
     seL4_CPtr workers_l1_pt;
     seL4_CPtr workers_l0_pt;
     int       next_tid;     /* next free tid for this process (starts at 2) */
+    /* v0.6.1 waitpid/procmgr_detach state.
+     *
+     * parent_pid    : pid that posix_spawn'd us. Set by spawn.c; gets
+     *                 reparented to pid 1 on procmgr_detach.
+     * exit_state    : 0 = alive, 1 = detached (alive, status delivered
+     *                 to parent), 2 = exited (zombie waiting for
+     *                 waitpid). Detached + exited later is still
+     *                 exit_state=2 with the reparent reflected in
+     *                 parent_pid.
+     * exit_status   : status value the waiter should see — set by
+     *                 procmgr_detach OR by exit/_exit.
+     * waiter_reply_slot : if a parent is parked in waitpid() on us,
+     *                 this is the taskman-CSpace slot holding the
+     *                 saved reply cap. Zero = no parker. */
+    pid_t     parent_pid;
+    int       exit_state;
+    int       exit_status;
+    seL4_CPtr waiter_reply_slot;
 } tm_process_t;
 
 /* v0.4: per-thread registry entry. Master caps live in taskman's CSpace
@@ -164,6 +182,12 @@ int tm_channel_register_existing(pid_t pid, int chid,
  * tm_connection_register_existing stores the index. */
 int tm_channel_index(pid_t pid, int chid);
 
+/* v0.6.1: return the taskman-side master cap for a channel index
+ * (used by spawn.c when minting badged Send-caps into a freshly-
+ * spawned child's CSpace, e.g. for inherited stdio). Returns 0 if
+ * the index is out of range or the slot is unused. */
+seL4_CPtr tm_channel_master(int idx);
+
 /* v0.5.0: resolve which channel a badged message arrived through.
  * The dispatch loop uses this on IO_WRITE/IO_READ to route to the
  * right resmgr handler. Returns 0 + fills out_pid/out_chid; or
@@ -175,6 +199,29 @@ int tm_channel_by_badge(seL4_Word badge, pid_t *out_pid, int *out_chid);
  * minting stdio connections into a child that hasn't been registered
  * in the process table yet, so it can't go through tm_connect_attach. */
 seL4_Word tm_alloc_scoid(void);
+
+/* v0.6.1 procmgr_detach / waitpid plumbing. */
+
+/* Set the parent pid of an already-registered process. Called by the
+ * TM_REQ_PROCESS_CREATE handler right after a successful spawn so
+ * the child knows whom to deliver its eventual exit/detach status
+ * to. Returns 0 / -ESRCH. */
+int tm_process_set_parent(pid_t child, pid_t parent);
+
+/* Mark a process as detached: deliver `status` to its parent's
+ * parked waitpid (if any), reparent to pid 1 so the child's later
+ * real exit isn't reported to the original parent again, and let
+ * the child continue running. Returns 0 on success. */
+int tm_process_detach(pid_t pid, int status);
+
+/* The blocking half of waitpid. If `child` has already detached or
+ * exited, fills *out_status and returns 0 immediately. Otherwise
+ * SaveCallers the parent's reply slot (allocated from taskman's
+ * CSpace), parks it on the child's record, and returns 1 — the
+ * dispatch loop sets out_no_reply and moves on. The Send happens
+ * later, from tm_process_detach. Returns -errno on hard failures. */
+int tm_process_waitpid(pid_t waiter, pid_t child,
+                       int *out_status, int *out_parked);
 
 /* Register a connection that was minted outside ConnectAttach (e.g.
  * spawn.c minting SYSMGR_COID into a child's slot 1). Returns 0 on

@@ -19,6 +19,13 @@
 #define QSOE_CAP_STDOUT_CONNECT 4
 #define QSOE_CAP_STDERR_CONNECT 5
 
+/* v0.6.1 driver-special-case slots. taskman mints these into devc-*
+ * children at spawn (gated on the ELF name for now; manifest-driven
+ * cap granting comes later). Stay within QSOE_CAP_WELL_KNOWN_END. */
+#define QSOE_CAP_IRQ_HANDLER    6  /* IRQHandler for the driver's IRQ line */
+#define QSOE_CAP_UART_FRAME     7  /* 4 KiB device-untyped covering UART MMIO */
+#define QSOE_CAP_IRQ_NTFN       8  /* Notification the IRQHandler is bound to */
+
 #define QSOE_CAP_WELL_KNOWN_END 16 /* slots [2..15] reserved; dynamics start at 16 */
 
 /* By convention pid 1 is taskman itself. */

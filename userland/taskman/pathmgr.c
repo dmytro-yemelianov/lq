@@ -153,3 +153,23 @@ int tm_pathmgr_resolve(const char *path,
     if (out_consumed_bytes) *out_consumed_bytes = (unsigned)(deepest_p - path);
     return 0;
 }
+
+int tm_pathmgr_repath(const char *path, const tm_pathmgr_obj_t *new_obj)
+{
+    if (!path || path[0] != '/' || !new_obj || !g_root) return -EINVAL;
+
+    /* Walk to the EXACT node for `path` — not longest-prefix. The
+     * caller wants to update a specific entry, not its parent. */
+    pm_node_t *node = g_root;
+    const char *p = path;
+    const char *comp;
+    unsigned len;
+    while (pm_next_component(&p, &comp, &len)) {
+        pm_node_t *child = pm_find_child(node, comp, len);
+        if (!child) return -ENOENT;
+        node = child;
+    }
+    if (!node->has_obj) return -ENOENT;
+    node->obj = *new_obj;
+    return 0;
+}

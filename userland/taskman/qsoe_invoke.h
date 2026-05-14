@@ -318,6 +318,44 @@ qsoe_tcb_unbind_notification(seL4_CPtr tcb)
     return seL4_MessageInfo_get_label(reply);
 }
 
+/* seL4_CNode_SaveCaller — moves the current thread's implicit reply
+ * cap (the one set up by the most recent Recv/ReplyRecv) into the
+ * named CNode slot. After this returns 0 the server can Recv again
+ * without consuming the reply state; the saved slot holds a single-
+ * use Reply cap. Sending to that slot delivers the deferred reply
+ * and the kernel clears the slot. Used by v0.6.1's waitpid handler
+ * to park the parent's call until the child detaches. */
+static inline seL4_Word
+qsoe_cnode_save_caller(seL4_CPtr root, seL4_Word index, seL4_Uint8 depth)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_CNodeSaveCaller, 0, 0, 2);
+    seL4_Word mr0 = index, mr1 = (seL4_Word)(depth & 0xffu), mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(root, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+/* seL4_Send — one-shot Send on a cap. No reply, no implicit reply
+ * state on the sender. Used to deliver a deferred reply via a slot
+ * SaveCaller'd into: Send-on-saved-slot makes the original blocked
+ * caller (the parent in waitpid()) unblock with this message.
+ * Non-MCS kernels self-clear the slot after the Send consumes it. */
+static inline void
+qsoe_sys_send(seL4_CPtr ep, seL4_MessageInfo_t info,
+              seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3)
+{
+    register seL4_Word a0 asm("a0") = ep;
+    register seL4_Word a1 asm("a1") = info.words[0];
+    register seL4_Word a2 asm("a2") = mr0;
+    register seL4_Word a3 asm("a3") = mr1;
+    register seL4_Word a4 asm("a4") = mr2;
+    register seL4_Word a5 asm("a5") = mr3;
+    register seL4_Word a7 asm("a7") = (seL4_Word)SYS_Send;
+    asm volatile("ecall"
+                 : "+r"(a0), "+r"(a1), "+r"(a2), "+r"(a3), "+r"(a4), "+r"(a5)
+                 : "r"(a7)
+                 : "memory");
+}
+
 /* seL4_Signal — empty Send to a Notification cap (kernel checks cap
  * type). No reply, no MRs. */
 static inline void
@@ -330,6 +368,52 @@ qsoe_sys_signal(seL4_CPtr ntfn)
                  : "+r"(a0), "+r"(a1)
                  : "r"(a7)
                  : "memory");
+}
+
+/* v0.6.1 IRQ wrappers.
+ *
+ * QSOE drivers attach to a PLIC interrupt line by minting an
+ * IRQHandler cap from the rootserver's IRQControl, then binding a
+ * Notification to it. The kernel signals the Notification whenever
+ * the IRQ fires; the driver acks via the IRQHandler to re-arm.
+ *
+ * On RISC-V, mint goes through RISCVIRQIssueIRQHandlerTrigger
+ * (the architecture-specific variant — the generic IRQIssueIRQHandler
+ * isn't exposed). trigger=0 means level-triggered (correct for the
+ * 16550 UART on QEMU virt's PLIC). */
+
+static inline seL4_Word
+qsoe_irq_control_get(seL4_CPtr ctrl, seL4_Word irq, seL4_Word trigger,
+                     seL4_CPtr root, seL4_Word index, seL4_Uint8 depth)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = root;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(RISCVIRQIssueIRQHandlerTrigger,
+                                                   0, 1, 4);
+    seL4_Word mr0 = irq;
+    seL4_Word mr1 = trigger;
+    seL4_Word mr2 = index;
+    seL4_Word mr3 = (seL4_Word)(depth & 0xffu);
+    seL4_MessageInfo_t reply = qsoe_sys_call(ctrl, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_irq_handler_set_notification(seL4_CPtr handler, seL4_CPtr ntfn)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = ntfn;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(IRQSetIRQHandler, 0, 1, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(handler, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+static inline seL4_Word
+qsoe_irq_handler_ack(seL4_CPtr handler)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(IRQAckIRQ, 0, 0, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(handler, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
 }
 
 /* seL4_Wait — same syscall as Recv; kernel distinguishes by cap type.

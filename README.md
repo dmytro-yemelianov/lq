@@ -72,7 +72,7 @@ incremental builds are seconds.
 ## Current status
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
-of **v0.6.0**:
+of **v0.6.1**:
 
 - QNX-style synchronous IPC: `ChannelCreate`/`Destroy`,
   `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`
@@ -95,6 +95,13 @@ of **v0.6.0**:
   via `brk()`
 - **cpiofs** — embedded `userland.cpio` mounted as a read-only
   filesystem at `/`; `open("/bin/hello.elf")` works from any program
+- **`/sbin/init`** owns userland orchestration; taskman just
+  bootstraps init
+- **`procmgr_detach` + `waitpid`** — QNX/QRV-style daemon
+  synchronisation; the parent blocks until the child says ready
+- **`devc-ser8250`** — first real userland resmgr: drives the 16550
+  UART via PLIC interrupts on a dedicated IRQ thread, registers at
+  `/dev/ser1`, and init redirects `/dev/console` to it at boot
 
 ## Documentation
 

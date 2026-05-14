@@ -33,6 +33,13 @@
 int tm_spawn(const void *elf, unsigned long elf_len,
              pid_t pid, seL4_CPtr primary_ep,
              int argc, const char *const *argv,
-             int envc, const char *const *envp);
+             int envc, const char *const *envp,
+             const char *elf_name);
+
+/* v0.6.1: register the device-untyped slot covering the 16550 UART
+ * MMIO so spawn.c can hand it to devc-ser8250 at process creation.
+ * main.c calls this once at boot after find_device_untyped_for_paddr
+ * resolves the cap slot. 0 = no UART device-untyped available. */
+void tm_set_uart_untyped(seL4_CPtr ut_slot);
 
 #endif /* QSOE_TASKMAN_SPAWN_H */

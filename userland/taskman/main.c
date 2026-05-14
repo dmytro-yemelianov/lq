@@ -170,7 +170,13 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
                                             envc, s_envp,
                                             &new_pid);
         if (rc) { err = (seL4_Word)(-rc); }
-        else    { *out_mr0 = (seL4_Word)new_pid; reply_len = 1; }
+        else {
+            /* v0.6.1: record the parent so the child's eventual
+             * procmgr_detach or exit can find whom to reply to. */
+            tm_process_set_parent(new_pid, caller);
+            *out_mr0 = (seL4_Word)new_pid;
+            reply_len = 1;
+        }
         break;
     }
     case TM_REQ_DEBUG_SLOT_COUNT: {
@@ -340,6 +346,75 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         }
         break;
     }
+    case TM_REQ_PROC_DETACH: {
+        /* MR0 = status. The caller is the detacher (its own pid). */
+        int status = (int)mr0;
+        int rc = tm_process_detach(caller, status);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_WAITPID: {
+        /* MR0 = pid to wait on. Reply MR0 = status, label = 0 on
+         * success. If the child hasn't detached/exited yet, taskman
+         * SaveCallers the parent's reply slot and parks it on the
+         * child's record; out_no_reply=1 tells the dispatcher to skip
+         * the reply phase. The deferred reply fires from
+         * tm_process_detach when the child finally signals. */
+        pid_t child = (pid_t)mr0;
+        int status = 0;
+        int parked = 0;
+        int rc = tm_process_waitpid(caller, child, &status, &parked);
+        if (rc) {
+            err = (seL4_Word)(-rc);
+        } else if (parked) {
+            *out_no_reply = 1;
+        } else {
+            *out_mr0 = (seL4_Word)(unsigned)status;
+            reply_len = 1;
+        }
+        break;
+    }
+    case TM_REQ_PATHMGR_REGISTER: {
+        /* MR0 = path_len, MR1 = chid. Caller (from badge) is the
+         * announcing resmgr; path bytes in msg[4..]. */
+        unsigned plen = (unsigned)mr0;
+        int chid = (int)mr1;
+        if (plen == 0 || plen >= 128) { err = (seL4_Word)EINVAL; break; }
+        static char s_reg_path[128];
+        const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+        for (unsigned i = 0; i < plen; ++i) s_reg_path[i] = (char)src[i];
+        s_reg_path[plen] = 0;
+
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = caller,
+            .server_chid  = chid,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_EXTERNAL,
+        };
+        int rc = tm_pathmgr_register(s_reg_path, &obj);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_PATHMGR_REPATH: {
+        /* MR0 = path_len, MR1 = new server pid, MR2 = new server chid,
+         * MR3 = new handler_kind. Path bytes in msg[4..]. */
+        unsigned plen = (unsigned)mr0;
+        if (plen == 0 || plen >= 128) { err = (seL4_Word)EINVAL; break; }
+        static char s_repath[128];
+        const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+        for (unsigned i = 0; i < plen; ++i) s_repath[i] = (char)src[i];
+        s_repath[plen] = 0;
+
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = (pid_t)mr1,
+            .server_chid  = (int)mr2,
+            .flags        = 0,
+            .handler_kind = (unsigned)mr3,
+        };
+        int rc = tm_pathmgr_repath(s_repath, &obj);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
     case TM_REQ_PING_CLIENTINFO: {
         /* Demo: exercise ConnectClientInfo from inside the dispatch
          * loop. The badge attached to this incoming message IS the
@@ -412,6 +487,26 @@ static seL4_CPtr find_largest_ram_untyped(seL4_BootInfo *bi)
     return bi->untyped.start + best;
 }
 
+/* v0.6.1: find the device-untyped covering a given physical address.
+ * The seL4 kernel publishes device regions as isDevice=1 untypeds
+ * in BootInfo, typically one per platform device. For the QEMU virt
+ * 16550 UART at 0x10000000 we expect a 4 KiB untyped at that exact
+ * paddr. Returns 0 if no covering untyped exists. */
+static seL4_CPtr find_device_untyped_for_paddr(seL4_BootInfo *bi,
+                                                unsigned long paddr)
+{
+    unsigned n = bi->untyped.end - bi->untyped.start;
+    for (unsigned i = 0; i < n; ++i) {
+        if (!bi->untypedList[i].isDevice) continue;
+        unsigned long base = bi->untypedList[i].paddr;
+        unsigned long size = 1UL << bi->untypedList[i].sizeBits;
+        if (paddr >= base && paddr < base + size) {
+            return bi->untyped.start + i;
+        }
+    }
+    return 0;
+}
+
 int main(seL4_BootInfo *bi)
 {
     print_banner();
@@ -421,6 +516,17 @@ int main(seL4_BootInfo *bi)
     if (ut == 0) {
         sel4_debug_puts("FATAL: no RAM untyped\n");
         for (;;) __asm__ volatile("nop");
+    }
+
+    /* v0.6.1: find the device-untyped covering the 16550 UART. We
+     * tolerate "not found" — drivers can still load without that
+     * cap (writes go through the existing in-taskman console
+     * fallback), but devc-ser8250 will refuse to bring up the
+     * hardware. */
+    seL4_CPtr uart_ut = find_device_untyped_for_paddr(bi, 0x10000000UL);
+    tm_set_uart_untyped(uart_ut);
+    if (uart_ut == 0) {
+        sel4_debug_puts("warn: no device-untyped at 0x10000000\n");
     }
 
     tm_init(ut, seL4_CapInitThreadCNode, bi->empty.start);
@@ -506,32 +612,34 @@ int main(seL4_BootInfo *bi)
     tm_set_primary_ep(primary_ep);
     tm_cpiofs_set_cpio(_userland_cpio_start, cpio_len);
 
-    /* Find tester.elf in the embedded userland CPIO. v0.6.0 moved
-     * entries under bin/, in line with cpiofs's expected layout. */
+    /* v0.6.1: taskman launches /sbin/init at boot, not the test
+     * binary directly. init is responsible for spawning every
+     * other userland program (drivers, getty, eventually tester).
+     * Until v0.6.1 the chain is: taskman -> init -> tester. */
     unsigned long elf_size = 0;
     const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
-                                     "bin/tester.elf", &elf_size);
+                                     "bin/init.elf", &elf_size);
     if (!elf) {
-        sel4_debug_puts("FATAL: bin/tester.elf not found in CPIO\n");
+        sel4_debug_puts("FATAL: bin/init.elf not found in CPIO\n");
         for (;;) __asm__ volatile("nop");
     }
-    pid_t tester_pid = tm_pid_alloc();
-    if (!tester_pid) {
+    pid_t init_pid = tm_pid_alloc();
+    if (!init_pid) {
         sel4_debug_puts("FATAL: pid allocator empty\n");
         for (;;) __asm__ volatile("nop");
     }
-    sel4_debug_puts("taskman: spawning tester (pid=");
+    sel4_debug_puts("taskman: spawning /sbin/init (pid=");
     {
-        char d = '0' + (char)(tester_pid & 0x7);
+        char d = '0' + (char)(init_pid & 0x7);
         sel4_debug_putchar(d);
     }
     sel4_debug_puts(")...\n");
-    /* Boot-time spawn of tester: no argv, no envp. */
-    static const char *boot_argv0 = "tester";
+    static const char *boot_argv0 = "init";
     const char *boot_argv[1] = { boot_argv0 };
-    int sr = tm_spawn(elf, elf_size, tester_pid, primary_ep,
+    int sr = tm_spawn(elf, elf_size, init_pid, primary_ep,
                        /*argc=*/1, boot_argv,
-                       /*envc=*/0, 0);
+                       /*envc=*/0, 0,
+                       /*elf_name=*/"init.elf");
     if (sr != 0) {
         sel4_debug_puts("FATAL: tm_spawn returned non-zero\n");
         for (;;) __asm__ volatile("nop");

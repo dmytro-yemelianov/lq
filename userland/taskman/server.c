@@ -96,8 +96,11 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
     pid_t new_pid = tm_pid_alloc();
     if (!new_pid) return -ENOMEM;
 
+    /* `name + 4` skips the "bin/" prefix taskman canonicalised onto
+     * the caller's bare ELF name; spawn.c needs the bare name to
+     * recognise driver special-cases. */
     int sr = tm_spawn(elf, elf_size, new_pid, s_primary_ep,
-                       argc, argv, envc, envp);
+                       argc, argv, envc, envp, &name[4]);
     if (sr) {
         tm_pid_free(new_pid);
         return sr;
@@ -131,6 +134,10 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     g_processes[0].workers_l1_pt  = 0;
     g_processes[0].workers_l0_pt  = 0;
     g_processes[0].next_tid       = 2;
+    g_processes[0].parent_pid     = QSOE_PID_TASKMAN;  /* self-parent */
+    g_processes[0].exit_state     = 0;
+    g_processes[0].exit_status    = 0;
+    g_processes[0].waiter_reply_slot = 0;
 }
 
 int tm_process_register(pid_t pid, seL4_CPtr cnode,
@@ -150,6 +157,10 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].workers_l1_pt  = 0;
         g_processes[i].workers_l0_pt  = 0;
         g_processes[i].next_tid       = 2;
+        g_processes[i].parent_pid     = QSOE_PID_TASKMAN;  /* updated by spawn.c */
+        g_processes[i].exit_state     = 0;
+        g_processes[i].exit_status    = 0;
+        g_processes[i].waiter_reply_slot = 0;
         return 0;
     }
     return -ENOMEM;
@@ -269,13 +280,89 @@ int tm_channel_index(pid_t pid, int chid)
     return c ? (int)(c - g_channels) : -1;
 }
 
+seL4_CPtr tm_channel_master(int idx)
+{
+    if (idx < 0 || idx >= TM_MAX_CHANNELS) return 0;
+    if (!g_channels[idx].in_use) return 0;
+    return g_channels[idx].master;
+}
+
 seL4_Word tm_alloc_scoid(void)
 {
     return s_next_badge++;
 }
 
-/* tm_channel_by_badge is defined further down, after the static
- * connection_find_by_badge helper it relies on. */
+/* ----------- v0.6.1 procmgr_detach / waitpid plumbing ----------- */
+
+int tm_process_set_parent(pid_t child, pid_t parent)
+{
+    tm_process_t *p = tm_process_lookup(child);
+    if (!p) return -ESRCH;
+    p->parent_pid = parent;
+    return 0;
+}
+
+/* Helper: deliver a (label, status) reply via a previously-SaveCaller'd
+ * slot. The kernel consumes the reply cap on Send, after which we
+ * free the slot back to taskman's pool. */
+static void deliver_waiter_reply(seL4_CPtr slot, seL4_Word label, int status)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(label, 0, 0, 1);
+    qsoe_sys_send(slot, tag, (seL4_Word)(unsigned)status, 0, 0, 0);
+    /* The single-use reply cap is gone now; reclaim the slot. */
+    taskman_free_slot(slot);
+}
+
+int tm_process_detach(pid_t pid, int status)
+{
+    tm_process_t *p = tm_process_lookup(pid);
+    if (!p) return -ESRCH;
+    if (p->exit_state != 0) return 0;  /* already detached/exited */
+
+    p->exit_state  = 1;       /* detached, still alive */
+    p->exit_status = status;
+
+    /* If our parent is parked in waitpid(), unblock it now. */
+    if (p->waiter_reply_slot != 0) {
+        seL4_CPtr slot = p->waiter_reply_slot;
+        p->waiter_reply_slot = 0;
+        deliver_waiter_reply(slot, /*label=*/0, status);
+    }
+
+    /* Reparent to pid 1 (taskman). The original parent's future
+     * waitpid() calls on this pid will fail with ECHILD; the child
+     * lives on as a daemon. */
+    p->parent_pid = QSOE_PID_TASKMAN;
+    return 0;
+}
+
+int tm_process_waitpid(pid_t waiter, pid_t child,
+                       int *out_status, int *out_parked)
+{
+    *out_parked = 0;
+    tm_process_t *c = tm_process_lookup(child);
+    if (!c) return -ECHILD;
+    if (c->parent_pid != waiter) return -ECHILD;
+
+    if (c->exit_state != 0) {
+        /* Already done — synchronous return. */
+        *out_status = c->exit_status;
+        return 0;
+    }
+
+    /* Park the caller's reply slot. SaveCaller into a fresh slot in
+     * taskman's CSpace; the eventual procmgr_detach/exit will Send
+     * the reply through it. */
+    extern seL4_CPtr s_next_slot;  /* defined in this file */
+    seL4_CPtr slot = taskman_alloc_empty_slot();
+    if (qsoe_cnode_save_caller(s_cnode_root, slot, TM_DEPTH_TASKMAN) != 0) {
+        taskman_free_slot(slot);
+        return -ENOMEM;
+    }
+    c->waiter_reply_slot = slot;
+    *out_parked = 1;
+    return 0;
+}
 
 int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
                                     int channel_idx, seL4_Word badge,
@@ -645,10 +732,23 @@ int tm_connect_flags(pid_t caller_pid, seL4_CPtr client_slot,
  */
 int tm_process_terminate(pid_t target, int status)
 {
-    (void)status;  /* not propagated to waiters until v0.5's waitpid */
     if (target == QSOE_PID_TASKMAN) return -EINVAL;
     tm_process_t *p = tm_process_lookup(target);
     if (!p) return -ESRCH;
+
+    /* v0.6.1: if the parent is parked in waitpid(target), deliver
+     * the exit status now and clear the parker. Even if the parent
+     * isn't waiting yet, the next waitpid() will see exit_state != 0
+     * and the saved exit_status, so the synchronous path handles it. */
+    if (p->exit_state == 0) {
+        p->exit_state  = 2;       /* exited (zombie) */
+        p->exit_status = status;
+        if (p->waiter_reply_slot != 0) {
+            seL4_CPtr slot = p->waiter_reply_slot;
+            p->waiter_reply_slot = 0;
+            deliver_waiter_reply(slot, /*label=*/0, status);
+        }
+    }
 
     /* 1. Worker threads of this pid. */
     for (int i = 0; i < TM_MAX_THREADS; ++i) {
