@@ -133,6 +133,9 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     g_processes[0].cwd[1] = 0;
     /* POSIX default umask — children inherit at spawn. */
     g_processes[0].umask = 022;
+    /* ITIMER_REAL disarmed by default. */
+    g_processes[0].itimer_expiry_ticks   = 0;
+    g_processes[0].itimer_interval_ticks = 0;
 }
 
 int tm_process_register(pid_t pid, seL4_CPtr cnode,
@@ -174,6 +177,8 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].cwd[0] = '/';
         g_processes[i].cwd[1] = 0;
         g_processes[i].umask  = 022;
+        g_processes[i].itimer_expiry_ticks   = 0;
+        g_processes[i].itimer_interval_ticks = 0;
         return 0;
     }
     return -ENOMEM;

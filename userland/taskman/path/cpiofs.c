@@ -339,3 +339,18 @@ int tm_cpiofs_readdir(seL4_Word badge, char *name_out,
     }
     return -ENOENT;
 }
+
+int tm_cpiofs_close(seL4_Word badge)
+{
+    unsigned long data_addr = 0, ctx1 = 0;
+    int rc = tm_connection_get_ctx(badge, &data_addr, &ctx1);
+    if (rc) return 0;     /* unknown connection — nothing for us to do */
+    if (data_addr != 0) return 0;   /* regular file, no dir slot to free */
+
+    int slot_idx = (int)ctx1;
+    if (slot_idx < 0 || slot_idx >= TM_CPIOFS_MAX_DIRS) return 0;
+    if (g_cpiofs_dirs[slot_idx].badge == badge) {
+        g_cpiofs_dirs[slot_idx].badge = 0;   /* mark free */
+    }
+    return 0;
+}

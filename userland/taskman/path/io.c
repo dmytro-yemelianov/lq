@@ -53,9 +53,26 @@ int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot)
     return 0;
 }
 
-int tm_io_close(pid_t caller, seL4_CPtr slot)
+int tm_io_close(pid_t caller, seL4_Word badge)
 {
-    return tm_connect_detach(caller, slot);
+    (void)caller;
+    /* Step 1 of two-step close: notify the owning resmgr so it can
+     * decrement counts / free per-fd state.  The cap itself is
+     * reclaimed by libc's follow-up TM_REQ_DETACH_CAP. */
+    pid_t srv_pid = 0;
+    int   srv_chid = 0;
+    if (tm_channel_by_badge(badge, &srv_pid, &srv_chid) != 0) return -EBADF;
+
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
+        return tm_cpiofs_close(badge);
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
+        return 0;   /* console has no per-fd state */
+    }
+    /* External resmgrs (e.g. /sbin/pipe): they receive TM_REQ_CLOSE
+     * directly on their own channel (the fd's cap points at them);
+     * taskman never sees those.  Reply cleanly. */
+    return 0;
 }
 
 /* IO_WRITE: route by badge → channel → resmgr handler. */
@@ -273,5 +290,68 @@ int tm_access(pid_t caller, unsigned path_len)
     }
     /* console & external resmgrs: pathmgr_resolve succeeding means
      * the resmgr owns the path and "exists" for the access() purpose. */
+    return 0;
+}
+
+/* PIPE_CREATE: locate the pipe manager via pathmgr at /dev/pipe, then
+ * mint two badged Send caps on its channel into the caller's CSpace.
+ * Badges encode (unique_id << 1) | direction-bit so the pipe manager
+ * can route IO requests and tell read-end from write-end. */
+int tm_pipe_create(pid_t caller, seL4_CPtr *out_read_slot,
+                   seL4_CPtr *out_write_slot)
+{
+    /* Resolve /dev/pipe; this works once the pipe manager has
+     * tm_pathmgr_register'd itself. */
+    tm_pathmgr_obj_t obj;
+    unsigned consumed = 0;
+    if (tm_pathmgr_resolve("/dev/pipe", &obj, &consumed) != 0) {
+        return -ENOENT;
+    }
+    int chidx = tm_channel_index(obj.server_pid, obj.server_chid);
+    if (chidx < 0) return -ESRCH;
+    tm_channel_t *gch = tm_channels_array();
+    seL4_CPtr master = gch[chidx].master;
+    if (!master) return -ESRCH;
+
+    tm_process_t *client = tm_process_lookup(caller);
+    if (!client) return -ESRCH;
+
+    /* Allocate a fresh unique id.  Monotonic; we don't recycle —
+     * the pipe manager's pool is finite, so a very long-running
+     * shell can eventually hit EMFILE on pipe creation.  Recycling
+     * is a v0.8 enhancement (it needs an "id-freed" notification
+     * from pipe manager). */
+    static unsigned s_next_pipe_uid = 1;  /* 0 reserved; pipe mgr starts at 1 */
+    unsigned uid = s_next_pipe_uid++;
+
+    seL4_Word read_badge  = ((seL4_Word)uid << 1) | 0u;
+    seL4_Word write_badge = ((seL4_Word)uid << 1) | 1u;
+
+    seL4_CPtr read_slot  = tm_process_alloc_slot(caller);
+    seL4_CPtr write_slot = tm_process_alloc_slot(caller);
+    seL4_Uint8 depth = cnode_depth_for(caller);
+
+    if (qsoe_cnode_mint(client->cnode, read_slot, depth,
+                        s_cnode_root, master, TM_DEPTH_TASKMAN,
+                        QSOE_RIGHTS_SEND, read_badge) != 0) {
+        return -ENOMEM;
+    }
+    if (qsoe_cnode_mint(client->cnode, write_slot, depth,
+                        s_cnode_root, master, TM_DEPTH_TASKMAN,
+                        QSOE_RIGHTS_SEND, write_badge) != 0) {
+        /* read-end already minted; not unwinding for v0.7 — caller
+         * sees ENOMEM and the read-end leaks until process exit
+         * cleans up the whole CSpace. */
+        return -ENOMEM;
+    }
+
+    /* Register both connections in taskman's table so subsequent
+     * tm_connect_detach (libc close) on either fd works.  flags=0
+     * (no COF_* bits for pipe ends in v0.7). */
+    tm_connection_register_existing(caller, read_slot,  chidx, read_badge,  0);
+    tm_connection_register_existing(caller, write_slot, chidx, write_badge, 0);
+
+    *out_read_slot  = read_slot;
+    *out_write_slot = write_slot;
     return 0;
 }

@@ -75,4 +75,10 @@ int tm_cpiofs_lseek(seL4_Word badge, int whence, long offset, long *out_off);
 int tm_cpiofs_readdir(seL4_Word badge, char *name, unsigned *namelen,
                       int *d_type);
 
+/* Per-fd close hook.  Frees the dir-slot entry tied to `badge` if
+ * one exists; no-op for regular-file connections (their per-fd
+ * state lives entirely in the connection-context slots that taskman
+ * already clears on tm_connect_detach).  Returns 0 either way. */
+int tm_cpiofs_close(seL4_Word badge);
+
 #endif

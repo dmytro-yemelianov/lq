@@ -54,6 +54,7 @@ typedef unsigned int  gid_t;
 #define EPERM           1
 #define ENOENT          2
 #define ESRCH           3
+#define EINTR           4
 #define EIO             5
 #define E2BIG           7
 #define EBADF           9
@@ -70,6 +71,7 @@ typedef unsigned int  gid_t;
 #define ENOTTY         25
 #define EFBIG          27
 #define ESPIPE         29
+#define EPIPE          32
 #define EROFS          30
 #define ERANGE         34
 #define ENAMETOOLONG   36

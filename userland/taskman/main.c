@@ -53,6 +53,12 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     *out_mr3 = 0;
     *out_no_reply = 0;
 
+    /* Hybrid timer expiry: every dispatch entry walks the timer
+     * state, wakes any expired nanosleep callers, delivers SIGALRM
+     * pulses for expired ITIMER_REALs.  Quiet systems see coarse
+     * granularity; IPC-busy ones see real-time timer behaviour. */
+    tm_timer_sweep();
+
     switch (label) {
     /* ---------- sysmgr ---------- */
     case TM_REQ_DEBUG_SLOT_COUNT:
@@ -305,6 +311,46 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         reply_len = 1;
         break;
     }
+    case TM_REQ_PIPE_CREATE: {
+        seL4_CPtr rfd = 0, wfd = 0;
+        int rc = tm_pipe_create(caller, &rfd, &wfd);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)rfd;
+        *out_mr1 = (seL4_Word)wfd;
+        reply_len = 2;
+        break;
+    }
+    case TM_REQ_DETACH_CAP: {
+        /* Step 2 of two-step close: libc has already notified the
+         * resmgr; we now delete the cap from the caller's CSpace
+         * and free the connection-table entry. */
+        int rc = tm_connect_detach(caller, (seL4_CPtr)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_NANOSLEEP: {
+        /* MR0 = total nanoseconds.  Block via SaveCaller until the
+         * timer sweep wakes us. */
+        int parked = 0;
+        int rc = tm_nanosleep(caller, (unsigned long)mr0, &parked);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        if (parked) {
+            *out_no_reply = 1;
+        }
+        break;
+    }
+    case TM_REQ_SETITIMER: {
+        /* MR0 = which, MR1 = initial value (us), MR2 = interval (us). */
+        unsigned long old_val = 0, old_int = 0;
+        int rc = tm_setitimer(caller, (int)mr0,
+                              (unsigned long)mr1, (unsigned long)mr2,
+                              &old_val, &old_int);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)old_val;
+        *out_mr1 = (seL4_Word)old_int;
+        reply_len = 2;
+        break;
+    }
     case TM_REQ_SET_CRED: {
         /* mr0 = ruid<<32|euid, mr1 = suid<<32|rgid, mr2 = egid<<32|sgid.
          * 0xFFFFFFFF in any 32-bit field means "no change". */
@@ -359,7 +405,12 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_CLOSE: {
-        int rc = tm_io_close(caller, (seL4_CPtr)mr0);
+        /* libc sends this on the fd's own cap; we arrive via the
+         * resmgr's channel.  Dispatch to the in-taskman resmgr's
+         * per-fd close hook (cpiofs frees its dir-slot; console is a
+         * no-op).  External resmgrs handle their own TM_REQ_CLOSE on
+         * their own channels — taskman never sees those. */
+        int rc = tm_io_close(caller, badge);
         if (rc) err = (seL4_Word)(-rc);
         break;
     }

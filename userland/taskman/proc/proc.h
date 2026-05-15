@@ -75,6 +75,15 @@ typedef struct {
     /* v0.7 file-creation mask.  Default 022 per POSIX; inherited by
      * children at spawn; mutated by umask(). */
     unsigned  umask;
+
+    /* v0.7 ITIMER_REAL state.  When `itimer_expiry_ticks` is
+     * non-zero, the timer is armed; the timer sweep at each
+     * dispatch entry checks it.  `itimer_interval_ticks` is the
+     * re-arm value (0 = one-shot, disarmed after firing).  Sigevent
+     * is delivered as a SIGALRM pulse to this process's signal
+     * channel (see signal_chid above). */
+    unsigned long itimer_expiry_ticks;
+    unsigned long itimer_interval_ticks;
 } tm_process_t;
 
 typedef struct {
@@ -192,6 +201,24 @@ int           tm_set_cred(pid_t caller_pid,
                            unsigned suid_new,
                            unsigned rgid_new, unsigned egid_new,
                            unsigned sgid_new);
+
+/* v0.7 timer subsystem (hybrid lazy expiry).  See proc/timer.c.
+ *
+ * tm_timer_sweep()  — called at every dispatch entry; wakes any
+ *                     sleepers whose deadlines have passed and
+ *                     pulses SIGALRM for any expired itimer.
+ * tm_nanosleep()    — parks the caller's reply cap; returns
+ *                     "no_reply" sentinel via *out_parked = 1.
+ * tm_setitimer()    — arms/disarms the per-process ITIMER_REAL.
+ */
+void          tm_timer_sweep(void);
+int           tm_nanosleep(pid_t caller_pid, unsigned long total_ns,
+                           int *out_parked);
+int           tm_setitimer(pid_t caller_pid, int which,
+                           unsigned long value_us,
+                           unsigned long interval_us,
+                           unsigned long *out_old_value_us,
+                           unsigned long *out_old_interval_us);
 
 /* ----------- channels ----------- */
 

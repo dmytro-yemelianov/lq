@@ -137,6 +137,7 @@ TASKMAN_OBJS := \
     $(OBJDIR)/proc/thread.o \
     $(OBJDIR)/proc/pulse.o \
     $(OBJDIR)/proc/spawn.o \
+    $(OBJDIR)/proc/timer.o \
     $(OBJDIR)/mem/mmap.o \
     $(OBJDIR)/path/pathmgr.o \
     $(OBJDIR)/path/cpiofs.o \

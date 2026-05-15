@@ -71,6 +71,7 @@ TESTER_ELF    := $(BUILD)/tester.elf
 HELLO_ELF     := $(BUILD)/hello.elf
 INIT_ELF      := $(BUILD)/init.elf
 DSER_ELF      := $(BUILD)/devc-ser8250.elf
+SBIN_PIPE_ELF := $(BUILD)/sbin-pipe.elf
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
 # ----------------------------------------------------------------------------
@@ -436,6 +437,16 @@ devc-ser8250: $(LIBQSOE_A) $(LIBC_A)
 $(DSER_ELF): | devc-ser8250
 	@true
 
+# sbin/pipe — POSIX pipe / FIFO resource manager.  v0.7+ System Program;
+# ships in /sbin/ inside the userland CPIO.  Spawning is handled by a
+# system manager later (intentionally not by init in v0.7).
+.PHONY: sbin-pipe
+sbin-pipe: $(LIBQSOE_A) $(LIBC_A)
+	+$(MAKE) -C $(TOP)/userland/sbin/pipe all
+
+$(SBIN_PIPE_ELF): | sbin-pipe
+	@true
+
 # ----------------------------------------------------------------------------
 # Userland CPIO — packs all spawnable binaries (init + tester + hello) and
 # gets embedded in taskman.elf via .incbin so taskman can fetch them at
@@ -453,15 +464,19 @@ qsh.elf-build: $(LIBQSOE_A) $(LIBC_A)
 $(QSH_ELF): | qsh.elf-build
 	@true
 
-$(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF) $(QSH_ELF)
-	@mkdir -p $(BUILD)/cpio-root/bin
-	@cp $(INIT_ELF)   $(BUILD)/cpio-root/bin/init.elf
-	@cp $(TESTER_ELF) $(BUILD)/cpio-root/bin/tester.elf
-	@cp $(HELLO_ELF)  $(BUILD)/cpio-root/bin/hello.elf
-	@cp $(DSER_ELF)   $(BUILD)/cpio-root/bin/devc-ser8250.elf
-	@cp $(QSH_ELF)    $(BUILD)/cpio-root/bin/qsh.elf
+$(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF) \
+                  $(QSH_ELF) $(SBIN_PIPE_ELF)
+	@mkdir -p $(BUILD)/cpio-root/bin $(BUILD)/cpio-root/sbin
+	@cp $(INIT_ELF)      $(BUILD)/cpio-root/bin/init.elf
+	@cp $(TESTER_ELF)    $(BUILD)/cpio-root/bin/tester.elf
+	@cp $(HELLO_ELF)     $(BUILD)/cpio-root/bin/hello.elf
+	@cp $(DSER_ELF)      $(BUILD)/cpio-root/bin/devc-ser8250.elf
+	@cp $(QSH_ELF)       $(BUILD)/cpio-root/bin/qsh.elf
+	@cp $(SBIN_PIPE_ELF) $(BUILD)/cpio-root/sbin/pipe.elf
 	@cd $(BUILD)/cpio-root && \
-	    printf '%s\n' bin/init.elf bin/tester.elf bin/hello.elf bin/devc-ser8250.elf bin/qsh.elf | \
+	    printf '%s\n' bin/init.elf bin/tester.elf bin/hello.elf \
+	                  bin/devc-ser8250.elf bin/qsh.elf \
+	                  sbin/pipe.elf | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)

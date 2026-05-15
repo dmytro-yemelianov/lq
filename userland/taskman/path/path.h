@@ -55,7 +55,12 @@ typedef struct {
 int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot);
 
 /* CLOSE: tear down `caller`'s connection at the given slot. */
-int tm_io_close(pid_t caller, seL4_CPtr slot);
+/* Resmgr-side close notification.  Dispatches by badge to the
+ * owning resmgr's per-fd cleanup hook (cpiofs frees its dir-slot
+ * entry; console has no per-fd state).  The cap itself is reclaimed
+ * by a separate TM_REQ_DETACH_CAP call from libc — this function
+ * does NOT touch the connection table or the caller's CSpace. */
+int tm_io_close(pid_t caller, seL4_Word badge);
 
 /* IO_WRITE: serve a write on `caller`'s `slot`.  bytes start at
  * msg[4]; bytecount in mr0.  Returns 0 + writes the bytes actually
@@ -98,6 +103,15 @@ int tm_lseek(pid_t caller, seL4_Word badge, int whence, long offset,
  * pathmgr resolves the path AND (for cpiofs) the file is present.
  * Returns 0 on success, -ENOENT on miss. */
 int tm_access(pid_t caller, unsigned path_len);
+
+/* PIPE_CREATE: mint two badged Send caps on /sbin/pipe's channel
+ * into the caller's CSpace — one read end, one write end.  Badge
+ * encoding shared with the pipe manager: bit 0 = direction
+ * (0 = read, 1 = write); bits 1.. = monotonically-allocated unique
+ * pipe id.  The pipe manager lazy-allocates a pool slot on first
+ * IO using the unique id. */
+int tm_pipe_create(pid_t caller, seL4_CPtr *out_read_slot,
+                   seL4_CPtr *out_write_slot);
 
 /* READDIR: fetch one directory entry from the connection at `badge`.
  *
