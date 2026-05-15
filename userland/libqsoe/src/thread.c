@@ -19,7 +19,7 @@
  * up to 14 pages (= 56 KiB) per the slot layout.
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../include/qsoe/slots.h"
 #include "../include/qsoe/wire.h"
 #include "state.h"

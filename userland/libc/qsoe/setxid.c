@@ -21,7 +21,7 @@
 
 #include <unistd.h>
 #include <sys/syscall.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <sel4_types.h>

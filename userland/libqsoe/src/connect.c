@@ -5,7 +5,7 @@
  * Standalone       : seL4_Call to taskman via QSOE_CAP_TASKMAN_EP.
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../include/qsoe/slots.h"
 #include "../include/qsoe/wire.h"
 #include "state.h"

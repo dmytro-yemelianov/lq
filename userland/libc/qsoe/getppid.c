@@ -8,7 +8,7 @@
  */
 
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 pid_t getppid(void)
 {

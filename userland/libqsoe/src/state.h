@@ -18,7 +18,7 @@
 #ifndef QSOE_LIBQSOE_STATE_H
 #define QSOE_LIBQSOE_STATE_H
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 
 #define QSOE_MAX_FD_CHANNELS     64
 #define QSOE_MAX_SIDE_CHANNELS   16

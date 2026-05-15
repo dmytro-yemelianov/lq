@@ -4,7 +4,7 @@
 # taskman is QSOE's rootserver: process/path/memory manager, equivalent
 # to QNX's procnto.  It is the very first userland process the seL4
 # kernel starts after boot.  taskman embeds the userland CPIO archive
-# (containing init / tester / hello / devc-ser8250) in its .userland_cpio
+# (containing init / tester / qsh / devc-ser8250 / pipe) in its .userland_cpio
 # section via .incbin, and at runtime serves files from it through the
 # cpiofs handler.
 #
@@ -21,7 +21,7 @@
 # you're running this submake standalone after a clean, build the user
 # ELFs first (`make -C $(TOP) build/userland.cpio`).
 #
-# Copyright (c) 2026 Yuri Zaporozhets <yuriz@gmail.com>
+# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
 # SPDX-License-Identifier: Apache-2.0
 #
 
@@ -67,7 +67,7 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/path/pathmgr.h \
     $(TASKMAN_DIR)/path/cpiofs.h \
     $(TASKMAN_DIR)/sys/console.h \
-    $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+    $(LIBQSOE_DIR)/include/qsoe-system.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
     $(LIBQSOE_DIR)/include/qsoe/wire.h \

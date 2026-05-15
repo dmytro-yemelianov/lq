@@ -1,10 +1,8 @@
 /*
- * hello — entry point.
+ * qsh — entry point.
  *
- * Spawned by another QSOE process via posix_spawn(). The kernel-supplied
- * sp points at the SysV ABI initial-stack image taskman built; see
- * tester/start.S for the layout commentary. crt0 just sets up
- * gp/tp/fp, computes argc/argv/envp into a1/a2/a3, and tail-calls
+ * Standard QSOE crt0: set gp / tp / fp, stage argc/argv/envp into
+ * a1/a2/a3 (a0 already holds pid from the kernel), then call libqsoe's
  * _qsoe_start_main.
  */
 

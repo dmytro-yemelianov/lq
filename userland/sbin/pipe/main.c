@@ -39,7 +39,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 

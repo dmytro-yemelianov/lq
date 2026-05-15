@@ -5,7 +5,7 @@
  */
 
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 gid_t getegid(void)
 {

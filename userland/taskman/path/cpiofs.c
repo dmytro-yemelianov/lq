@@ -6,7 +6,7 @@
 #include "cpiofs.h"
 #include "../sel4_syscalls.h"
 #include "../proc/proc.h"
-#include "../../libqsoe/include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include <cpio/cpio.h>
 
 /* Set at boot from main.c — same CPIO blob taskman uses for spawn. */
@@ -18,6 +18,119 @@ void tm_cpiofs_set_cpio(const void *start, unsigned long len)
 {
     s_cpio_start = start;
     s_cpio_len   = len;
+}
+
+/* Walk the CPIO manually, looking for `name`.  On match, returns the
+ * entry's data pointer, file size, and POSIX mode.  Returns -1 if not
+ * found.  We need this (instead of relying on cpio_get_file) because
+ * libcpio doesn't expose the mode field — and we need the S_IFLNK bit
+ * to distinguish symlinks. */
+#define TM_CPIO_ALIGN_UP(n, a)  (((unsigned long)(n) + (a) - 1) & ~((unsigned long)(a) - 1))
+
+static unsigned long tm_cpio_hex8(const char *p)
+{
+    unsigned long v = 0;
+    for (int i = 0; i < 8; ++i) {
+        char c = p[i];
+        v <<= 4;
+        if      (c >= '0' && c <= '9') v |= (unsigned long)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (unsigned long)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (unsigned long)(c - 'A' + 10);
+    }
+    return v;
+}
+
+static int tm_cpio_scan(const char *name,
+                        const void **out_data,
+                        unsigned long *out_size,
+                        unsigned long *out_mode)
+{
+    if (!s_cpio_start) return -1;
+    const char *p   = (const char *)s_cpio_start;
+    const char *end = p + s_cpio_len;
+    while ((unsigned long)(end - p) >= sizeof(struct cpio_header)) {
+        const struct cpio_header *h = (const struct cpio_header *)p;
+        if (h->c_magic[0] != '0' || h->c_magic[1] != '7' ||
+            h->c_magic[2] != '0' || h->c_magic[3] != '7' ||
+            h->c_magic[4] != '0' || h->c_magic[5] != '1') return -1;
+        unsigned long mode     = tm_cpio_hex8(h->c_mode);
+        unsigned long filesize = tm_cpio_hex8(h->c_filesize);
+        unsigned long namesize = tm_cpio_hex8(h->c_namesize);
+        const char *fname = p + sizeof(struct cpio_header);
+        /* TRAILER!!! marks EOF. */
+        if (namesize >= 11 &&
+            fname[0] == 'T' && fname[1] == 'R' && fname[2] == 'A' &&
+            fname[3] == 'I' && fname[4] == 'L' && fname[5] == 'E' &&
+            fname[6] == 'R' && fname[7] == '!') return -1;
+        const char *data = (const char *)TM_CPIO_ALIGN_UP(
+            (unsigned long)(fname + namesize), 4);
+        const char *next = (const char *)TM_CPIO_ALIGN_UP(
+            (unsigned long)(data + filesize), 4);
+        if (next > end) return -1;
+        /* Compare names (both NUL-terminated since CPIO namesize
+         * includes the trailing NUL). */
+        int match = 1;
+        for (unsigned long i = 0; ; ++i) {
+            char a = (i < namesize) ? fname[i] : 0;
+            char b = name[i];
+            if (a != b) { match = 0; break; }
+            if (a == 0) break;
+        }
+        if (match) {
+            *out_data = data;
+            *out_size = filesize;
+            *out_mode = mode;
+            return 0;
+        }
+        p = next;
+    }
+    return -1;
+}
+
+const void *tm_cpio_lookup(const char *name, unsigned long *out_size)
+{
+    const void   *data;
+    unsigned long size;
+    unsigned long mode;
+    if (tm_cpio_scan(name, &data, &size, &mode) != 0) return 0;
+
+    /* Regular file (or anything not S_IFLNK) — return as-is. */
+    if ((mode & 0170000UL) != 0120000UL) {
+        if (out_size) *out_size = size;
+        return data;
+    }
+
+    /* S_IFLNK: data is the target string, `size` bytes, no NUL. */
+    char resolved[128];
+    if (size == 0 || size >= sizeof resolved) return 0;
+    const char *tgt = (const char *)data;
+    unsigned long t = 0;
+    if (tgt[0] == '/') {
+        /* Absolute: strip leading '/'. */
+        for (unsigned long i = 1; i < size; ++i) {
+            if (t >= sizeof resolved - 1) return 0;
+            resolved[t++] = tgt[i];
+        }
+    } else {
+        /* Relative: join with link's parent directory. */
+        int last_slash = -1;
+        for (int i = 0; name[i]; ++i) if (name[i] == '/') last_slash = i;
+        for (int i = 0; i <= last_slash; ++i) {
+            if (t >= sizeof resolved - 1) return 0;
+            resolved[t++] = name[i];
+        }
+        for (unsigned long i = 0; i < size; ++i) {
+            if (t >= sizeof resolved - 1) return 0;
+            resolved[t++] = tgt[i];
+        }
+    }
+    resolved[t] = 0;
+
+    /* Re-lookup; chained symlinks not supported in v0.7. */
+    if (tm_cpio_scan(resolved, &data, &size, &mode) != 0) return 0;
+    if ((mode & 0170000UL) == 0120000UL) return 0;
+    if (out_size) *out_size = size;
+    return data;
 }
 
 /* Per-directory iterator state.  Allocated on opendir, freed on the
@@ -98,9 +211,10 @@ int tm_cpiofs_open(const char *open_path, unsigned consumed,
         return tm_connection_set_ctx(badge, 0, (unsigned long)idx);
     }
 
-    /* Regular file path. */
+    /* Regular file path.  tm_cpio_lookup resolves one level of
+     * symlinks so e.g. open("/bin/sh") finds bin/qsh. */
     unsigned long size = 0;
-    const void *data = cpio_get_file(s_cpio_start, s_cpio_len, name, &size);
+    const void *data = tm_cpio_lookup(name, &size);
     if (data) {
         if (size > 0xFFFFFFFFul) return -EFBIG;
         unsigned long packed = ((unsigned long)size) << 32;
@@ -208,7 +322,11 @@ int tm_cpiofs_stat(seL4_Word badge, tm_stat_t *out)
 
     out->st_dev     = 1;             /* synthetic dev for cpiofs */
     out->st_ino     = data_addr;     /* CPIO data ptr is a stable id */
-    out->st_mode    = TM_S_IFREG | 0444;  /* read-only regular file */
+    /* 0555 — readable + executable; cpiofs is read-only so no write
+     * bits.  Exec bits matter for qsh/POSIX exec-eligibility checks
+     * (search_access compares stat's S_IXUSR before allowing exec).
+     * Per-entry CPIO mode bits land later. */
+    out->st_mode    = TM_S_IFREG | 0555;
     out->st_nlink   = 1;
     out->st_uid     = 0;
     out->st_gid     = 0;
@@ -223,7 +341,7 @@ int tm_cpiofs_probe(const char *name)
     if (!s_cpio_start) return -ENOENT;
     if (!name || *name == 0) return -ENOENT;
     unsigned long size = 0;
-    const void *data = cpio_get_file(s_cpio_start, s_cpio_len, name, &size);
+    const void *data = tm_cpio_lookup(name, &size);
     return data ? 0 : -ENOENT;
 }
 

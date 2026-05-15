@@ -14,7 +14,7 @@
 #define QSOE_TASKMAN_PATH_H
 
 #include "../sel4_types.h"
-#include "../../libqsoe/include/qsoe/qrv.h"
+#include <qsoe-system.h>
 
 /* POSIX `struct stat` byte-for-byte for RISC-V64 musl.  Built into the
  * fstat reply payload at msg[4..]; libc/qsoe's fstat.c copies the

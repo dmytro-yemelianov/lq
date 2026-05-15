@@ -9,7 +9,7 @@
  *
  * On non-MCS seL4 the reply capability is per-thread (tcbCaller slot),
  * not per-message, so MsgReply takes the rcvid only for QNX API
- * compatibility — internally it's the implicit reply cap. See qrv.h
+ * compatibility — internally it's the implicit reply cap. See <qsoe-system.h>
  * for the caveat.
  *
  * Byte ↔ word marshalling: we treat the IPC buffer's msg[] array as
@@ -19,7 +19,7 @@
  * into msg[0..3] so unpack_bytes can find them.
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../include/qsoe/slots.h"
 #include "../include/qsoe/wire.h"
 #include "state.h"
@@ -177,6 +177,7 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
                 info->dstmsglen = bytes;
                 info->priority  = 0;
                 info->flags     = QSOE_MI_PULSE;
+                info->label     = 0;
             }
             return 0;
         }
@@ -205,6 +206,7 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
         info->dstmsglen = bytes;
         info->priority  = 0;
         info->flags     = 0;
+        info->label     = (unsigned)seL4_MessageInfo_get_label(tag);
     }
 
     /* rcvid: in QNX it's a token identifying this specific receive.
@@ -215,9 +217,26 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
     return (int)badge;
 }
 
+int MsgSavereply(int rcvid)
+{
+    /* Already saved — caller is double-saving; just hand the same
+     * stable rcvid back. */
+    if ((unsigned)rcvid & QSOE_RCVID_SAVED) return rcvid;
+
+    unsigned long slot = qsoe_state_alloc_empty_slot();
+    if (!slot) { qsoe_errno = EAGAIN; return -1; }
+    seL4_Word err = qsoe_cnode_save_caller(QSOE_CAP_CNODE_SELF, slot,
+                                            QSOE_CAP_CNODE_DEPTH);
+    if (err) {
+        qsoe_state_free_empty_slot(slot);
+        qsoe_errno = (int)err;
+        return -1;
+    }
+    return (int)(QSOE_RCVID_SAVED | (unsigned)slot);
+}
+
 int MsgReply(int rcvid, int status, const void *msg, int bytes)
 {
-    (void)rcvid;  /* non-MCS: implicit reply cap, not addressed by rcvid */
     qsoe_cancel_point();
     if (bytes < 0) { qsoe_errno = EINVAL; return -1; }
 
@@ -229,7 +248,17 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes)
 
     seL4_MessageInfo_t tag = seL4_MessageInfo_new((unsigned)status,
                                                    0, 0, nwords);
-    qsoe_sys_reply(tag, mr0, mr1, mr2, mr3);
+    if ((unsigned)rcvid & QSOE_RCVID_SAVED) {
+        /* Deferred reply via SaveCaller'd slot: Send on the slot and
+         * recycle it.  The kernel auto-clears the slot when the Send
+         * consumes the reply cap on non-MCS. */
+        unsigned long slot = (unsigned long)((unsigned)rcvid & ~QSOE_RCVID_SAVED);
+        qsoe_sys_send((seL4_CPtr)slot, tag, mr0, mr1, mr2, mr3);
+        qsoe_state_free_empty_slot(slot);
+    } else {
+        /* Normal reply via the implicit per-thread reply cap. */
+        qsoe_sys_reply(tag, mr0, mr1, mr2, mr3);
+    }
     return 0;
 }
 

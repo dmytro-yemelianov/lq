@@ -12,7 +12,7 @@
  */
 
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 long sysconf(int name)
 {

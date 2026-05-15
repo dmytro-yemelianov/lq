@@ -10,7 +10,7 @@
  * primitives that don't have POSIX names.
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../include/qsoe/slots.h"
 #include "../include/qsoe/wire.h"
 #include "state.h"
@@ -67,5 +67,29 @@ int qsoe_pathmgr_repath(const char *path, pid_t new_pid,
                                               &mr0, &mr1, &mr2, &mr3);
     seL4_Word err = seL4_MessageInfo_get_label(reply);
     if (err != 0) { qsoe_errno = (int)err; return -1; }
+    return 0;
+}
+
+int qsoe_pathmgr_resolve(const char *path, pid_t *out_pid,
+                         int *out_chid, unsigned *out_kind)
+{
+    if (!path) { qsoe_errno = EINVAL; return -1; }
+    unsigned plen = io_strlen(path);
+    if (plen == 0 || plen >= 128) { qsoe_errno = EINVAL; return -1; }
+
+    unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+    for (unsigned i = 0; i < plen; ++i) dst[i] = (unsigned char)path[i];
+
+    seL4_Word mr0 = plen, mr1 = 0, mr2 = 0, mr3 = 0;
+    unsigned nwords = 4 + (plen + 7) / 8;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_PATHMGR_RESOLVE,
+                                                   0, 0, nwords);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    if (out_pid)  *out_pid  = (pid_t)mr0;
+    if (out_chid) *out_chid = (int)mr1;
+    if (out_kind) *out_kind = (unsigned)mr2;
     return 0;
 }

@@ -16,7 +16,7 @@
  * minted into QSOE_CAP_STDIN/OUT/ERR_CONNECT at process creation.
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../include/qsoe/slots.h"
 #include "state.h"
 

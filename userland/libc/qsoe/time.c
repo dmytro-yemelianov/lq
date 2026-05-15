@@ -7,7 +7,7 @@
  */
 
 #include <time.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 time_t time(time_t *tloc)
 {

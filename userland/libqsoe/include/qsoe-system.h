@@ -1,14 +1,20 @@
 /*
- * <qsoe/qrv.h> — QNX-compatible IPC API (libqsoe public surface).
+ * <qsoe-system.h> — QSOE userland system API (libqsoe public surface).
  *
- * v0.3.3: + side-channel coid/chid namespace + SYSMGR_*
- *         + ConnectServerInfo / ConnectClientInfo / ConnectFlags.
+ * Analogous to QNX's <sys/neutrino.h>: one include gives you the full
+ * QNX-shape IPC surface plus QSOE-native extensions — channels, con-
+ * nections, messages, threads, processes, file IO, mmap, timers,
+ * signals, pathmgr, and line discipline.
  *
  * All entrypoints return -1 on failure and set qsoe_errno to a QNX-
  * compatible value.
+ *
+ * History: replaces qsoe/qrv.h from v0.3.x — same surface, single
+ * top-level header.  Slots / wire / tls headers remain separate for
+ * now and may fold in later.
  */
-#ifndef QSOE_QRV_H
-#define QSOE_QRV_H
+#ifndef QSOE_SYSTEM_H
+#define QSOE_SYSTEM_H
 
 #include <qsoe/tls.h>   /* qsoe_errno, qsoe_self_pid, qsoe_ipcbuf, pid_t */
 
@@ -57,6 +63,7 @@ typedef unsigned int  gid_t;
 #define EINTR           4
 #define EIO             5
 #define E2BIG           7
+#define ENOEXEC         8
 #define EBADF           9
 #define ECHILD         10
 #define EAGAIN         11
@@ -112,7 +119,8 @@ struct _msg_info {
     int      srcmsglen; /* same as msglen until v0.4 */
     int      dstmsglen; /* requested receive size */
     int      priority;  /* (unused; v0.4) */
-    int      flags;     /* (unused; v0.4) */
+    int      flags;     /* QSOE_MI_PULSE if wake came from a pulse */
+    unsigned label;     /* QSOE-extension: TM_REQ_* / wire-protocol tag */
 };
 
 /* QNX uses `_server_info` and `_msg_info` interchangeably; the former
@@ -140,6 +148,25 @@ int MsgSend(int coid, const void *smsg, int sbytes,
             void *rmsg, int rbytes);
 int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info);
 int MsgReply(int rcvid, int status, const void *msg, int bytes);
+
+/* Save the implicit reply cap so the reply can be deferred across
+ * subsequent MsgReceive calls.  Returns a stable rcvid with the
+ * QSOE_RCVID_SAVED bit set; pass that to MsgReply when the deferred
+ * work completes.  Returns -1 / qsoe_errno=EAGAIN if the per-thread
+ * save-slot pool is exhausted.  Used by resmgrs that park clients —
+ * a pipe with an empty buffer, a UART driver waiting on RX, etc.
+ *
+ * GOTCHA: QSOE_RCVID_SAVED is bit 31 of `int`, i.e. the sign bit.  A
+ * SUCCESSFUL save returns a NEGATIVE signed integer (the SAVED bit
+ * is set on success).  Callers MUST check for failure with
+ *
+ *      if (saved == -1) { ... handle EAGAIN ... }
+ *
+ * and NEVER with `if (saved < 0)` — that would treat every successful
+ * park as a failure.  This is documented because we already got bitten
+ * by it once in the devc-ser8250 rework. */
+#define QSOE_RCVID_SAVED  0x80000000
+int MsgSavereply(int rcvid);
 
 /*
  * Pulses (v0.4.2). Async fixed-size messages: 8-bit signed code
@@ -333,9 +360,7 @@ int ThreadCtl(int cmd, void *data);
  *     _exit() goes directly to ProcessTerminate(0, status).
  */
 int  ProcessCreate(const char *path);
-int  posix_spawn(pid_t *pid_out, const char *path,
-                 const void *file_actions, const void *attr,
-                 char *const argv[], char *const envp[]);
+/* posix_spawn is declared by <spawn.h>; libqsoe.a provides the symbol. */
 
 /* POSIX IO entry points (open / close / read / write / writev) now
  * live in userland/libc/qsoe/ and are resolved through libc.a — no
@@ -374,6 +399,37 @@ int  waitpid(pid_t pid, int *status, int options);
 int qsoe_pathmgr_register(const char *path, int chid);
 int qsoe_pathmgr_repath  (const char *path, pid_t new_pid,
                           int new_chid, unsigned handler_kind);
+/* Longest-prefix resolve.  On success, fills *out_pid / *out_chid /
+ * *out_kind with the server binding at the deepest matching prefix.
+ * Returns 0; sets qsoe_errno+returns -1 on miss. */
+int qsoe_pathmgr_resolve (const char *path, pid_t *out_pid,
+                          int *out_chid, unsigned *out_kind);
+
+/* ---------------------------------------------------------------------
+ * Interrupt-handling surface (drivers only).
+ * ---------------------------------------------------------------------
+ *
+ * QSOE userland drivers attach an IRQHandler cap to a Notification at
+ * boot, then a dedicated IRQ thread blocks in qsoe_irq_wait().  The
+ * kernel signals the Notification on each rising edge of the device's
+ * PLIC line; the thread drains the device, qsoe_irq_ack()s the handler
+ * to re-arm, and loops.  spawn.c pre-mints the IRQHandler and the
+ * Notification into well-known caller slots (QSOE_CAP_IRQ_HANDLER /
+ * QSOE_CAP_IRQ_NTFN) per driver, so resmgrs only ever see slot ids,
+ * never raw seL4 surface.
+ */
+
+/* Attach `ntfn` to `handler` so that subsequent device IRQs signal
+ * the notification.  Returns 0 on success, -1 / qsoe_errno on failure. */
+int qsoe_irq_set_notification(int handler, int ntfn);
+
+/* Block on the IRQ Notification until the kernel signals it.  Used
+ * by interrupt-thread loops; returns when an edge has been delivered.
+ * Returns 0 always (the wait itself has no failure mode). */
+int qsoe_irq_wait(int ntfn);
+
+/* Tell the kernel the IRQ has been serviced and re-arm `handler`. */
+int qsoe_irq_ack(int handler);
 
 /*
  * libqsoe init hook. Each spawned process calls this exactly once at
@@ -385,4 +441,78 @@ int qsoe_pathmgr_repath  (const char *path, pid_t new_pid,
  */
 void qsoe_libqsoe_init(void *ipcbuf, pid_t self_pid);
 
-#endif /* QSOE_QRV_H */
+/* ---------------------------------------------------------------------
+ * Line discipline (LDISC) — shared between getty / login / qsh.
+ * ---------------------------------------------------------------------
+ *
+ * Slim cooked-mode helper around a byte-stream fd (typically a UART
+ * driver registered at /dev/console or /dev/ser*).  Per-instance handle,
+ * caller owns the fd.  Intentionally NOT a POSIX termios shim — that
+ * lives at a higher layer and lands in v0.8.
+ *
+ * Backspace accepts both 0x08 (BS) and 0x7F (DEL) regardless of
+ * `verase`.  Echo emits "\b \b" on erase if `echoe` is set, plain "\b"
+ * if only `echo` is set, nothing otherwise.  In canonical mode the
+ * line buffer is filled until a newline arrives, then the whole line
+ * (including the trailing '\n') is returned.  In raw mode each byte
+ * is passed through verbatim.
+ *
+ * VINTR (default ^C) aborts an in-flight readline with errno=EINTR
+ * when `isig` is set.  Real signal delivery (POSIX SIGINT to the
+ * process group) is additive in v0.8.
+ */
+
+typedef struct {
+    unsigned icanon:1;   /* canonical / cooked mode                 */
+    unsigned echo  :1;   /* echo typed chars                        */
+    unsigned echoe :1;   /* echo erase as "\b \b" instead of "\b"   */
+    unsigned isig  :1;   /* VINTR / VQUIT abort readline (EINTR)    */
+    unsigned icrnl :1;   /* translate input CR to NL                */
+    unsigned opost :1;   /* perform output processing               */
+    unsigned onlcr :1;   /* translate output NL to CR-NL            */
+    unsigned char vintr;  /* default 0x03 (^C) */
+    unsigned char verase; /* default 0x7F (DEL) — 0x08 (BS) also accepted */
+    unsigned char vkill;  /* default 0x15 (^U) — erase to start of line */
+    unsigned char veof;   /* default 0x04 (^D) — end-of-file marker */
+} qsoe_ldisc_attr_t;
+
+/* Opaque handle. */
+typedef struct qsoe_ldisc qsoe_ldisc_t;
+
+/* Open a handle that reads typed bytes from `fd_in` and writes echo /
+ * erase / line-feed visuals to `fd_out`.  Pass the same fd for both
+ * if the underlying device is bidirectional and you genuinely want
+ * one descriptor (rare — terminals in QSOE keep stdin and stdout
+ * separate, so the typical call is `qsoe_ldisc_open(0, 1, NULL)`).
+ * If `attr` is NULL, defaults are used (canonical, echo, echoe, isig,
+ * icrnl, opost, onlcr; VINTR=^C, VERASE=DEL, VKILL=^U, VEOF=^D).
+ * Returns NULL on alloc failure.  Does NOT take ownership of either fd. */
+qsoe_ldisc_t *qsoe_ldisc_open(int fd_in, int fd_out,
+                              const qsoe_ldisc_attr_t *attr);
+
+/* Tear the handle down.  Caller still owns `fd`; ldisc_close does
+ * NOT close it. */
+void qsoe_ldisc_close(qsoe_ldisc_t *ld);
+
+/* Read / write attributes. */
+int qsoe_ldisc_get(qsoe_ldisc_t *ld, qsoe_ldisc_attr_t *out);
+int qsoe_ldisc_set(qsoe_ldisc_t *ld, const qsoe_ldisc_attr_t *in);
+
+/* Convenience: switch the whole flag set between cooked and raw. */
+int qsoe_ldisc_set_cooked(qsoe_ldisc_t *ld);
+int qsoe_ldisc_set_raw   (qsoe_ldisc_t *ld);
+
+/* Read one cooked-mode line into `buf` (terminated by '\n', count
+ * includes the '\n').  Returns the byte count; 0 on EOF (VEOF on an
+ * empty line); -1 with qsoe_errno=EINTR if isig+VINTR fires. */
+long qsoe_ldisc_readline(qsoe_ldisc_t *ld, char *buf, unsigned long cap);
+
+/* Read one byte (no editing, no echo).  Returns 1 on success,
+ * 0 on EOF, -1 on error. */
+long qsoe_ldisc_readbyte(qsoe_ldisc_t *ld, unsigned char *c);
+
+/* Write `n` bytes through the handle.  If opost+onlcr are set, '\n'
+ * is expanded to "\r\n" before transmission. */
+long qsoe_ldisc_write(qsoe_ldisc_t *ld, const void *buf, unsigned long n);
+
+#endif /* QSOE_SYSTEM_H */

@@ -1,9 +1,8 @@
 /*
- * init — entry point.
+ * userland/sbin/repath — entry point.
  *
- * Same crt0 shape as hello/tester; the standard QSOE convention is to
- * land in libqsoe's _qsoe_start_main after gp/tp setup and argc/argv/
- * envp register staging.
+ * Standard QSOE crt0: set gp / tp / fp, stage argc / argv / envp
+ * into a1 / a2 / a3, then jump to libqsoe's _qsoe_start_main.
  */
 
 .section .text.start
@@ -18,7 +17,6 @@ _start:
 
     li fp, 0
 
-    /* a0 = pid (preserved). Stage argc/argv/envp into a1/a2/a3. */
     ld   a1, 0(sp)
     addi a2, sp, 8
     addi t0, a1, 1

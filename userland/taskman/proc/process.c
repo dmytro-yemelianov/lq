@@ -13,6 +13,7 @@
 #include "spawn.h"
 #include "../mem/mem.h"   /* QSOE_MMAP_BASE */
 #include "../qsoe_invoke.h"
+#include "../path/cpiofs.h"  /* tm_cpio_lookup */
 #include "../../libqsoe/include/qsoe/slots.h"
 #include <cpio/cpio.h>
 
@@ -61,6 +62,9 @@ void tm_set_userland_cpio(const void *start, unsigned long len)
     s_cpio_len   = len;
 }
 
+const void *tm_get_userland_cpio_start(void) { return s_cpio_start; }
+unsigned long tm_get_userland_cpio_len(void)   { return s_cpio_len; }
+
 void tm_set_primary_ep(seL4_CPtr ep)
 {
     s_primary_ep = ep;
@@ -74,23 +78,51 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
     if (path_len == 0 || path_len >= 60) return -EINVAL;
     if (!s_cpio_start || !s_primary_ep) return -EINVAL;
 
-    /* v0.6.0: prepend "bin/" so the lookup matches the new CPIO
-     * layout.  The wire protocol still has callers pass the bare
-     * name ("hello.elf"); taskman canonicalises here. */
+    /* Two lookup strategies:
+     *   1. Absolute path ("/sbin/devc-ser8250"): strip leading '/' and
+     *      look up directly via cpiofs (handles symlinks too).
+     *   2. Bare name ("qsh"): try "bin/<name>" first, then
+     *      "sbin/<name>" — a minimal PATH search until the libc gains
+     *      proper PATH-based execvp.  Lets init.sh write
+     *      `devc-ser8250 &` instead of always typing the full path. */
     char name[64];
-    name[0] = 'b'; name[1] = 'i'; name[2] = 'n'; name[3] = '/';
-    for (unsigned i = 0; i < path_len; ++i) name[4 + i] = path[i];
-    name[4 + path_len] = 0;
-
     unsigned long elf_size = 0;
-    const void *elf = cpio_get_file(s_cpio_start, s_cpio_len, name, &elf_size);
+    const void *elf = 0;
+
+    if (path[0] == '/') {
+        if (path_len < 2 || path_len > sizeof name) return -EINVAL;
+        for (unsigned i = 1; i < path_len; ++i) name[i - 1] = path[i];
+        name[path_len - 1] = 0;
+        elf = tm_cpio_lookup(name, &elf_size);
+    } else {
+        /* Try bin/ then sbin/. */
+        static const char *prefixes[] = { "bin/", "sbin/" };
+        static const unsigned prefix_lens[] = { 4, 5 };
+        for (int pi = 0; pi < 2 && !elf; ++pi) {
+            if (prefix_lens[pi] + path_len + 1 > sizeof name) return -EINVAL;
+            for (unsigned i = 0; i < prefix_lens[pi]; ++i) {
+                name[i] = prefixes[pi][i];
+            }
+            for (unsigned i = 0; i < path_len; ++i) {
+                name[prefix_lens[pi] + i] = path[i];
+            }
+            name[prefix_lens[pi] + path_len] = 0;
+            elf = tm_cpio_lookup(name, &elf_size);
+        }
+    }
     if (!elf) return -ENOENT;
 
     pid_t new_pid = tm_pid_alloc();
     if (!new_pid) return -ENOMEM;
 
+    /* elf_name passed to tm_spawn is the basename — that's what
+     * spawn_name_eq cares about, and shebang code uses it for the
+     * synthesised script_path argument. */
+    const char *basename = name;
+    for (const char *p = name; *p; ++p) if (*p == '/') basename = p + 1;
+
     int sr = tm_spawn(elf, elf_size, new_pid, s_primary_ep,
-                       argc, argv, envc, envp, &name[4]);
+                       argc, argv, envc, envp, basename);
     if (sr) {
         tm_pid_free(new_pid);
         return sr;
@@ -382,6 +414,16 @@ int tm_dup_cap(pid_t caller_pid, seL4_CPtr src_slot, seL4_CPtr dest_slot)
                         p->cnode, src_slot, depth,
                         QSOE_RIGHTS_ALL) != 0) {
         return -EBADF;
+    }
+    /* Mirror the cap copy in the connection registry so each fd has
+     * an independent row.  Without this, the dup'd fd would share a
+     * single registry row with the source fd, and closing the source
+     * (TM_REQ_DETACH_CAP) would drop the row out from under the
+     * surviving fd — reads then fail EBADF. */
+    int crc = tm_connection_clone_for_dup(caller_pid, src_slot, dest_slot);
+    if (crc != 0) {
+        (void)qsoe_cnode_delete(p->cnode, dest_slot, depth);
+        return crc;
     }
     return 0;
 }

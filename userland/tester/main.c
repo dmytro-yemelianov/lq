@@ -12,7 +12,7 @@
 #include "../taskman/sel4_syscalls.h"
 #include "../taskman/sel4_types.h"
 #include "../taskman/qsoe_invoke.h"
-#include "../libqsoe/include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
 
@@ -91,31 +91,6 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
-    /* --- 0b. v0.6.0 cpiofs demo: open /bin/hello.elf, read 64 bytes,
-     *         print the ELF magic to prove the path went through the
-     *         path manager, cpiofs registered at "/", and the per-fd
-     *         offset state in tm_connection_t.ctx[]. --- */
-    {
-        int fd = open("/bin/hello.elf", 0);
-        sel4_debug_puts("[tester] open(/bin/hello.elf) -> fd=");
-        putd(fd);
-        sel4_debug_putchar('\n');
-        if (fd >= 0) {
-            unsigned char hdr[64];
-            long n = read(fd, hdr, sizeof hdr);
-            sel4_debug_puts("[tester] read(fd, 64) -> ");
-            putd((int)n);
-            sel4_debug_puts(" bytes, magic=");
-            for (int i = 0; i < 4 && i < n; ++i) {
-                static const char hex[] = "0123456789abcdef";
-                sel4_debug_putchar(hex[(hdr[i] >> 4) & 0xf]);
-                sel4_debug_putchar(hex[hdr[i] & 0xf]);
-                sel4_debug_putchar(' ');
-            }
-            sel4_debug_putchar('\n');
-            close(fd);
-        }
-    }
 
     /* --- 1. Round-trip on SYSMGR_COID (no ConnectAttach needed) --- */
     for (int i = 1; i <= 3; ++i) {
@@ -327,71 +302,6 @@ int main(int argc, char **argv, char **envp)
 
         ConnectDetach(pulse_coid);
         ChannelDestroy(pulse_chid);
-    }
-
-    /* --- 7b. posix_spawn hello.elf as a tiny IPC server (v0.4.3).
-     *         hello now does ChannelCreate + MsgReceive+Reply loop.
-     *         We ConnectAttach to hello's chid=1 with retry (it may
-     *         not have created the channel yet — yields let it run);
-     *         then MsgSend 3 round-trips. ConnectServerInfo confirms
-     *         the server identity (pid != taskman). --- */
-    {
-        pid_t hpid = 0;
-        /* v0.4.4: pass argv/envp; hello prints them at startup. */
-        char *hargv[] = { "hello", "world", 0 };
-        char *henvp[] = { "FOO=bar", "QSOE_VER=0.4.4", 0 };
-        int rc = posix_spawn(&hpid, "hello.elf", 0, 0, hargv, henvp);
-        sel4_debug_puts("[tester] posix_spawn(hello.elf) -> rc=");
-        putd(rc);
-        sel4_debug_puts(" pid=");
-        putd((int)hpid);
-        sel4_debug_putchar('\n');
-
-        if (rc == 0) {
-            /* Give hello a few ticks to reach ChannelCreate. */
-            for (int i = 0; i < 4; ++i) qsoe_sys_yield();
-
-            int hcoid = -1;
-            for (int try = 0; try < 8 && hcoid < 0; ++try) {
-                hcoid = ConnectAttach(ND_LOCAL_NODE, hpid, /*chid=*/1, 0, 0);
-                if (hcoid < 0) qsoe_sys_yield();
-            }
-            sel4_debug_puts("[tester] ConnectAttach(hello) -> coid=");
-            putd(hcoid);
-            sel4_debug_putchar('\n');
-
-            if (hcoid >= 0) {
-                /* Introspect: confirm we're really connected to hello. */
-                struct _server_info si;
-                int sirc = ConnectServerInfo(0, hcoid, &si);
-                sel4_debug_puts("[tester] hello ConnectServerInfo: rc=");
-                putd(sirc);
-                sel4_debug_puts(" pid=");
-                putd((int)si.pid);
-                sel4_debug_puts(" chid=");
-                putd(si.chid);
-                sel4_debug_putchar('\n');
-
-                for (int i = 0; i < 3; ++i) {
-                    unsigned long payload = 1000UL + (unsigned long)i;
-                    unsigned long reply = 0;
-                    int mr = MsgSend(hcoid, &payload, sizeof payload,
-                                      &reply, sizeof reply);
-                    sel4_debug_puts("[tester] MsgSend(hello, ");
-                    putd((int)payload);
-                    sel4_debug_puts(") rc=");
-                    putd(mr);
-                    sel4_debug_puts(" reply=");
-                    putd((int)reply);
-                    sel4_debug_putchar('\n');
-                }
-
-                ConnectDetach(hcoid);
-            }
-
-            /* Yield until hello finishes its loop and exits. */
-            for (int i = 0; i < 8; ++i) qsoe_sys_yield();
-        }
     }
 
     /* --- 8. Cap-leak smoke test. With taskman's slot free-list, the

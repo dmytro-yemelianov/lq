@@ -68,10 +68,10 @@ KERNEL_ELF  := $(BUILD)/kernel.elf
 IMAGE         := $(BUILD)/qsoe.elf
 TASKMAN_ELF   := $(BUILD)/taskman.elf
 TESTER_ELF    := $(BUILD)/tester.elf
-HELLO_ELF     := $(BUILD)/hello.elf
-INIT_ELF      := $(BUILD)/init.elf
+INIT_SH       := $(TOP)/userland/init/init.sh
 DSER_ELF      := $(BUILD)/devc-ser8250.elf
 SBIN_PIPE_ELF := $(BUILD)/sbin-pipe.elf
+SBIN_REPATH_ELF := $(BUILD)/sbin-repath.elf
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
 # ----------------------------------------------------------------------------
@@ -247,7 +247,7 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/path/cpiofs.h \
     $(TASKMAN_DIR)/sys/console.h \
     $(TASKMAN_DIR)/sys/platform.h \
-    $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+    $(LIBQSOE_DIR)/include/qsoe-system.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
     $(LIBQSOE_DIR)/include/qsoe/wire.h \
@@ -300,7 +300,7 @@ $(LIBC_A) $(MUSL_GEN_HDRS): | libc
 
 # libqsoe — build delegated to userland/libqsoe/Makefile.  Produces two
 # archives:
-#   $(LIBQSOE_A)    — normal flavour (hello/init/tester/devc-ser8250)
+#   $(LIBQSOE_A)    — normal flavour (init/tester/qsh/devc-ser8250/pipe)
 #   $(LIBQSOE_TM_A) — IN_TASKMAN flavour (taskman links this in)
 LIBQSOE_A    := $(BUILD)/libqsoe.a
 LIBQSOE_TM_A := $(BUILD)/libqsoe-tm.a
@@ -332,7 +332,7 @@ $(TESTBUILD)/start.o: $(TESTER_DIR)/start.S
 
 $(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
                      $(TASKMAN_DIR)/sel4_types.h \
-                     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+                     $(LIBQSOE_DIR)/include/qsoe-system.h \
                      $(LIBQSOE_DIR)/include/qsoe/slots.h
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
@@ -355,72 +355,10 @@ $(TESTER_ELF): $(TESTER_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	    $(LIBC_A)
 
 # ----------------------------------------------------------------------------
-# hello — first non-taskman/non-tester userland program. Spawned by
-# tester via posix_spawn(). Uses the same libqsoe build flags as tester.
+# init — /sbin/init.  In v0.7-rc3 init became a shell script; taskman
+# spawns it as such, the shebang machinery in spawn.c re-dispatches via
+# /bin/sh (symlink to /bin/qsh), and qsh interprets it.  No compile.
 # ----------------------------------------------------------------------------
-
-HELLO_DIR  := $(TOP)/userland/hello
-HELLOBUILD := $(BUILD)/hello
-
-$(HELLOBUILD)/start.o: $(HELLO_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(HELLOBUILD)/main.o: $(HELLO_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) \
-	    -isystem $(MUSL_GEN)/include \
-	    -isystem $(MUSL_DIR)/include \
-	    -isystem $(MUSL_DIR)/arch/riscv64 \
-	    -isystem $(MUSL_DIR)/arch/generic \
-	    -c -o $@ $<
-
-HELLO_OBJS := \
-    $(HELLOBUILD)/start.o \
-    $(HELLOBUILD)/main.o
-
-$(HELLO_ELF): $(HELLO_OBJS) $(LIBQSOE_A) $(LIBC_A)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -static -nostdlib \
-	    -Wl,--build-id=none \
-	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(HELLO_OBJS) \
-	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
-	    $(LIBC_A)
-
-# ----------------------------------------------------------------------------
-# init — /sbin/init (v0.6.1+). Spawned by taskman at boot; orchestrates
-# the rest of userland (resmgrs, getty, etc.). Same build shape as hello.
-# ----------------------------------------------------------------------------
-
-INIT_DIR   := $(TOP)/userland/init
-INITBUILD  := $(BUILD)/init
-
-$(INITBUILD)/start.o: $(INIT_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(INITBUILD)/main.o: $(INIT_DIR)/main.c $(TM_HEADERS) $(MUSL_GEN_HDRS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) \
-	    -isystem $(MUSL_GEN)/include \
-	    -isystem $(MUSL_DIR)/include \
-	    -isystem $(MUSL_DIR)/arch/riscv64 \
-	    -isystem $(MUSL_DIR)/arch/generic \
-	    -c -o $@ $<
-
-INIT_OBJS := \
-    $(INITBUILD)/start.o \
-    $(INITBUILD)/main.o
-
-$(INIT_ELF): $(INIT_OBJS) $(LIBQSOE_A) $(LIBC_A)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -static -nostdlib \
-	    -Wl,--build-id=none \
-	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(INIT_OBJS) \
-	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
-	    $(LIBC_A)
 
 # ----------------------------------------------------------------------------
 # devc-ser8250 — 16550 UART driver / resource manager (v0.6.1+).
@@ -429,10 +367,10 @@ $(INIT_ELF): $(INIT_OBJS) $(LIBQSOE_A) $(LIBC_A)
 # ----------------------------------------------------------------------------
 
 
-# devc-ser8250 — build delegated to userland/devc-ser8250/Makefile.
+# devc-ser8250 — build delegated to userland/dev/ser8250/Makefile.
 .PHONY: devc-ser8250
 devc-ser8250: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/devc-ser8250 all
+	+$(MAKE) -C $(TOP)/userland/dev/ser8250 all
 
 $(DSER_ELF): | devc-ser8250
 	@true
@@ -447,10 +385,19 @@ sbin-pipe: $(LIBQSOE_A) $(LIBC_A)
 $(SBIN_PIPE_ELF): | sbin-pipe
 	@true
 
+# sbin/repath — CLI wrapper for qsoe_pathmgr_repath, used by init.sh
+# to swap /dev/console at boot.
+.PHONY: sbin-repath
+sbin-repath: $(LIBQSOE_A) $(LIBC_A)
+	+$(MAKE) -C $(TOP)/userland/sbin/repath all
+
+$(SBIN_REPATH_ELF): | sbin-repath
+	@true
+
 # ----------------------------------------------------------------------------
-# Userland CPIO — packs all spawnable binaries (init + tester + hello) and
-# gets embedded in taskman.elf via .incbin so taskman can fetch them at
-# runtime through libcpio. See plan §2.
+# Userland CPIO — packs all spawnable binaries (init + tester + qsh +
+# devc-ser8250 + pipe) and gets embedded in taskman.elf via .incbin so
+# taskman can fetch them at runtime through libcpio. See plan §2.
 # ----------------------------------------------------------------------------
 
 
@@ -464,19 +411,20 @@ qsh.elf-build: $(LIBQSOE_A) $(LIBC_A)
 $(QSH_ELF): | qsh.elf-build
 	@true
 
-$(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF) \
-                  $(QSH_ELF) $(SBIN_PIPE_ELF)
+$(USERLAND_CPIO): $(INIT_SH) $(TESTER_ELF) $(DSER_ELF) \
+                  $(QSH_ELF) $(SBIN_PIPE_ELF) $(SBIN_REPATH_ELF)
+	@rm -rf $(BUILD)/cpio-root
 	@mkdir -p $(BUILD)/cpio-root/bin $(BUILD)/cpio-root/sbin
-	@cp $(INIT_ELF)      $(BUILD)/cpio-root/bin/init.elf
-	@cp $(TESTER_ELF)    $(BUILD)/cpio-root/bin/tester.elf
-	@cp $(HELLO_ELF)     $(BUILD)/cpio-root/bin/hello.elf
-	@cp $(DSER_ELF)      $(BUILD)/cpio-root/bin/devc-ser8250.elf
-	@cp $(QSH_ELF)       $(BUILD)/cpio-root/bin/qsh.elf
-	@cp $(SBIN_PIPE_ELF) $(BUILD)/cpio-root/sbin/pipe.elf
+	@install -m 0755 $(INIT_SH) $(BUILD)/cpio-root/sbin/init
+	@cp $(TESTER_ELF)      $(BUILD)/cpio-root/bin/tester
+	@cp $(QSH_ELF)         $(BUILD)/cpio-root/bin/qsh
+	@cp $(DSER_ELF)        $(BUILD)/cpio-root/sbin/devc-ser8250
+	@cp $(SBIN_PIPE_ELF)   $(BUILD)/cpio-root/sbin/pipe
+	@cp $(SBIN_REPATH_ELF) $(BUILD)/cpio-root/sbin/repath
+	@ln -sf qsh $(BUILD)/cpio-root/bin/sh
 	@cd $(BUILD)/cpio-root && \
-	    printf '%s\n' bin/init.elf bin/tester.elf bin/hello.elf \
-	                  bin/devc-ser8250.elf bin/qsh.elf \
-	                  sbin/pipe.elf | \
+	    printf '%s\n' sbin/init bin/tester bin/qsh bin/sh \
+	                  sbin/devc-ser8250 sbin/pipe sbin/repath | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)
@@ -570,73 +518,3 @@ clean:
 
 distclean: clean
 	rm -rf $(SEL4BUILD)
-
-# ----------------------------------------------------------------------------
-# v0.6.2 — qsh compile-attempt (research-only target, not in `all`).
-#
-# Pull QRV's userland/sh source (= mksh, renamed qsh) and try to
-# compile each .c against musl + libqsoe. The goal is the error log,
-# not a working binary. Yuri analyses the output and decides v0.6.x
-# next steps.
-#
-#   make qsh           — pull source if needed + compile each .c
-#                        (build/qsh.log) + attempt partial link to
-#                        capture undefined symbols (build/qsh.symbols.txt)
-#
-# Errors don't abort the loop — each file gets its own .errs sidecar.
-# ----------------------------------------------------------------------------
-
-QSH_DIR    := $(TOP)/userland/qsh
-QSHBUILD   := $(BUILD)/qsh
-QSH_LOG    := $(BUILD)/qsh.log
-QSH_SYMS   := $(BUILD)/qsh.symbols.txt
-
-QSH_CFLAGS := $(TM_CFLAGS) \
-    -isystem $(MUSL_GEN)/include \
-    -isystem $(MUSL_DIR)/include \
-    -isystem $(MUSL_DIR)/arch/riscv64 \
-    -isystem $(MUSL_DIR)/arch/generic \
-    -I$(QSH_DIR)/include \
-    -I$(QSH_DIR)/gen \
-    -Wno-error -w
-
-.PHONY: qsh qsh-pull
-qsh-pull:
-	@if [ ! -f $(QSH_DIR)/main.c ]; then \
-	    echo "==> Pulling qsh source via scripts/pull-qsh.sh..."; \
-	    $(TOP)/scripts/pull-qsh.sh; \
-	fi
-
-qsh: qsh-pull $(MUSL_GEN_HDRS)
-	@mkdir -p $(QSHBUILD)
-	@rm -f $(QSHBUILD)/*.o
-	@echo "==> qsh compile-attempt (errors expected, not aborting on failure)"
-	@echo "# qsh compile-attempt log generated $$(date)" > $(QSH_LOG)
-	@: > $(QSH_SYMS)
-	@for src in $(QSH_DIR)/*.c; do \
-	    base=$$(basename $$src .c); \
-	    echo "" >> $(QSH_LOG); \
-	    echo "===== $$src =====" >> $(QSH_LOG); \
-	    $(CC) $(QSH_CFLAGS) -c -o $(QSHBUILD)/$$base.o $$src \
-	        >> $(QSH_LOG) 2>&1 || \
-	        echo "  (compile failed for $$base.c)" >> $(QSH_LOG); \
-	done
-	@echo "==> compile log: $(QSH_LOG) ($$(grep -cE '(fatal )?error:' $(QSH_LOG)) error lines, $$(grep -c '(compile failed' $(QSH_LOG)) failed files)"
-	@echo "==> capturing per-object undefined-symbol set..."
-	@if ls $(QSHBUILD)/*.o >/dev/null 2>&1; then \
-	    : > $(QSH_SYMS); \
-	    for o in $(QSHBUILD)/*.o; do \
-	        $(CROSS)nm -u $$o | awk '{print $$NF}' >> $(QSH_SYMS).raw; \
-	    done; \
-	    sort -u $(QSH_SYMS).raw > $(QSH_SYMS).objs.txt; \
-	    rm -f $(QSH_SYMS).raw; \
-	    echo "==> per-object undefined set: $(QSH_SYMS).objs.txt ($$(wc -l < $(QSH_SYMS).objs.txt) symbols)"; \
-	    echo "==> attempting link against libc.a to see what's STILL unresolved..."; \
-	    $(CC) $(TM_CFLAGS) -static -nostdlib \
-	        -Wl,--warn-unresolved-symbols \
-	        -o $(QSHBUILD)/qsh.elf.attempt \
-	        $(QSHBUILD)/*.o $(LIBC_A) 2>$(QSH_SYMS) || true; \
-	    echo "==> link-time undefined-after-libc: $(QSH_SYMS) ($$(grep -c 'undefined' $(QSH_SYMS)) warning lines)"; \
-	else \
-	    echo "==> no .o files produced; nothing to link"; \
-	fi

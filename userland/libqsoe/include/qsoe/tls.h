@@ -18,7 +18,7 @@
 #ifndef QSOE_TLS_H
 #define QSOE_TLS_H
 
-typedef int           pid_t;  /* duplicated from qrv.h to keep tls.h standalone */
+typedef int           pid_t;  /* duplicated from <qsoe-system.h> to keep tls.h standalone */
 
 typedef struct qsoe_tcb {
     int        tid;             /* 1 for the main thread of every process */
@@ -80,12 +80,29 @@ static inline void qsoe_spin_unlock(qsoe_spinlock_t *l)
     __atomic_store_n(l, 0, __ATOMIC_RELEASE);
 }
 
+/* QSOE-native shape of the IPC buffer — same layout as seL4_IPCBuffer
+ * but exposed under a QSOE name so resmgrs (devc-ser8250, sbin/pipe,
+ * future fs servers) don't have to pull <sel4_types.h> just to access
+ * ipcbuf->msg[].  Layout is fixed and matches the kernel's view; any
+ * change here would require kernel/userland co-update. */
+#define QSOE_MSG_MAX_LENGTH      120
+#define QSOE_MSG_MAX_EXTRA_CAPS  3
+typedef struct {
+    unsigned long tag;
+    unsigned long msg[QSOE_MSG_MAX_LENGTH];
+    unsigned long userData;
+    unsigned long caps_or_badges[QSOE_MSG_MAX_EXTRA_CAPS];
+    unsigned long receiveCNode;
+    unsigned long receiveIndex;
+    unsigned long receiveDepth;
+} qsoe_ipcbuf_t;
+
 /* Public surface — same names as the v0.3 globals, now macros over tp.
  * qsoe_errno and qsoe_self_pid are lvalues; qsoe_ipcbuf is r-value
  * only (the cast loses lvalue-ness — write through qsoe_curthr()
  * directly on the rare init path that needs it). */
 #define qsoe_errno     (qsoe_curthr()->qerrno)
 #define qsoe_self_pid  (qsoe_curthr()->self_pid)
-#define qsoe_ipcbuf    ((seL4_IPCBuffer *)qsoe_curthr()->ipcbuf)
+#define qsoe_ipcbuf    ((qsoe_ipcbuf_t *)qsoe_curthr()->ipcbuf)
 
 #endif /* QSOE_TLS_H */

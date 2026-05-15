@@ -65,13 +65,12 @@ LIBQSOE_A := $(BUILD)/libqsoe.a
 
 all: $(QSH_ELF)
 
-# Need start.S like the other userland ELFs.  Reuse hello/start.S
-# verbatim — it does the standard QSOE crt0 (clear gp/tp, set up
-# initial stack, jump to _qsoe_start_main).
-$(OBJDIR)/start.o: $(TOP)/userland/hello/start.S | $(OBJDIR)
+# Standard QSOE crt0: clear gp/tp, stage argc/argv/envp, jump to
+# _qsoe_start_main.  Each userland program ships its own start.S.
+$(OBJDIR)/start.o: $(QSH_DIR)/start.S | $(OBJDIR)
 	$(CC) $(ARCH_CFLAGS) -c -o $@ $<
 
-# Link.  Same shape as hello.elf in the top-level Makefile.
+# Link: same shape as the other userland ELFs.
 $(QSH_ELF): $(OBJDIR)/start.o $(OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(ARCH_CFLAGS) -static -nostdlib \

@@ -25,7 +25,7 @@
 #include "sys/console.h"
 #include "sys/platform.h"
 
-#include "../libqsoe/include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
 #include <qsoe/sys_version.h>
@@ -515,6 +515,26 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
 
+    case TM_REQ_PATHMGR_RESOLVE: {
+        unsigned plen = (unsigned)mr0;
+        if (plen == 0 || plen >= 128) { err = (seL4_Word)EINVAL; break; }
+        static char s_qpath[128];
+        const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+        for (unsigned i = 0; i < plen; ++i) s_qpath[i] = (char)src[i];
+        s_qpath[plen] = 0;
+
+        tm_pathmgr_obj_t obj = { 0 };
+        unsigned consumed = 0;
+        int rc = tm_pathmgr_resolve(s_qpath, &obj, &consumed);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)obj.server_pid;
+        *out_mr1 = (seL4_Word)obj.server_chid;
+        *out_mr2 = (seL4_Word)obj.handler_kind;
+        *out_mr3 = (seL4_Word)consumed;
+        reply_len = 4;
+        break;
+    }
+
     default:
         /* Application-level message (v0.3 demo). Echo back with MR0
          * incremented, so tester sees the round-trip succeed. */
@@ -669,9 +689,9 @@ int main(seL4_BootInfo *bi)
 
     unsigned long elf_size = 0;
     const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
-                                     "bin/init.elf", &elf_size);
+                                     "sbin/init", &elf_size);
     if (!elf) {
-        sel4_debug_puts("FATAL: bin/init.elf not found in CPIO\n");
+        sel4_debug_puts("FATAL: sbin/init not found in CPIO\n");
         for (;;) __asm__ volatile("nop");
     }
     pid_t init_pid = tm_pid_alloc();
@@ -690,7 +710,7 @@ int main(seL4_BootInfo *bi)
     int sr = tm_spawn(elf, elf_size, init_pid, primary_ep,
                        /*argc=*/1, boot_argv,
                        /*envc=*/0, 0,
-                       /*elf_name=*/"init.elf");
+                       /*elf_name=*/"sbin/init");
     if (sr != 0) {
         sel4_debug_puts("FATAL: tm_spawn returned non-zero\n");
         for (;;) __asm__ volatile("nop");

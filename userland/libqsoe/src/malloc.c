@@ -27,11 +27,11 @@
  * old size for copies and zero-fills.  Returned pointers are 16-byte
  * aligned per the SysV ABI.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@gmail.com>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 
 #define ARENA_CHUNK     0x200000UL          /* one Mega_Page */
 #define ALIGN           16UL

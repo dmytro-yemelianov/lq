@@ -88,6 +88,24 @@ int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
     return -ENOMEM;
 }
 
+int tm_connection_clone_for_dup(pid_t client_pid, seL4_CPtr src_slot,
+                                 seL4_CPtr dest_slot)
+{
+    tm_connection_t *src = connection_find_by_slot(client_pid, src_slot);
+    if (!src) return -EBADF;
+    int idx = connection_alloc_slot_idx();
+    if (idx < 0) return -ENOMEM;
+    g_connections[idx].in_use      = 1;
+    g_connections[idx].channel_idx = src->channel_idx;
+    g_connections[idx].badge       = src->badge;
+    g_connections[idx].client_pid  = client_pid;
+    g_connections[idx].client_slot = dest_slot;
+    g_connections[idx].flags       = src->flags;
+    g_connections[idx].ctx[0]      = src->ctx[0];
+    g_connections[idx].ctx[1]      = src->ctx[1];
+    return 0;
+}
+
 int tm_connection_set_ctx(seL4_Word badge, unsigned long c0, unsigned long c1)
 {
     tm_connection_t *cn = connection_find_by_badge(badge);

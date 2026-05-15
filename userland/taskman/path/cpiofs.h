@@ -2,7 +2,7 @@
  * cpiofs.h — read-only filesystem backed by the embedded userland CPIO.
  *
  * Registered in the path manager at "/" with handler_kind=CPIOFS at
- * boot. open("/bin/hello.elf") consults the path manager (longest-
+ * boot. open("/bin/qsh") consults the path manager (longest-
  * prefix match), gets routed here, the leading "/" is stripped, and
  * the remainder is looked up in the in-memory CPIO archive via
  * cpio_get_file. The resulting (data, size) is stashed in the
@@ -22,10 +22,19 @@
 /* Boot-time setup: hand cpiofs the embedded CPIO blob. */
 void tm_cpiofs_set_cpio(const void *start, unsigned long len);
 
+/* Look up `name` in the CPIO archive with one level of symlink
+ * resolution.  `name` is unprefixed (e.g. "bin/sh", not "/bin/sh").
+ * If the entry is a symlink (S_IFLNK mode), its target is resolved
+ * once: absolute targets ("/...") have the leading '/' stripped,
+ * relative targets are joined with the link's parent directory.
+ * Chained symlinks (target is also a symlink) return NULL.
+ * Used by tm_cpiofs_* and by spawn.c (shebang interpreter lookup). */
+const void *tm_cpio_lookup(const char *name, unsigned long *out_size);
+
 /* Called from main.c's TM_REQ_OPEN handler when the resolved
  * pathmgr object has handler_kind=PATHMGR_HANDLER_TASKMAN_CPIOFS.
  *
- *   open_path: full path the client passed (e.g. "/bin/hello.elf")
+ *   open_path: full path the client passed (e.g. "/bin/qsh")
  *   consumed:  bytes of path the prefix-match consumed (1 for "/")
  *   badge:     scoid of the freshly-minted connection (set by the
  *              caller before calling this — we stash file state on it)

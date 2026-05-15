@@ -132,7 +132,20 @@ int MsgSendPulse(int coid, int priority,
 
 These form the fundamental Send/Receive/Reply triad.  The synchronous
 variants map directly to \texttt{seL4\_Call}, \texttt{seL4\_Recv}, and
-\texttt{seL4\_Reply}.  Pulses use seL4 Notification objects.
+\texttt{seL4\_Reply}.  Pulses use seL4 Notification objects.  Deferred
+replies (saving the reply cap to be consumed after intervening
+\texttt{MsgReceive}s) are covered separately in
+\S\ref{sec:msg-savereply}.
+
+\texttt{MsgReceive} populates an extended \texttt{struct \_msg\_info}.
+In addition to the QNX-compatible fields (\texttt{nd}, \texttt{pid},
+\texttt{chid}, \texttt{scoid}, \texttt{msglen}, etc.) it sets
+\texttt{flags} (with \texttt{QSOE\_MI\_PULSE} when the wake came from a
+pulse rather than an EP message) and \texttt{label} --- the seL4
+message-info label, which carries the QSOE wire-protocol tag
+(\texttt{TM\_REQ\_IO\_READ}, \texttt{TM\_REQ\_IO\_WRITE}, \ldots).
+Resource managers dispatch on \texttt{info.label} without ever touching
+the seL4 \texttt{MessageInfo} structure directly.
 
 \section{State split: libqsoe vs taskman}
 \label{sec:state-split}
@@ -591,120 +604,285 @@ gone.
           data under OR-accumulation.  Deferred.
 \end{itemize}
 
+\section{Line discipline (LDISC)}
+\label{sec:ldisc}
+
+\emph{libqsoe} ships a small line-discipline helper used by every
+program that wants cooked-mode line editing on a byte-stream fd ---
+chiefly the interactive shell (\texttt{qsh}), and, in future versions,
+\texttt{getty} and \texttt{login}.  The handle wraps an already-open
+fd and adds: line buffering, backspace / kill / VEOF handling, visible
+erase, optional echo, and CR$\to$NL / NL$\to$CRLF translations.  It is
+intentionally \emph{not} a POSIX \texttt{termios} shim --- that would
+require the driver to honour \texttt{TCGETS}/\texttt{TCSETS} and is
+deferred to v0.8.
+
+\subsection{API}
+
+\begin{lstlisting}[language=C]
+typedef struct {
+    unsigned icanon:1, echo:1, echoe:1, isig:1,
+             icrnl:1, opost:1, onlcr:1;
+    unsigned char vintr, verase, vkill, veof;
+} qsoe_ldisc_attr_t;
+
+typedef struct qsoe_ldisc qsoe_ldisc_t;
+
+qsoe_ldisc_t *qsoe_ldisc_open(int fd_in, int fd_out,
+                              const qsoe_ldisc_attr_t *attr);
+void          qsoe_ldisc_close(qsoe_ldisc_t *ld);
+int           qsoe_ldisc_get(qsoe_ldisc_t *, qsoe_ldisc_attr_t *);
+int           qsoe_ldisc_set(qsoe_ldisc_t *, const qsoe_ldisc_attr_t *);
+int           qsoe_ldisc_set_cooked(qsoe_ldisc_t *);
+int           qsoe_ldisc_set_raw   (qsoe_ldisc_t *);
+long          qsoe_ldisc_readline(qsoe_ldisc_t *, char *buf,
+                                  unsigned long cap);
+long          qsoe_ldisc_readbyte(qsoe_ldisc_t *, unsigned char *c);
+long          qsoe_ldisc_write   (qsoe_ldisc_t *, const void *buf,
+                                  unsigned long n);
+\end{lstlisting}
+
+Passing \texttt{attr=NULL} to \texttt{qsoe\_ldisc\_open} selects the
+defaults: canonical mode, echo, echoe, isig, icrnl, opost, onlcr;
+\texttt{VINTR}=\^{}C, \texttt{VERASE}=DEL, \texttt{VKILL}=\^{}U,
+\texttt{VEOF}=\^{}D.  Backspace accepts both 0x08 (BS) and 0x7F (DEL)
+regardless of \texttt{verase} --- terminals send wildly mixed bytes
+and trying to be strict here causes more pain than it saves.
+
+\paragraph{Two-fd input/output split.}  Unlike QNX's \texttt{termios},
+QSOE's handle takes two file descriptors: \texttt{fd\_in} for incoming
+keystrokes and \texttt{fd\_out} for outgoing echo / erase / line-feed
+bytes.  In QSOE, the stdin, stdout, and stderr capabilities a process
+inherits are independently-minted Send-caps; writing to \texttt{fd 0}
+(stdin) is a code smell and may route to a different connection than
+the user's terminal once rights checking and FD redirection mature.
+The natural call from an interactive shell is therefore
+\texttt{qsoe\_ldisc\_open(0, 1, NULL)} — read from stdin, write echoes
+to stdout.
+
+\subsection{Behavioural notes}
+
+\begin{itemize}
+    \item In canonical mode, \texttt{qsoe\_ldisc\_readline} blocks until
+          a newline arrives and returns the full line (including the
+          trailing \texttt{'\textbackslash{}n'}) in \texttt{buf}.
+    \item Erase echo: \texttt{echoe=1} emits \texttt{"\textbackslash{}b
+          \textbackslash{}b"} when a character is rubbed out, drawing a
+          visible step-back.  \texttt{echoe=0} with \texttt{echo=1}
+          emits a bare \texttt{"\textbackslash{}b"}.  \texttt{echo=0}
+          and \texttt{echoe=0} together suppress all visual feedback.
+          The two flags are \emph{independent}: when the underlying
+          host terminal is already echoing typed bytes, qsh opens its
+          handle with \texttt{echo=0, echoe=1} so only the erase visual
+          is drawn from inside.
+    \item \texttt{VINTR} with \texttt{isig=1} aborts an in-flight
+          \texttt{readline} with \texttt{errno=EINTR}.  Real
+          process-group SIGINT delivery is additive and lands in v0.8.
+    \item \texttt{VEOF} on an empty line returns 0 (real EOF).  Mid-
+          line, it returns the line so far \emph{without} the EOF
+          marker.
+    \item Raw mode (\texttt{qsoe\_ldisc\_set\_raw}) clears all the
+          processing flags.  \texttt{readline} then just hands the next
+          available bytes through unchanged.
+\end{itemize}
+
+\subsection{Where it sits}
+
+The handle holds malloc'd state (the current line buffer, the
+attribute set, the fd).  Both reads from and writes to the underlying
+fd use the standard \texttt{read}/\texttt{write} POSIX calls --- the
+LDISC layer is purely user-space line editing, not a driver-level
+service.  This deliberately mirrors QRV's split: drivers ship raw
+bytes; the cooked-mode polish is a library shared by every program
+that wants it.
+
+The interactive qsh prompt currently opens one handle on fd 0 at
+\texttt{main\_init} (when \texttt{FTALKING} is set) and switches its
+read loop in \texttt{lex.c} to \texttt{qsoe\_ldisc\_readline}.  The
+edit.c raw-mode editor with history (Emacs key bindings, arrow keys,
+\texttt{\$HISTFILE}) is not yet enabled --- that's a v0.7-rc4 item
+that requires raw input throughout and proper \texttt{isatty}.
+
+\section{Driver-side IRQ surface}
+\label{sec:irq-surface}
+
+Resource managers that own hardware (\texttt{devc-ser8250}, future
+\texttt{devc-nvme}, etc.) reach the kernel's interrupt machinery
+through three libqsoe primitives.  No driver should ever call seL4
+syscalls directly; these wrappers are the entire allowed surface.
+
+\begin{lstlisting}[language=C]
+int qsoe_irq_set_notification(int handler, int ntfn);
+int qsoe_irq_wait(int ntfn);
+int qsoe_irq_ack(int handler);
+\end{lstlisting}
+
+Per-driver, \texttt{spawn.c} mints the IRQHandler cap into
+\texttt{QSOE\_CAP\_IRQ\_HANDLER} and a fresh Notification into
+\texttt{QSOE\_CAP\_IRQ\_NTFN} at process creation.  The driver then:
+
+\begin{enumerate}
+    \item calls \texttt{qsoe\_irq\_set\_notification(QSOE\_CAP\_IRQ\_HANDLER,
+          QSOE\_CAP\_IRQ\_NTFN)} once to bind the two together;
+    \item spawns a dedicated IRQ thread that loops on
+          \texttt{qsoe\_irq\_wait(QSOE\_CAP\_IRQ\_NTFN)} --- blocking
+          until the kernel signals on a PLIC rising edge --- drains
+          the device, and finishes with
+          \texttt{qsoe\_irq\_ack(QSOE\_CAP\_IRQ\_HANDLER)} to re-arm.
+\end{enumerate}
+
+The wrappers live in \texttt{libqsoe/src/irq.c}; the underlying
+invocations are \texttt{seL4\_IRQHandler\_SetNotification},
+\texttt{seL4\_Wait}, and \texttt{seL4\_IRQHandler\_Ack}.  Drivers never
+see those names.
+
+\section{Deferred replies (\texttt{MsgSavereply})}
+\label{sec:msg-savereply}
+
+A pure non-MCS seL4 server can only reply with the \emph{implicit}
+per-thread reply capability set up by the most recent
+\texttt{seL4\_Recv}.  That implicit cap is consumed by
+\texttt{seL4\_Reply} \emph{and} overwritten by the next
+\texttt{seL4\_Recv} --- which makes the obvious QNX-style ``park this
+client and come back to it later'' pattern unworkable as-is.
+
+\emph{libqsoe} closes the gap with \texttt{MsgSavereply}:
+
+\begin{lstlisting}[language=C]
+#define QSOE_RCVID_SAVED  0x80000000
+int MsgSavereply(int rcvid);
+int MsgReply(int rcvid, int status, const void *msg, int bytes);
+\end{lstlisting}
+
+\texttt{MsgSavereply} copies the implicit reply cap into a fresh
+CSpace slot (via \texttt{seL4\_CNode\_SaveCaller}) and returns a new,
+stable rcvid with the \texttt{QSOE\_RCVID\_SAVED} bit set.  The caller
+stores that rcvid wherever it likes, runs further \texttt{MsgReceive}s,
+and when the deferred work finishes, replies with
+\texttt{MsgReply(saved\_rcvid, \ldots)}.  \texttt{MsgReply} checks the
+\texttt{QSOE\_RCVID\_SAVED} bit: if set, it \texttt{Send}s on the saved
+slot and recycles it; if not, it uses the implicit cap exactly as
+before.  No special-case API at the call site.
+
+This is the foundation for every parking resmgr in QSOE.
+\texttt{devc-ser8250} parks readers when its ring is empty;
+\texttt{sbin/pipe} parks readers waiting on bytes and writers waiting
+on buffer space; future filesystem servers will park on async I/O.
+
+\paragraph{Caveat: sign-bit collision on success.}
+\texttt{QSOE\_RCVID\_SAVED} is bit~31 of \texttt{int}, i.e.\ the sign
+bit.  A \emph{successful} \texttt{MsgSavereply} therefore returns a
+\emph{negative} signed integer (the saved bit is set on success).
+Callers must check for failure with the exact sentinel
+\texttt{if (saved == -1) \{ \ldots \}} — never with the more natural-
+looking \texttt{if (saved < 0) \{ \ldots \}}, which would treat every
+successful park as a failure.  This bit us once in the
+\texttt{devc-ser8250} rework before we noticed; the rule is now
+documented in \texttt{<qsoe-system.h>} next to the macro.
+
 \section{Relationship to musl libc}
 
 Standard C/POSIX functions (\texttt{printf}, \texttt{malloc},
-\texttt{open}, \texttt{read}, etc.) are provided by musl libc, patched
-to route system calls through seL4 IPC to \texttt{taskman} or the
-appropriate resource manager rather than through Linux \texttt{ecall}
-traps.
+\texttt{open}, \texttt{read}, etc.) come from musl libc.  The split
+between vanilla musl source and QSOE-native glue is the focus of this
+section.
 
-\subsection{The \texttt{\_\_sysinfo} bridge (v0.5.1)}
+\subsection{No \texttt{\_\_syscall} bridge}
 
-Upstream musl on Linux issues syscalls via an inline \texttt{ecall}
-in \texttt{arch/riscv64/syscall\_arch.h}.  QSOE replaces that file
-with a patched variant at
-\texttt{core/userland/libc/patches/arch/riscv64/syscall\_arch.h},
-included earlier in the libc build's include path, which redefines
-every \texttt{\_\_syscallN} stub to call through a global function
-pointer:
+Earlier QSOE iterations patched musl's \texttt{syscall\_arch.h} so that
+every \texttt{\_\_syscallN} routed through a global \texttt{\_\_sysinfo}
+function pointer.  That layer is gone.  POSIX entry points
+(\texttt{read}, \texttt{write}, \texttt{open}, \texttt{close},
+\texttt{fcntl}, \texttt{mmap}, \texttt{stat}, etc.) are now implemented
+\emph{directly} as QSOE-native C functions under
+\texttt{userland/libc/qsoe/}, each one a thin wrapper that issues the
+corresponding \texttt{TM\_REQ\_*} via libqsoe.  The build symlinks that
+directory into the vanilla musl tree at \texttt{src/os\_dependent/} so
+the regular libc make-rules pick it up.  No \texttt{\_\_syscall},
+no Linux syscall numbers, no \texttt{ecall} traps at all.
 
-\begin{lstlisting}[language=C]
-#define CALL_SYSINFO(n, ...) \
-    ((long(*)(long, ...))__sysinfo)(n, ##__VA_ARGS__)
-\end{lstlisting}
+The earlier excluded-files list (\texttt{scripts/placement.txt})
+removes the Linux-syscall-bearing musl sources so they don't conflict
+with the QSOE-native versions.
 
-\texttt{\_\_sysinfo} is a \texttt{size\_t} global defined by musl
-itself in \texttt{src/internal/defsysinfo.c}.  In Linux musl,
-\texttt{\_\_libc\_start\_main} reads its address from the kernel's
-\texttt{AT\_SYSINFO} auxv entry (the vDSO entrypoint).  QSOE skips
-\texttt{\_\_libc\_start\_main} entirely; instead, \texttt{\_qsoe\_start\_main}
-in \texttt{libqsoe/src/start\_main.c} assigns
-\texttt{\_\_sysinfo = (size\_t)qsoe\_syscall\_dispatch} before
-control reaches the user's \texttt{main}.
+\subsection{Heap: mmap, no \texttt{brk()}}
+\label{sec:libc-heap}
 
-\texttt{qsoe\_syscall\_dispatch} lives in
-\texttt{libqsoe/src/syscall\_dispatch.c} --- a single C function
-that switches on the Linux RISC-V syscall number and routes:
+QSOE has no \texttt{brk()} anywhere --- the syscall isn't implemented,
+\texttt{taskman} never reserves a per-process heap region in advance,
+and process VSpace layouts have no break pointer.  All dynamic memory
+comes through \texttt{mmap}.
 
-\begin{tabular}{lll}
-\hline
-Linux \texttt{SYS\_*} & Number & libqsoe handler \\
-\hline
-\texttt{write}, \texttt{writev}   & 64, 66  & \texttt{qsoe\_write} \\
-\texttt{read},  \texttt{readv}    & 63, 65  & \texttt{qsoe\_read} \\
-\texttt{openat}                   & 56      & \texttt{qsoe\_open} \\
-\texttt{close}                    & 57      & \texttt{qsoe\_close} \\
-\texttt{brk}                      & 214     & \texttt{qsoe\_brk} \\
-\texttt{exit}, \texttt{exit\_group} & 93, 94 & \texttt{\_exit} \\
-\texttt{ioctl}                    & 29      & returns \texttt{-ENOTTY} \\
-\texttt{set\_tid\_address}        & 96      & returns \texttt{1} \\
-\hline
-\end{tabular}
+\texttt{libqsoe/src/malloc.c} provides \texttt{malloc}, \texttt{free},
+\texttt{realloc}, and \texttt{calloc}, plus the
+\texttt{\_\_libc\_malloc}-family aliases musl uses internally.  On the
+first \texttt{malloc} it acquires a 2~MiB arena from taskman via
+\texttt{TM\_REQ\_MMAP} (the same path POSIX \texttt{mmap} takes) and
+bumps a pointer through it.  \texttt{free} is a no-op for v0.7;
+\texttt{realloc} always copies into a fresh chunk.  The arena grows on
+demand by acquiring additional mmaps.
 
-Anything else returns \texttt{-ENOSYS}.
+musl's own three malloc backends --- \texttt{lite\_malloc},
+\texttt{oldmalloc}, and \texttt{mallocng} --- all call \texttt{SYS\_brk}
+internally.  The QSOE libc build strips them out (\texttt{filter-out}
+in \texttt{userland/libc/Makefile}); libqsoe's mmap-based allocator
+takes their place.
 
-\subsection{Heap and \texttt{brk()} (v0.5.1)}
+\subsection{Soft-float linker stubs}
 
-Each spawned process gets a 2 MiB Mega\_Page mapped at
-\texttt{[0x800000, 0xA00000)} in its VSpace.  taskman retypes the
-megapage during \texttt{spawn.c} just before configuring the TCB.
-
-Inside the process, \texttt{libqsoe/src/syscall\_dispatch.c} tracks
-the current break pointer in a static variable initialised to
-\texttt{0x800000}.  \texttt{qsoe\_brk(NULL)} returns the current
-break (matches Linux's \texttt{brk(0)} convention); a non-NULL
-argument moves the break within the megapage and returns the new
-value, or returns the current break unchanged if the request lies
-outside \texttt{[0x800000, 0xA00000)}.
-
-musl's \texttt{lite\_malloc} (\texttt{src/malloc/lite\_malloc.c})
-uses brk as its bump allocator.  printf's working set is well under
-2 MiB, so the fixed-size megapage suffices for v0.5.1.  Growable
-heap via on-demand mmap is deferred.
-
-\subsection{Soft-float linker stubs (v0.5.1)}
-
-QSOE builds with \texttt{-mabi=lp64} (soft-float).  The
-cross-compiler's prebuilt \texttt{libgcc.a} is compiled for
-\texttt{-mabi=lp64d} (double-float) and rejects soft-float objects
-at link time, even when the actual instructions never use the FPU.
-
-musl's \texttt{vfprintf} statically references soft-float helpers
-(\texttt{\_\_addtf3}, \texttt{\_\_multf3}, \texttt{\_\_netf2}, etc.)
-for the \texttt{\%f} / \texttt{\%g} / \texttt{\%e} code paths, even
-when the format string contains no floating-point conversions.
-\texttt{libqsoe/src/float128\_stubs.c} provides empty aliases for
-those symbols so the linker is satisfied; if a caller ever does
-print a \texttt{\%f}, the stub spins.
-
-A real soft-float-compatible \texttt{compiler-rt} build is the
-proper fix, deferred until QSOE actually wants floating-point
-output.
+QSOE builds with \texttt{-mabi=lp64} (soft-float).  The cross-compiler's
+prebuilt \texttt{libgcc.a} is compiled for \texttt{-mabi=lp64d} and
+refuses to link against soft-float objects even when no FPU
+instructions are reachable.  musl's \texttt{vfprintf} statically
+references \texttt{\_\_addtf3}, \texttt{\_\_multf3}, \texttt{\_\_netf2},
+and similar float128 helpers from the \texttt{\%f}/\texttt{\%g}/
+\texttt{\%e} code paths --- even when the format string contains no
+floating-point conversions.  \texttt{libqsoe/src/float128\_stubs.c}
+provides empty aliases for those symbols; a real
+\texttt{compiler-rt}-soft-float build is the proper fix and is
+deferred until QSOE actually wants to print floats.
 
 \subsection{Bypassed musl init paths}
 
-The full musl on Linux runs \texttt{\_\_libc\_start\_main} to do
-locale init, atexit registration, env parsing, vDSO discovery, etc.
+The full musl on Linux runs \texttt{\_\_libc\_start\_main} for locale
+init, atexit registration, env parsing, vDSO discovery, and TLS setup.
 QSOE binaries enter through \texttt{\_qsoe\_start\_main} (in
-\texttt{libqsoe/src/start\_main.c}) which performs only the QSOE-
+\texttt{libqsoe/src/start\_main.c}), which performs only the QSOE-
 relevant subset:
 
 \begin{enumerate}
-    \item \texttt{qsoe\_libqsoe\_init} --- planted IPC-buffer pointer
-          and self-pid into the main thread's TLS.
-    \item Set \texttt{\_\_sysinfo} so musl syscalls route through
-          QSOE.
-    \item Bind fds 0/1/2 to the inherited console connections (see
-          \S~3 ``File descriptors and stdio inheritance'').
+    \item \texttt{qsoe\_libqsoe\_init} plants the IPC-buffer pointer
+          and self-pid into the main thread's TLS slot.
+    \item Bind fds 0/1/2 to the connections taskman inherited into the
+          child during spawn (see Chapter~3 ``File descriptors and
+          stdio inheritance'').
     \item Call the user's \texttt{main(argc, argv, envp)}.
     \item \texttt{\_exit(rc)} --- bypasses musl's stdio cleanup
-          (\texttt{fflush\_on\_exit}), so v0.5.1 programs must
-          explicitly \texttt{fflush} before returning if they care.
-          Hello does this.
+          (\texttt{fflush\_on\_exit}).  v0.7 programs that care about
+          buffered output before exit must call \texttt{fflush}
+          explicitly.
 \end{enumerate}
 
-\texttt{\_\_errno\_location} is overridden by a libqsoe stub
-returning a single static \texttt{int}, since the per-thread
-\texttt{errno} musl normally provides via TLS-on-pthread requires a
-full pthread bootstrap that v0.5.1 doesn't run.
+\texttt{\_\_errno\_location} is overridden by a libqsoe stub so musl's
+internal \texttt{errno} reads land in the same per-thread slot as
+\texttt{qsoe\_errno}.
+
+\subsection{The single system header}
+\label{sec:qsoe-system-h}
+
+Every program that uses any libqsoe surface includes one top-level
+header:
+
+\begin{lstlisting}[language=C]
+#include <qsoe-system.h>
+\end{lstlisting}
+
+This is QSOE's analogue of QNX's \texttt{<sys/neutrino.h>}: one
+include gives the full QSOE-shape system API --- channels,
+connections, messages, threads, processes, file IO, mmap, timers,
+signals, pathmgr, IRQ, line discipline.  Earlier iterations spread
+these across \texttt{<qsoe/qrv.h>}, \texttt{<qsoe/slots.h>}, and
+\texttt{<qsoe/wire.h>}; the \texttt{qrv}-named header is gone, with
+its declarations now living in \texttt{<qsoe-system.h>}.  Slots and
+wire still live under \texttt{<qsoe/>} short-term and will fold in as
+the surface stabilises.

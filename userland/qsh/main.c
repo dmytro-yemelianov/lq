@@ -554,18 +554,31 @@ main_init(int argc, const char *argv[], Source **sp)
 
 /* this indirection barrier reduces stack usage during normal operation */
 
+#include <qsoe-system.h>
+
+/* v0.7-rc3: libqsoe LDISC handle wrapping stdin for the interactive
+ * prompt.  Set in main() once FTALKING is known; consumed by lex.c's
+ * line-reader to get backspace / kill / VEOF without dragging in qsh's
+ * full raw-mode editor.  edit.c (history, arrow keys, etc.) is the
+ * v0.7-rc4 path. */
+qsoe_ldisc_t *g_qsh_ldisc;
+
 int
 main(int argc, const char *argv[])
 {
     int rv;
     Source *s;
 
-    /* v0.6.4 trace: confirm we got past crt0 + libqsoe init. */
-    extern int printf(const char *, ...);
-    printf("[qsh] main entered, argc=%d argv[0]=%s\n",
-           argc, argc > 0 ? argv[0] : "(none)");
-
     main_init(argc, argv, &s);
+
+    /* Open a cooked-mode LDISC: read keystrokes from stdin, write
+     * echo / erase / line-feed visuals to stdout.  Two separate fds
+     * because in QSOE stdin and stdout are independently-minted caps;
+     * writing to stdin is a code smell and may route to a different
+     * connection than the user's terminal. */
+    if (Flag(FTALKING))
+        g_qsh_ldisc = qsoe_ldisc_open(0, 1, NULL);
+
     if (as_builtin) {
         rv = c_builtin(e->loc->argv) & 0xFF;
         exstat = rv;

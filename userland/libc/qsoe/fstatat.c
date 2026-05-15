@@ -21,7 +21,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <stddef.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
 {

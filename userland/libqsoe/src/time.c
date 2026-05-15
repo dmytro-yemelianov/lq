@@ -13,7 +13,7 @@
  * time at 10 MHz.  All other arithmetic is plain 64-bit.
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../include/qsoe/slots.h"
 #include "../include/qsoe/wire.h"
 

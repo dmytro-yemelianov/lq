@@ -15,7 +15,7 @@
 
 #include <signal.h>
 #include <stddef.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 #include <qsoe/tls.h>
 
 int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)

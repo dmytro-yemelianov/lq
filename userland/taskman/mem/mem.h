@@ -10,7 +10,7 @@
 #define QSOE_TASKMAN_MEM_H
 
 #include "../sel4_types.h"
-#include "../../libqsoe/include/qsoe/qrv.h"
+#include <qsoe-system.h>
 
 /* mmap region origin + page size used to bump tm_process_t.mmap_top. */
 #define QSOE_MMAP_BASE  0x2000000UL    /* 32 MiB */

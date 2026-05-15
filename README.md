@@ -47,10 +47,17 @@ core/                          vendored upstream (gitignored; populated
   userland/taskman/runenv/     sel4runtime (C runtime for seL4 user-space)
 
 userland/                      QSOE-native source (this is the work)
-  taskman/                     central system server
-  libqsoe/                     QNX-compatible IPC library
+  taskman/                     central system server (sys/proc/mem/path/)
+  libqsoe/                     QNX-compatible IPC + line discipline
+                                 (single header: <qsoe-system.h>)
+  libc/qsoe/                   QSOE-native POSIX entry points, symlinked
+                                 into musl's src/os_dependent/
+  qsh/                         interactive shell (mksh-derived)
+  init/                        /sbin/init — a shell script
+  dev/ser8250/                 16550 UART driver / resmgr
+  sbin/pipe/                   POSIX pipe / FIFO resmgr
+  sbin/repath/                 pathmgr-rewire CLI helper
   tester/                      end-to-end test program
-  hello/                       second user-space binary, exercises posix_spawn
 
 scripts/                       source extraction and build helpers
 doc/tex/Design/                design document (LaTeX)
@@ -61,7 +68,9 @@ sel4test-full/                 upstream seL4 + sel4test checkout (gitignored)
 
 ```
 ./scripts/extract-sel4-riscv.sh     # one-time: fetch upstream sources
-make                                # builds kernel, elfloader, taskman, tester, hello
+make                                # builds kernel, elfloader, taskman,
+                                    # libqsoe, libc, qsh, init, tester,
+                                    # devc-ser8250, sbin/pipe, sbin/repath
 make run                            # boot under qemu-system-riscv64
 ```
 
@@ -72,47 +81,65 @@ incremental builds are seconds.
 ## Current status
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
-of **v0.6.4**:
+of **v0.7**:
 
-- QNX-style synchronous IPC: `ChannelCreate`/`Destroy`,
-  `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`
-- Pulses with `seL4` bound-Notification wake (`MsgSendPulse`, 1-IPC idle
-  `MsgReceive`)
+- QNX-style synchronous IPC — `ChannelCreate`/`Destroy`,
+  `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`, plus
+  `MsgSavereply` for non-MCS deferred replies (saves the implicit
+  reply cap via `seL4_CNode_SaveCaller`).
+- Pulses with bound-Notification wake (`MsgSendPulse`, 1-IPC idle
+  `MsgReceive`).
 - Threading (`ThreadCreate`/`Join`/`Detach`/`Destroy`/`Cancel`/`Ctl`)
-  with per-thread TLS and SMP affinity across 4 harts
-- Processes (`ProcessCreate`/`Terminate`, `posix_spawn`, `_exit`) with
-  per-child untyped budget and cap-leak hygiene
-- argv/envp delivery on the child's initial stack per RISC-V SysV ABI
-- Multi-server IPC end-to-end (a second process can act as a server
-  and serve `MsgReceive` from other processes)
-- **Path manager** in taskman (prefix-tree namespace registry)
-- **`/dev/console`** as the first registered resource manager
-- POSIX-style `open`/`close`/`read`/`write` via libqsoe; spawned
-  processes inherit fds 0/1/2 bound to `/dev/console`
-- **musl libc** linked into spawned binaries; `__sysinfo` indirection
-  routes musl's "syscalls" into libqsoe; `printf` works end-to-end
-- **mmap-only memory model** — no `brk` anywhere in QSOE.  musl's
-  three malloc backends are filtered out of `libc.a`; libqsoe
-  provides its own `malloc`/`realloc`/`free` over `mmap`, which
-  routes to taskman's Memory Manager (`TM_REQ_MMAP`).  Memory is
-  allocated on demand in 2 MiB Mega_Page chunks.
-- **cpiofs** — embedded `userland.cpio` mounted as a read-only
-  filesystem at `/`; `open("/bin/hello.elf")` works from any program
-- **`/sbin/init`** owns userland orchestration; taskman just
-  bootstraps init
-- **`procmgr_detach` + `waitpid`** — QNX/QRV-style daemon
-  synchronisation; the parent blocks until the child says ready
-- **`devc-ser8250`** — first real userland resmgr: drives the 16550
-  UART via PLIC interrupts on a dedicated IRQ thread, registers at
-  `/dev/ser1`, and init redirects `/dev/console` to it at boot.
-  Blocking reads park the caller via `seL4_CNode_SaveCaller`; the
-  IRQ thread wakes them via a self-`MsgSendPulse` on each RX batch
-  (the QRV two-thread design, in QSOE primitives).
-- **qsh** — mksh-derived shell ported from QRV, **boots to a `# `
-  prompt** on the real console and runs commands typed at the QEMU
-  terminal.  Line editing (backspace, arrows, history) and a
-  working filesystem are v0.7+ work; for v0.6.4 the input is raw
-  with minimum `\r → \n` translation and echo in `devc-ser8250`.
+  with per-thread TLS and SMP affinity across 4 harts.
+- Processes (`ProcessCreate`/`Terminate`, `posix_spawn`, `_exit`,
+  shebang `#!`) with per-child untyped budget, cap-leak hygiene, and
+  argv/envp on the child's initial stack per RISC-V SysV ABI.
+- **Path manager** in taskman (prefix-tree namespace registry) with
+  `register` / `repath` / `resolve` wire ops.
+- **`/dev/console`** routed at boot to `/dev/ser1` (the real UART)
+  by `/sbin/init`.
+- POSIX surface — ~25 entry points in `userland/libc/qsoe/`:
+  `open`/`close`/`read`/`write`/`writev`/`lseek`/`dup2`/`fcntl`,
+  `chdir`/`getcwd`/`unlink`/`fstat`/`fstatat`/`readlink`/`access`,
+  `opendir`/`readdir`, the `getpid`/`getppid`/`getuid`/... family,
+  `clock_gettime`/`gettimeofday`/`time`/`times`,
+  `nanosleep`/`setitimer`/`pause`, `umask`, `sysconf`, `isatty`,
+  `pthread_sigmask`, `strerror`.
+- **musl libc** linked into spawned binaries — no `__sysinfo`
+  indirection; QSOE-native POSIX entry points live in
+  `userland/libc/qsoe/` and are symlinked into musl's
+  `src/os_dependent/`.
+- **mmap-only memory model** — no `brk` anywhere.  musl's three
+  malloc backends are filtered out of `libc.a`; libqsoe provides
+  `malloc`/`realloc`/`free` over `mmap`, which routes to taskman's
+  Memory Manager (`TM_REQ_MMAP`).
+- **cpiofs** — embedded `userland.cpio` mounted read-only at `/`,
+  with one level of CPIO symlink resolution
+  (`/bin/sh` → `/bin/qsh`).
+- **BSD-style boot** — `/sbin/init` is a shell script:
+  ```sh
+  #!/bin/sh
+  /sbin/devc-ser8250
+  /sbin/repath /dev/console /dev/ser1
+  exec /bin/qsh -i
+  ```
+  Drivers detach via `procmgr_detach`; `wait` semantics + the
+  shebang machinery in `tm_spawn` make this work.
+- **`devc-ser8250`** — 16550 UART driver / resmgr, **rewritten in
+  v0.7-rc3 to use only `libqsoe` + `libc`**.  No `seL4_*`, no
+  `qsoe_sys_*`, no `taskman/` includes.  Three new libqsoe
+  primitives (`qsoe_irq_set_notification` / `_wait` / `_ack`)
+  encapsulate the IRQ-handler / Notification surface; blocking
+  reads park via `MsgSavereply`.
+- **`/sbin/pipe`** — POSIX pipe / FIFO resmgr.  16-pipe pool,
+  4 KiB ring each, QNX rcvid-park on full / empty.  Same "libqsoe +
+  libc only" discipline.
+- **`<qsoe-system.h>`** — single top-level header for the libqsoe
+  public surface (analogous to QNX's `<sys/neutrino.h>`).
+- **qsh** with working line discipline: backspace, VKILL, VEOF
+  visible erase all work on the real UART via libqsoe's
+  `qsoe_ldisc_*` line-discipline primitives.  Arrow-key history
+  remains v0.7+ work.
 
 ## Documentation
 

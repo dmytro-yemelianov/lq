@@ -6,7 +6,7 @@
 # lifecycle, etc.  It is built in two flavours:
 #
 #   libqsoe.a     — normal: dispatch syscalls / process-mgmt via IPC
-#                    to taskman.  Linked into hello, init, tester,
+#                    to taskman.  Linked into init, tester,
 #                    devc-ser8250, qsh, etc.
 #
 #   libqsoe-tm.a  — `-DQSOE_LIBQSOE_IN_TASKMAN`: same sources, but
@@ -18,7 +18,7 @@
 #
 # Hand-run: cd userland/libqsoe && make clean all
 #
-# Copyright (c) 2026 Yuri Zaporozhets <yuriz@gmail.com>
+# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
 # SPDX-License-Identifier: Apache-2.0
 #
 
@@ -69,7 +69,7 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/path/pathmgr.h \
     $(TASKMAN_DIR)/path/cpiofs.h \
     $(TASKMAN_DIR)/sys/console.h \
-    $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+    $(LIBQSOE_DIR)/include/qsoe-system.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
     $(LIBQSOE_DIR)/include/qsoe/wire.h \
@@ -96,7 +96,7 @@ $(GEN)/qsoe/sys_version.h: $(wildcard $(TOP)/.git/HEAD $(TOP)/.git/index)
 # Normal flavour: full surface (everything in src/).
 NORMAL_SRCS := state.c msg.c process.c thread.c channel.c connect.c \
                start_main.c io.c mmap.c proc_info.c time.c \
-               float128_stubs.c signal.c malloc.c
+               float128_stubs.c signal.c malloc.c ldisc.c irq.c
 
 # In-taskman flavour: subset — taskman doesn't need its own start_main,
 # its own syscall dispatcher, or the float128 stubs.

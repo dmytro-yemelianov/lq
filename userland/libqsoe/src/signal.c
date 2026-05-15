@@ -24,7 +24,7 @@
  * handler table and ProcessTerminate's the receiving process.
  */
 
-#include "../include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../include/qsoe/slots.h"
 #include "../include/qsoe/wire.h"
 #include "state.h"

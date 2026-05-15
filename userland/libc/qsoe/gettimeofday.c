@@ -13,7 +13,7 @@
  */
 
 #include <sys/time.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 int gettimeofday(struct timeval *tv, void *tz)
 {

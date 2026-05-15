@@ -21,7 +21,7 @@
  * taskman's TM_REQ_CLOSE dispatch.
  */
 
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include "state.h"

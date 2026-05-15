@@ -6,7 +6,7 @@
  */
 
 #include <time.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 int clock_gettime(clockid_t clk, struct timespec *ts)
 {

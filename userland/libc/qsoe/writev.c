@@ -11,7 +11,7 @@
 
 #include <sys/uio.h>
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt);
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt)

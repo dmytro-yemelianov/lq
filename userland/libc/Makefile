@@ -8,7 +8,7 @@
 #
 # Hand-run: cd userland/libc && make clean all
 #
-# Copyright (c) 2026 Yuri Zaporozhets <yuriz@gmail.com>
+# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
 # SPDX-License-Identifier: Apache-2.0
 #
 

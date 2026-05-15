@@ -17,7 +17,7 @@
 #define QSOE_TASKMAN_PATHMGR_H
 
 #include "../sel4_types.h"
-#include "../../libqsoe/include/qsoe/qrv.h"
+#include <qsoe-system.h>
 
 /* Handler kinds. v0.5.0 uses these to route in-taskman traffic
  * without a real ConnectAttach hop; v0.6+ external resmgrs always

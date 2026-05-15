@@ -18,7 +18,7 @@
 
 #include <sys/times.h>
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 #define TMS_TICKS_PER_SEC  100UL
 #define TMS_NSEC_PER_TICK  (1000000000UL / TMS_TICKS_PER_SEC)

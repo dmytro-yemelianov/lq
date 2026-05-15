@@ -6,19 +6,19 @@
 # bound to a kernel-signaled Notification.  Registers /dev/ser1 with
 # taskman's pathmgr.
 #
-# Hand-run: cd userland/devc-ser8250 && make clean all
+# Hand-run: cd userland/dev/ser8250 && make clean all
 #
-# Copyright (c) 2026 Yuri Zaporozhets <yuriz@gmail.com>
+# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
 # SPDX-License-Identifier: Apache-2.0
 #
 
-TOP        ?= $(abspath $(CURDIR)/../..)
+TOP        ?= $(abspath $(CURDIR)/../../..)
 BUILD      := $(TOP)/build
 
 CROSS      ?= riscv64-linux-gnu-
 CC         := $(CROSS)gcc
 
-DSER_DIR    := $(TOP)/userland/devc-ser8250
+DSER_DIR    := $(TOP)/userland/dev/ser8250
 TASKMAN_DIR := $(TOP)/userland/taskman
 LIBQSOE_DIR := $(TOP)/userland/libqsoe
 CORE        := $(TOP)/core
@@ -52,13 +52,11 @@ MAIN_CFLAGS := $(TM_CFLAGS) \
     -isystem $(MUSL_DIR)/arch/riscv64 \
     -isystem $(MUSL_DIR)/arch/generic
 
-# Headers (subset of taskman's TM_HEADERS — devc-ser8250 doesn't need
-# taskman-side server/spawn/pathmgr/etc.).
+# Headers — v0.7-rc3: driver now uses ONLY libqsoe public surface
+# (no taskman/* anything).  Per CLAUDE.md "Requirements for resource
+# managers": POSIX + libqsoe; no direct seL4 syscalls.
 DSER_HEADERS := \
-    $(TASKMAN_DIR)/sel4_syscalls.h \
-    $(TASKMAN_DIR)/sel4_types.h \
-    $(TASKMAN_DIR)/qsoe_invoke.h \
-    $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+    $(LIBQSOE_DIR)/include/qsoe-system.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
     $(LIBQSOE_DIR)/include/qsoe/wire.h \

@@ -23,7 +23,7 @@
 
 #include "stdio_impl.h"
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 int __stdio_close(FILE *f)
 {

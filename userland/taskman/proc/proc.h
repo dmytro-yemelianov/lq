@@ -15,7 +15,7 @@
 #define QSOE_TASKMAN_PROC_H
 
 #include "../sel4_types.h"
-#include "../../libqsoe/include/qsoe/qrv.h"
+#include <qsoe-system.h>
 #include "../../libqsoe/include/qsoe/slots.h"
 
 #define TM_MAX_CHANNELS     64
@@ -161,6 +161,8 @@ pid_t         tm_pid_alloc(void);
 void          tm_pid_free(pid_t pid);
 
 void          tm_set_userland_cpio(const void *start, unsigned long len);
+const void   *tm_get_userland_cpio_start(void);
+unsigned long tm_get_userland_cpio_len(void);
 void          tm_set_primary_ep(seL4_CPtr ep);
 int           tm_process_create_by_name(const char *path, unsigned path_len,
                                          int argc, const char *const *argv,
@@ -253,6 +255,13 @@ int tm_connect_flags(pid_t caller_pid, seL4_CPtr client_slot,
 int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
                                      int channel_idx, seL4_Word badge,
                                      unsigned flags);
+/* Clone the source connection's registry row at (client_pid, src_slot)
+ * into a fresh row keyed by dest_slot.  Used by tm_dup_cap so each
+ * dup'd fd has an independent registry entry — closing one fd no
+ * longer invalidates the other.  Ctx is copied (independent offsets;
+ * POSIX strict-offset-sharing is a follow-up). */
+int tm_connection_clone_for_dup(pid_t client_pid, seL4_CPtr src_slot,
+                                 seL4_CPtr dest_slot);
 int tm_connection_set_ctx(seL4_Word badge, unsigned long c0, unsigned long c1);
 int tm_connection_get_ctx(seL4_Word badge, unsigned long *c0, unsigned long *c1);
 int tm_connection_badge_by_slot(pid_t client_pid, seL4_CPtr slot,

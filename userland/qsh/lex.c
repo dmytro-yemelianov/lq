@@ -7,6 +7,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "sh.h"
+#include <qsoe-system.h>
+
+/* v0.7-rc3: defined in main.c, opened when FTALKING is set. */
+extern qsoe_ldisc_t *g_qsh_ldisc;
 
 /*
  * states while lexing word
@@ -1330,6 +1334,30 @@ getsc_line(Source *s)
     if (have_tty) {
         xp = x_read(xp);
         *xp = '\0';
+    } else if (interactive && g_qsh_ldisc) {
+        /* v0.7-rc3: cooked-mode reads via libqsoe LDISC.  Echo, BS /
+         * VKILL / VEOF / VINTR all handled inside qsoe_ldisc_readline;
+         * we just get the finished line.  Arrow keys land in the
+         * buffer as junk for now — edit.c integration is v0.7-rc4. */
+        pprompt(prompt, 0);
+        for (;;) {
+            long n = qsoe_ldisc_readline(g_qsh_ldisc, xp,
+                                          (unsigned long)Xnleft(s->xs, xp));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    if (trap) runtraps(0);
+                    continue;
+                }
+                kwarnf(KWF_ERR(128) | KWF_VERRNO | KWF_PREFIX | KWF_FILELINE |
+                           KWF_BUILTIN | KWF_ONEMSG | KWF_BIUNWIND,
+                       errno, Trderr);
+                unwind(LRDERR);
+            }
+            xp += n;
+            *xp = '\0';
+            if (n == 0 || (n > 0 && xp[-1] == '\n')) break;
+            XcheckN(s->xs, xp, Xlength(s->xs, xp));
+        }
     } else {
         if (interactive)
             pprompt(prompt, 0);

@@ -9,7 +9,7 @@
 #
 # Hand-run: cd userland/sbin/pipe && make clean all
 #
-# Copyright (c) 2026 Yuri Zaporozhets <yuriz@gmail.com>
+# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
 # SPDX-License-Identifier: Apache-2.0
 #
 
@@ -52,7 +52,7 @@ PIPE_CFLAGS := $(ARCH_CFLAGS) \
 
 PIPE_HEADERS := \
     $(TASKMAN_DIR)/sel4_types.h \
-    $(LIBQSOE_DIR)/include/qsoe/qrv.h \
+    $(LIBQSOE_DIR)/include/qsoe-system.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
     $(LIBQSOE_DIR)/include/qsoe/wire.h \

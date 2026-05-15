@@ -12,6 +12,7 @@
 #include "../qsoe_invoke.h"
 #include "proc.h"
 #include "../path/pathmgr.h"
+#include "../path/cpiofs.h"
 #include "../../libqsoe/include/qsoe/slots.h"
 
 /* ELF64 minimal types — just enough to walk PHDRs. */
@@ -260,13 +261,18 @@ void tm_set_uart_untyped(seL4_CPtr ut_slot)
     s_uart_dev_ut = ut_slot;
 }
 
-/* Match an elf_name against a constant string. */
+/* Match the basename of `a` (everything after the last '/') against
+ * the literal `b`.  Lets us key special cases like the devc-ser8250
+ * cap-grant on the program name regardless of how it was looked up
+ * (bare "devc-ser8250" vs. "/sbin/devc-ser8250"). */
 static int spawn_name_eq(const char *a, const char *b)
 {
     if (!a || !b) return 0;
+    const char *base = a;
+    for (const char *p = a; *p; ++p) if (*p == '/') base = p + 1;
     for (unsigned i = 0;; ++i) {
-        if (a[i] != b[i]) return 0;
-        if (a[i] == 0) return 1;
+        if (base[i] != b[i]) return 0;
+        if (base[i] == 0) return 1;
     }
 }
 
@@ -276,6 +282,111 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
              int envc, const char *const *envp,
              const char *elf_name)
 {
+    /* Shebang handling.  If the blob starts with "#!", look up the
+     * interpreter in the CPIO and re-invoke ourselves with it.  Linux
+     * argv convention: argv = [interp, optional_arg, script_path,
+     * original_argv[1..]].  Recursion limit 1 — the interpreter must
+     * itself be ELF, not another script. */
+    {
+        const unsigned char *b = (const unsigned char *)elf_blob;
+        if (elf_len >= 2 && b[0] == '#' && b[1] == '!') {
+            unsigned long scan = elf_len < 128 ? elf_len : 128;
+            unsigned long eol  = 2;
+            while (eol < scan && b[eol] != '\n' && b[eol] != 0) ++eol;
+
+            unsigned long p = 2;
+            while (p < eol && (b[p] == ' ' || b[p] == '\t')) ++p;
+            unsigned long interp_start = p;
+            while (p < eol && b[p] != ' ' && b[p] != '\t') ++p;
+            unsigned long interp_end = p;
+            if (interp_end == interp_start || b[interp_start] != '/') {
+                sel4_debug_puts("spawn: shebang interp missing or not absolute\n");
+                return -ENOEXEC;
+            }
+            while (p < eol && (b[p] == ' ' || b[p] == '\t')) ++p;
+            unsigned long arg_start = p;
+            unsigned long arg_end   = eol;
+            while (arg_end > arg_start &&
+                   (b[arg_end-1] == ' ' || b[arg_end-1] == '\t')) --arg_end;
+            int has_arg = (arg_end > arg_start);
+
+            /* Interpreter path stripped of leading '/' for CPIO lookup. */
+            static char interp_cpio[64];
+            unsigned long ilen = interp_end - interp_start - 1;
+            if (ilen == 0 || ilen >= sizeof interp_cpio) return -ENOEXEC;
+            for (unsigned long i = 0; i < ilen; ++i) {
+                interp_cpio[i] = (char)b[interp_start + 1 + i];
+            }
+            interp_cpio[ilen] = 0;
+
+            unsigned long interp_size = 0;
+            const void *interp_blob = tm_cpio_lookup(interp_cpio, &interp_size);
+            if (!interp_blob) {
+                sel4_debug_puts("spawn: shebang interpreter not found: ");
+                sel4_debug_puts(interp_cpio);
+                sel4_debug_puts("\n");
+                return -ENOENT;
+            }
+            /* Recursion limit: interpreter must itself be ELF. */
+            const unsigned char *ib = (const unsigned char *)interp_blob;
+            if (interp_size < 4 ||
+                ib[0] != 0x7f || ib[1] != 'E' ||
+                ib[2] != 'L'  || ib[3] != 'F') {
+                sel4_debug_puts("spawn: nested shebang not supported\n");
+                return -ENOEXEC;
+            }
+
+            /* Preserve the interpreter path (with leading '/') for new
+             * argv[0], and the optional argument, into static buffers. */
+            static char interp_path[80];
+            unsigned long plen = interp_end - interp_start;
+            if (plen >= sizeof interp_path) return -ENOEXEC;
+            for (unsigned long i = 0; i < plen; ++i) {
+                interp_path[i] = (char)b[interp_start + i];
+            }
+            interp_path[plen] = 0;
+
+            static char opt_arg[80];
+            if (has_arg) {
+                unsigned long alen = arg_end - arg_start;
+                if (alen >= sizeof opt_arg) return -ENOEXEC;
+                for (unsigned long i = 0; i < alen; ++i) {
+                    opt_arg[i] = (char)b[arg_start + i];
+                }
+                opt_arg[alen] = 0;
+            }
+
+            /* Build new argv: [interp, opt_arg?, script_path, argv[1..]].
+             *
+             * script_path is the absolute path the interpreter will see
+             * for the script: '/' + cpio name (e.g. "/sbin/init").  The
+             * shell uses this to open the script through pathmgr — so
+             * it must round-trip through cpiofs's resolution. */
+            static char script_path[80];
+            unsigned long nlen = 0;
+            while (elf_name && elf_name[nlen]) ++nlen;
+            if (nlen + 2 > sizeof script_path) return -ENOEXEC;
+            script_path[0] = '/';
+            for (unsigned long i = 0; i < nlen; ++i) {
+                script_path[1 + i] = elf_name[i];
+            }
+            script_path[1 + nlen] = 0;
+
+            static const char *new_argv[16];
+            int new_argc = 0;
+            new_argv[new_argc++] = interp_path;
+            if (has_arg) new_argv[new_argc++] = opt_arg;
+            new_argv[new_argc++] = script_path;
+            for (int i = 1; i < argc && new_argc < 16; ++i) {
+                new_argv[new_argc++] = argv[i];
+            }
+
+            return tm_spawn(interp_blob, interp_size, pid, primary_ep,
+                            new_argc, new_argv, envc, envp,
+                            /*elf_name=*/interp_cpio);
+        }
+    }
+
     (void)elf_len;
     const struct elf64_hdr *eh = elf_blob;
 
@@ -527,7 +638,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     into QSOE_CAP_IRQ_NTFN that the IRQHandler will signal
      *     on each rising edge. Manifest-driven cap granting is
      *     v0.7+; for v0.6.1 the special case is gated by ELF name. */
-    if (spawn_name_eq(elf_name, "devc-ser8250.elf")) {
+    if (spawn_name_eq(elf_name, "devc-ser8250")) {
         const seL4_Word PLIC_UART_IRQ = 10;
         const seL4_Word TRIGGER_LEVEL = 0;
         const unsigned long UART_VADDR  = 0xA00000UL;  /* L1 slot 5 */

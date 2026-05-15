@@ -14,7 +14,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdarg.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include "state.h"

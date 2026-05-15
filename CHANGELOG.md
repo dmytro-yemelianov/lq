@@ -5,6 +5,209 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.7] — 2026-05-15
+
+**Milestone: full QNX-shape userland.**  Interactive shell with working
+line editing on the real UART; BSD-style boot (`/sbin/init` is a shell
+script); every resource manager uses only `libqsoe` + `libc` (no direct
+seL4 surface anywhere outside the kernel-facing wrappers); a single
+top-level system header.  Built up over rc1 → rc2 → rc3.
+
+### Architecture: taskman split + wire protocol re-bucketing
+- `userland/taskman/server.{c,h}` retired.  Code redistributed:
+  - `proc/` — processes, threads, channels, connections, pulses, spawn,
+    timer
+  - `mem/`  — memory manager (mmap)
+  - `path/` — pathmgr, cpiofs, IO dispatch, open/close
+  - `sys/`  — console + platform
+- `TM_REQ_*` wire labels renumbered into 0x100-wide buckets per
+  subsystem (sysmgr 0x000, procmgr 0x100, memmgr 0x200, pathmgr 0x300);
+  256 entries of headroom each.  Label rides in seL4's 52-bit
+  `MessageInfo.label` field.
+- `libqsoe/src/syscall_dispatch.c` and `musl_stubs.c` deleted — the
+  `__sysinfo` indirection is gone.  Every POSIX entry point talks to
+  taskman directly through libqsoe primitives.
+
+### Single top-level header: `<qsoe-system.h>`
+- `<qsoe/qrv.h>` retired; its declarations live in
+  `userland/libqsoe/include/qsoe-system.h`, analogous to QNX's
+  `<sys/neutrino.h>`.  60+ source files migrated in one sweep.
+- `<qsoe/slots.h>`, `<qsoe/wire.h>`, `<qsoe/tls.h>` survive short-term
+  — none are "qrv"-named.  Long-term consolidation deferred.
+- New `qsoe_ipcbuf_t` typedef in `<qsoe/tls.h>` mirrors
+  `seL4_IPCBuffer`'s layout under a QSOE-native name; resource managers
+  no longer pull `<sel4_types.h>` just to reach `qsoe_ipcbuf->msg[]`.
+
+### POSIX surface (rc1)
+- `userland/libc/qsoe/` now hosts ~25 real entry points:
+  - fd surface: `open` `close` `read` `write` `writev` `lseek` `dup2`
+    `fcntl`
+  - fs/path: `chdir` `getcwd` `unlink` `fstat` `fstatat` `readlink`
+    `access` `opendir` `readdir`
+  - cred/id: `getpid` `getppid` `getuid` `geteuid` `getgid` `getegid`
+    `getpgrp` `setxid`
+  - misc: `sysconf` `umask` `isatty` `pthread_sigmask` `strerror`
+    `wctomb`, errno locks, stdio backend
+  - clock: `clock_gettime` `gettimeofday` `time` `times` over QNX
+    `Clock*`
+  - stub: `poll()` — real wait/wake deferred to v0.8
+- New `TM_REQ_*` ops for these: `CLOCK_FREQ`, `CHDIR`, `GETCWD`,
+  `DUP_CAP`, `UMASK`, `PROC_SELF_INFO`, `SET_CRED`, `FSTAT`,
+  `READLINK`, `LSEEK`, `READDIR`, `ACCESS`.
+
+### QNX Clock*, timers, deferred replies
+- QNX `Clock*` family in `libqsoe/src/time.c`, backed by RISC-V `rdtime`
+  and a per-process cached frequency.  `TM_CLOCK_FREQ_HZ` hardcoded
+  for qemu-riscv-virt (v0.8 reads `/cpus/timebase-frequency` from FDT).
+- New `proc/timer.c`: 16-slot sleeper queue + per-process `ITIMER_REAL`
+  state.  Hybrid lazy expiry: `tm_timer_sweep()` runs at every dispatch
+  entry, replies to expired `nanosleep` callers, fires `SIGALRM` pulses
+  on expired itimers.  No kernel patch in v0.7 — `option 3` hybrid is
+  enough to ship.  libc shims: `nanosleep`, `setitimer` (backs
+  `alarm()`), `pause`.
+- New `MsgSavereply(rcvid)` + extended `MsgReply(rcvid, ...)`:
+  - `MsgSavereply` copies the implicit reply cap into a fresh CSpace
+    slot via `seL4_CNode_SaveCaller`, returns a stable rcvid with the
+    `QSOE_RCVID_SAVED = 0x80000000` bit set.
+  - `MsgReply` checks the bit: saved rcvids dispatch on the slot
+    (`seL4_Send` + slot recycle); plain rcvids use the implicit cap.
+  - **GOTCHA**: `QSOE_RCVID_SAVED` is the sign bit of `int`, so a
+    *successful* save returns a negative signed integer.  Failure
+    sentinel is `-1` exactly; callers must check `if (saved == -1)`,
+    not `if (saved < 0)`.  Documented near the macro and in the
+    design doc Chapter 4.
+- `_msg_info` gained `unsigned label` — the seL4 message-info label
+  surfaced so resmgrs dispatch on the wire-protocol tag without
+  touching seL4 types directly.  `MsgReceive` populates it.
+
+### Resource managers (the "no seL4 in resmgrs" rule, enforced)
+- **`/sbin/pipe`** (rc2) — first non-driver System Program.  16-pipe
+  pool, 4 KiB ring each, QNX rcvid-park for blocking read-on-empty
+  and write-on-full.  Lives under `userland/sbin/pipe/`; uses ONLY
+  libqsoe + libc.  `TM_REQ_PIPE_CREATE` mints two badged Send caps
+  (read-end + write-end) on the caller's behalf.
+- **`devc-ser8250` rewrite** (rc3) — directory moved to
+  `userland/dev/ser8250/`.  Source now imports exactly:
+  ```
+  #include <stdio.h>
+  #include <qsoe-system.h>
+  #include <qsoe/slots.h>
+  #include <qsoe/wire.h>
+  ```
+  All `qsoe_sys_*`, `qsoe_cnode_*`, `seL4_*`, and `../taskman/*`
+  includes gone.  The old SaveCaller + slot-pool park pattern replaced
+  by `MsgSavereply`; the explicit pulse-drain loop replaced by
+  `MsgReceive`'s `QSOE_MI_PULSE` flag.  IRQ thread uses three new
+  libqsoe wrappers — `qsoe_irq_set_notification`, `qsoe_irq_wait`,
+  `qsoe_irq_ack` — in `src/irq.c`.
+- **Two-step close** (rc2): `close(fd)` now does (1) `TM_REQ_CLOSE`
+  on the fd's bound cap so the resmgr observes the close, (2)
+  `TM_REQ_DETACH_CAP` for taskman-side cap delete + connection
+  cleanup, (3) local fd unbind.  External resmgrs see closes
+  uniformly with in-taskman ones.
+- **`dup()` fix** (rc3): `tm_dup_cap` now clones the connection
+  registry row alongside the cap copy, so each dup'd fd has its own
+  row and closing one doesn't dangle the others.
+
+### Line discipline (rc3)
+- New `userland/libqsoe/src/ldisc.c` + declarations in
+  `<qsoe-system.h>`:
+  - Opaque `qsoe_ldisc_t`; `qsoe_ldisc_attr_t` with `icanon` /
+    `echo` / `echoe` / `isig` / `icrnl` / `opost` / `onlcr` flags
+    and `VINTR` / `VERASE` / `VKILL` / `VEOF` chars.
+  - `qsoe_ldisc_open(fd_in, fd_out, attr)` — two fds, because in
+    QSOE stdin and stdout are independently-minted caps; writing to
+    fd 0 is a code smell.  qsh calls `qsoe_ldisc_open(0, 1, NULL)`.
+  - `_readline` (canonical mode), `_readbyte` (single byte),
+    `_write` (with optional NL → CR-NL translation).
+  - Backspace accepts both 0x08 (BS) and 0x7F (DEL) regardless of
+    `verase`.  `VINTR` aborts `readline` with `EINTR`.
+- qsh's `lex.c` interactive prompt path now routes through
+  `qsoe_ldisc_readline`.  **Backspace, VKILL, VEOF visible erase
+  all work** on the real `/dev/ser1` UART.  Arrow-key history and
+  Emacs-style raw editing remain a v0.7+ item (would need
+  `qsh/edit.c` + raw-mode driver handshake).
+
+### BSD-style boot (rc3)
+- `/sbin/init` is now a **shell script** (`userland/init/init.sh`,
+  mode 0755):
+  ```sh
+  #!/bin/sh
+  /sbin/devc-ser8250
+  /sbin/repath /dev/console /dev/ser1
+  exec /bin/qsh -i
+  ```
+- **Shebang support** in `tm_spawn`: blobs starting with `#!` are
+  recognised, the interpreter is looked up in cpiofs, argv is
+  re-built per Linux convention (`[interp, optional_arg, script_path,
+  original_argv[1..]]`), and the interpreter ELF is loaded.  Recursion
+  limit 1 — no nested `#!`.
+- **CPIO symlinks**: `bin/sh -> bin/qsh` ships in `userland.cpio`.
+  `tm_cpio_lookup` in `path/cpiofs.c` resolves one level of symlinks
+  (absolute *and* relative targets) and is used by `tm_cpiofs_open`,
+  `tm_cpiofs_probe`, and the shebang interpreter lookup.
+- **`/sbin/repath`** (new ~50-line helper) — CLI front-end for
+  `qsoe_pathmgr_repath`.  Two forms:
+  - `repath <target> <source>` — copies source's pathmgr binding to
+    target.  Used by init.sh; no pids needed at the script level.
+  - `repath <target> <pid> <chid>` — explicit form for tests.
+- New `TM_REQ_PATHMGR_RESOLVE` + `qsoe_pathmgr_resolve()` library
+  wrapper: longest-prefix lookup returning the bound
+  `(server_pid, server_chid, handler_kind)`.  `/sbin/repath` uses it
+  for the `<target> <source>` form.
+- `tm_process_create_by_name` handles absolute paths
+  (`/sbin/devc-ser8250`) directly; bare names try `bin/` then
+  `sbin/` (minimal `PATH`-search until libc gains `execvp`).
+- `spawn_name_eq` compares basenames so the devc-ser8250 cap-grant
+  special case works regardless of how the program was looked up.
+
+### Cleanup: `.elf` suffix dropped, `hello` retired
+- CPIO entries lose the `.elf` suffix: `bin/init` (script), `bin/qsh`,
+  `bin/tester`, `bin/sh` (→ qsh), `sbin/devc-ser8250`, `sbin/pipe`,
+  `sbin/repath`.  Build outputs in `$(BUILD)/*.elf` keep the suffix
+  for tooling clarity.
+- `userland/hello/` retired entirely — its smoke-test role is
+  covered by tester + qsh.
+- `userland/init/main.c` and `init/start.S` deleted; only `init.sh`
+  remains.
+
+### Errno + caps
+- New errno: `ENOEXEC = 8` in `<qsoe-system.h>` (used by shebang on
+  nested-interpreter / malformed script).
+- `cpiofs` stat returns mode `0555` (was `0444`) so qsh's
+  `search_access` lets binaries run.  Per-entry CPIO mode bits
+  threading deferred.
+
+### Documentation
+- Design doc Chapter 4 updated: new sections "Line discipline",
+  "Driver-side IRQ surface", "Deferred replies (MsgSavereply)";
+  obsolete `__sysinfo` bridge and brk/heap text rewritten;
+  "Relationship to musl libc" reflects the current direct
+  `os_dependent/` design and mmap-based malloc.  PDF rebuilds clean
+  (30 pages).
+
+### Verification
+- `make` — green; all binaries produced.
+- Boot in qemu — taskman banner, devc-ser8250 attaches, `/dev/ser1`
+  registered, init repoints `/dev/console`, qsh prompt visible on
+  the real UART.
+- Interactive typing + backspace + VKILL exercise the full LDISC
+  path on the rewritten driver.
+- `make` in `doc/tex/Design/` rebuilds the design PDF clean.
+
+### Known gaps / deferred to v0.7+
+- Arrow-key history navigation (needs qsh's raw-mode `edit.c` wired
+  in + `tcgetattr`/`tcsetattr` driver handshake).
+- `pause()` blocks but nothing wakes it yet — real signal delivery
+  to the in-process signal thread is v0.8.
+- `poll()` ships as a stub; real wait/wake is v0.8.
+- `TM_CLOCK_FREQ_HZ` hardcoded; v0.8 reads `/cpus/timebase-frequency`
+  from the device tree.
+- Cap-leak smoke test (tester) no longer runs at boot — init.sh
+  doesn't spawn tester.  Run on demand from the shell.
+- Mode-bit fidelity for cpiofs (currently every regular file is
+  0555).
+
 ## [v0.6.4] — 2026-05-15
 
 **Milestone: qsh runs and accepts input from the real interrupt-driven

@@ -151,6 +151,13 @@ enum {
      * path exist".  MR0 = path_len (path in msg[4..]).
      * Reply label = 0 / ENOENT / etc. */
     TM_REQ_ACCESS               = 0x30b,
+    /* resolve: longest-prefix lookup on a path.  MR0 = path_len (path
+     * in msg[4..]).  Reply MR0 = server_pid, MR1 = server_chid,
+     * MR2 = handler_kind, MR3 = bytes consumed by the match.  Label
+     * = 0 / ENOENT.  Used by /sbin/repath so it can copy an existing
+     * (pid, chid) binding to another path without the caller having
+     * to know the driver's pid. */
+    TM_REQ_PATHMGR_RESOLVE      = 0x30c,
 };
 
 /* Reply label conventions: 0 on success, positive QNX errno on failure.

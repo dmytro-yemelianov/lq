@@ -6,7 +6,7 @@
  */
 
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 
 uid_t geteuid(void)
 {

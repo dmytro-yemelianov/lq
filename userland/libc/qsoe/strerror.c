@@ -6,7 +6,7 @@
  * plain English messages, no translation, no per-thread buffer.
  *
  * The table is keyed by the QNX/QSOE errno values from
- * <qsoe/qrv.h> (matching musl's bits/errno.h for now).  Add entries
+ * <qsoe-system.h> (matching musl's bits/errno.h for now).  Add entries
  * as more callers turn up undefined refs that point here.
  */
 

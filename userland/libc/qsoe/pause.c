@@ -19,7 +19,7 @@
  */
 
 #include <unistd.h>
-#include <qsoe/qrv.h>
+#include <qsoe-system.h>
 #include <sel4_types.h>   /* seL4_Word */
 
 static int s_pause_chid = -1;
