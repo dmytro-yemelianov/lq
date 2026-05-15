@@ -16,7 +16,8 @@
 #ifndef QSOE_TASKMAN_CPIOFS_H
 #define QSOE_TASKMAN_CPIOFS_H
 
-#include "sel4_types.h"
+#include "../sel4_types.h"
+#include "path.h"
 
 /* Boot-time setup: hand cpiofs the embedded CPIO blob. */
 void tm_cpiofs_set_cpio(const void *start, unsigned long len);
@@ -42,5 +43,36 @@ int tm_cpiofs_open(const char *open_path, unsigned consumed,
  * the bytes are placed in qsoe_ipcbuf->msg[4..]. On EOF returns
  * 0 with *got=0. */
 int tm_cpiofs_read(seL4_Word badge, unsigned want, unsigned *got);
+
+/* Fill *out with file metadata for the cpiofs-bound connection at
+ * `badge`.  Reads file size from the connection's stashed ctx[]
+ * (set at open).  Returns 0 / -EBADF.  Mode is S_IFREG with the
+ * usual rwxr-xr-x permissions; cpiofs has no per-file ownership. */
+int tm_cpiofs_stat(seL4_Word badge, tm_stat_t *out);
+
+/* Probe whether `name` exists in the CPIO archive (used by unlink
+ * to distinguish ENOENT from EROFS).  Returns 0 if it exists,
+ * -ENOENT otherwise.  Name is relative — leading slashes stripped
+ * by the caller exactly as in tm_cpiofs_open. */
+int tm_cpiofs_probe(const char *name);
+
+/* Reposition the read pointer on a cpiofs connection.
+ *   whence: 0=SET, 1=CUR, 2=END
+ *   offset: signed byte offset
+ * Writes the resulting absolute offset into *out_off.  Returns
+ * 0 / -EBADF / -EINVAL. */
+int tm_cpiofs_lseek(seL4_Word badge, int whence, long offset, long *out_off);
+
+/* Return the next dirent for a connection opened on a directory.
+ *
+ *   badge:    the connection's scoid
+ *   name:     output, NUL-terminated entry name written here
+ *   namelen:  output, length of name (excluding NUL)
+ *   d_type:   output, DT_REG / DT_DIR
+ *
+ * Returns 0 on success, -ENOENT past the end of the directory,
+ * -ENOTDIR if the connection was opened on a regular file. */
+int tm_cpiofs_readdir(seL4_Word badge, char *name, unsigned *namelen,
+                      int *d_type);
 
 #endif

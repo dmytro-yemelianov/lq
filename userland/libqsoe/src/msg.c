@@ -31,7 +31,7 @@
 #include "qsoe_invoke.h"
 
 #ifdef QSOE_LIBQSOE_IN_TASKMAN
-#  include "server.h"
+#  include "proc/proc.h"
 #endif
 
 /* The IPC buffer pointer lives in the current thread's qsoe_tcb_t.

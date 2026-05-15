@@ -46,7 +46,7 @@ QSH_ELF    := $(BUILD)/qsh.elf
 # musl-via-isystem.
 ARCH_CFLAGS  := -march=rv64imafdc -mabi=lp64 -mno-relax \
                 -nostdinc -static -fno-stack-protector -fno-pic -ffreestanding
-QSH_CFLAGS   := $(ARCH_CFLAGS) -O2 -g \
+QSH_CFLAGS   := $(ARCH_CFLAGS) -std=c11 -D_DEFAULT_SOURCE -O2 -g \
                 -isystem $(MUSL_GEN)/include \
                 -isystem $(MUSL_DIR)/include \
                 -isystem $(MUSL_DIR)/arch/riscv64 \

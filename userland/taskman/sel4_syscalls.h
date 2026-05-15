@@ -18,9 +18,9 @@
 
 static inline void sel4_debug_putchar(char c)
 {
-    register long _a0 asm("a0") = (long)(unsigned char)c;
-    register long _a7 asm("a7") = SEL4_SYS_DEBUG_PUTCHAR;
-    asm volatile("ecall"
+    register long _a0 __asm__("a0") = (long)(unsigned char)c;
+    register long _a7 __asm__("a7") = SEL4_SYS_DEBUG_PUTCHAR;
+    __asm__ volatile("ecall"
                  : "+r"(_a0)
                  : "r"(_a7)
                  : "memory", "a1", "a2", "a3", "a4", "a5", "a6");

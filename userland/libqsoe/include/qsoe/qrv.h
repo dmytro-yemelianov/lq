@@ -49,25 +49,32 @@ typedef unsigned int  gid_t;
 #define QSOE_COF_NOSHARE    0x0040u
 #define QSOE_COF_NONBLOCK   0x0100u
 
-/* Error codes (QNX-compatible subset for v0.x). */
-#define EOK            0
-#define ENOENT         2
-#define ESRCH          3
-#define EAGAIN        11
-#define EBADF          9
-#define ENOMEM        12
-#define EINVAL        22
-#define E2BIG          7
-#define ESPIPE        29
-#define ENOTTY        25
-#define EROFS         30
-#define EISDIR        21
-#define EFBIG         27
-#define ECHILD        10
-#define ENODEV        19
-#define EBUSY         16
-#define ENOSYS        89
-#define EHOSTUNREACH 113
+/* Error codes (QNX-compatible subset for v0.x), sorted by value. */
+#define EOK             0
+#define EPERM           1
+#define ENOENT          2
+#define ESRCH           3
+#define EIO             5
+#define E2BIG           7
+#define EBADF           9
+#define ECHILD         10
+#define EAGAIN         11
+#define ENOMEM         12
+#define EFAULT         14
+#define EBUSY          16
+#define ENODEV         19
+#define ENOTDIR        20
+#define EISDIR         21
+#define EINVAL         22
+#define EMFILE         24
+#define ENOTTY         25
+#define EFBIG          27
+#define ESPIPE         29
+#define EROFS          30
+#define ERANGE         34
+#define ENAMETOOLONG   36
+#define ENOSYS         89
+#define EHOSTUNREACH  113
 
 int ChannelCreate(unsigned flags);
 int ChannelDestroy(int chid);
@@ -199,6 +206,54 @@ int MsgSendPulse(int coid, int priority, int code, int value);
  */
 int ConnectServerInfo(pid_t pid, int coid, struct _server_info *info);
 int ConnectClientInfo(int scoid, struct _client_info *info, int ngroups);
+
+/* v0.7: caller's own (pid, ppid, cred).  Backs POSIX
+ * getpid / getppid / getuid / geteuid / getgid / getegid via libc/qsoe. */
+int qsoe_proc_self_info(pid_t *out_pid, pid_t *out_ppid,
+                        struct _cred_info *out_cred);
+
+/* ============== QNX-compatible Clock / Timer core ============== */
+
+/* Types + CLOCK_* constants are guarded so QSOE-side translation units
+ * that also pull in musl's <time.h> don't trip on the duplicate
+ * definitions.  Values mirror musl's bits/alltypes.h / time.h so a
+ * single integer answers in both worlds. */
+#ifndef __DEFINED_clockid_t
+typedef int clockid_t;
+#define __DEFINED_clockid_t
+#endif
+#ifndef __DEFINED_timer_t
+typedef void *timer_t;
+#define __DEFINED_timer_t
+#endif
+
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME             0
+#define CLOCK_MONOTONIC            1
+#define CLOCK_PROCESS_CPUTIME_ID   2
+#define CLOCK_THREAD_CPUTIME_ID    3
+#endif
+
+struct _clockperiod {
+    unsigned int nsec;
+    int          fract;   /* fractional nsec; 64-bit fixed-point */
+};
+
+struct _clockadjust {
+    unsigned long tick_count;
+    long          tick_nsec_inc;
+};
+
+/* Set in _qsoe_start_main from TM_REQ_CLOCK_FREQ (in taskman, set
+ * directly from TM_CLOCK_FREQ_HZ).  Read by ClockTime / ClockCycles
+ * / nanosleep / etc.  Hz: ticks per second of RISC-V `rdtime`. */
+extern unsigned long qsoe_time_freq_hz;
+
+int ClockTime  (clockid_t id, const unsigned long *new_, unsigned long *old);
+int ClockAdjust(clockid_t id, const struct _clockadjust *new_, struct _clockadjust *old);
+int ClockPeriod(clockid_t id, const struct _clockperiod *new_, struct _clockperiod *old, int reserved);
+int ClockId    (pid_t pid, int tid);
+unsigned long ClockCycles(void);
 int ConnectFlags(pid_t pid, int coid, unsigned mask, unsigned bits);
 
 /*
@@ -280,14 +335,9 @@ int  posix_spawn(pid_t *pid_out, const char *path,
                  const void *file_actions, const void *attr,
                  char *const argv[], char *const envp[]);
 
-/* v0.5.0: POSIX-shape I/O. These are the wire-level callees musl's
- * read/write/open/close syscalls land in via __sysinfo (see
- * userland/libqsoe/src/syscall_dispatch.c). They can also be called
- * directly from -nostdlib programs that want raw IO. */
-int   qsoe_open  (const char *path, int flags);
-int   qsoe_close (int fd);
-long  qsoe_write (int fd, const void *buf, unsigned long count);
-long  qsoe_read  (int fd, void *buf, unsigned long count);
+/* POSIX IO entry points (open / close / read / write / writev) now
+ * live in userland/libc/qsoe/ and are resolved through libc.a — no
+ * qsoe_* shim here. */
 int  ProcessTerminate(pid_t pid, int status);
 void _exit(int status) __attribute__((noreturn));
 void exit (int status) __attribute__((noreturn));

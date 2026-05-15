@@ -28,7 +28,7 @@
 #include "qsoe_invoke.h"
 
 #ifdef QSOE_LIBQSOE_IN_TASKMAN
-#  include "server.h"
+#  include "proc/proc.h"
 #endif
 
 /* v0.4.1: worker region starts at 1 GiB — a separate L1 PT from the

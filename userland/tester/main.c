@@ -16,6 +16,14 @@
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
 
+/* v0.7: tester compiles with -nostdinc but links libc.a, so we
+ * forward-declare the POSIX IO entry points by hand.  The runtime
+ * call resolves to libc/qsoe/{open,close,read,write}.c at link. */
+extern int  open (const char *path, int flags, ...);
+extern int  close(int fd);
+extern long read (int fd, void *buf, unsigned long count);
+extern long write(int fd, const void *buf, unsigned long count);
+
 static void puthex(unsigned long x)
 {
     char buf[19];
@@ -61,25 +69,25 @@ int main(int argc, char **argv, char **envp)
      *        the new fd. These exercise the full pathmgr + console
      *        resmgr path without going through musl yet. --- */
     {
-        const char *out_msg = "[tester] stdout via qsoe_write(1)\n";
-        const char *err_msg = "[tester] stderr via qsoe_write(2)\n";
+        const char *out_msg = "[tester] stdout via write(1)\n";
+        const char *err_msg = "[tester] stderr via write(2)\n";
         unsigned out_len = 0; while (out_msg[out_len]) out_len++;
         unsigned err_len = 0; while (err_msg[err_len]) err_len++;
-        qsoe_write(1, out_msg, out_len);
-        qsoe_write(2, err_msg, err_len);
+        write(1, out_msg, out_len);
+        write(2, err_msg, err_len);
 
-        int cfd = qsoe_open("/dev/console", 0);
-        sel4_debug_puts("[tester] qsoe_open(/dev/console) -> fd=");
+        int cfd = open("/dev/console", 0);
+        sel4_debug_puts("[tester] open(/dev/console) -> fd=");
         putd(cfd);
         sel4_debug_putchar('\n');
         if (cfd >= 0) {
             const char *m = "[tester] write via opened /dev/console\n";
             unsigned ml = 0; while (m[ml]) ml++;
-            long w = qsoe_write(cfd, m, ml);
+            long w = write(cfd, m, ml);
             sel4_debug_puts("[tester] write -> ");
             putd((int)w);
             sel4_debug_putchar('\n');
-            qsoe_close(cfd);
+            close(cfd);
         }
     }
 
@@ -88,13 +96,13 @@ int main(int argc, char **argv, char **envp)
      *         path manager, cpiofs registered at "/", and the per-fd
      *         offset state in tm_connection_t.ctx[]. --- */
     {
-        int fd = qsoe_open("/bin/hello.elf", 0);
+        int fd = open("/bin/hello.elf", 0);
         sel4_debug_puts("[tester] open(/bin/hello.elf) -> fd=");
         putd(fd);
         sel4_debug_putchar('\n');
         if (fd >= 0) {
             unsigned char hdr[64];
-            long n = qsoe_read(fd, hdr, sizeof hdr);
+            long n = read(fd, hdr, sizeof hdr);
             sel4_debug_puts("[tester] read(fd, 64) -> ");
             putd((int)n);
             sel4_debug_puts(" bytes, magic=");
@@ -105,7 +113,7 @@ int main(int argc, char **argv, char **envp)
                 sel4_debug_putchar(' ');
             }
             sel4_debug_putchar('\n');
-            qsoe_close(fd);
+            close(fd);
         }
     }
 

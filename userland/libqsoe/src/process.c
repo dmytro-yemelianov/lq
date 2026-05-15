@@ -19,7 +19,7 @@
 #include "qsoe_invoke.h"
 
 #ifdef QSOE_LIBQSOE_IN_TASKMAN
-#  include "server.h"
+#  include "proc/proc.h"
 #endif
 
 /* Strlen for tiny C strings — libqsoe is freestanding, no libc. */

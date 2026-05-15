@@ -8,6 +8,12 @@
 # section via .incbin, and at runtime serves files from it through the
 # cpiofs handler.
 #
+# v0.7 layout — code is split across four subsystem dirs:
+#   sys/   — system services (console)
+#   proc/  — processes / threads / channels / connections / pulses + spawn
+#   mem/   — memory manager (mmap)
+#   path/  — pathmgr / cpiofs / open / close / io
+#
 # Hand-run: cd userland/taskman && make clean all
 #
 # Build-time precondition: $(USERLAND_CPIO) must exist.  The top-level
@@ -34,34 +40,33 @@ GEN         := $(BUILD)/gen
 OBJDIR     := $(BUILD)/taskman
 TASKMAN_ELF := $(BUILD)/taskman.elf
 
-# Inputs from sibling submakes.  The libqsoe submake produces these
-# alongside its own outputs.
 LIBQSOE_TM_A := $(BUILD)/libqsoe-tm.a
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
-# Compile flags — mirror the top-level TM_CFLAGS, plus libcpio for the
-# few TUs that talk to the embedded CPIO directly.
 ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 \
                -mcmodel=medany -mstrict-align
 
 TM_CFLAGS := $(ARCH_CFLAGS) \
-    -ffreestanding -nostdlib -nostdinc \
+    -std=c11 -ffreestanding -nostdlib -nostdinc \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
     -fno-builtin -Wall -Wextra \
     -I$(GEN) \
     -I$(CORE)/kernel/sel4_gen \
     -I$(LIBQSOE_DIR)/include
 
-# Headers shared across taskman/libqsoe TUs.
+# All taskman .h headers — used as a coarse "if anything changed,
+# rebuild" trigger for the .o pattern rules below.
 TM_HEADERS := \
     $(TASKMAN_DIR)/sel4_syscalls.h \
     $(TASKMAN_DIR)/sel4_types.h \
     $(TASKMAN_DIR)/qsoe_invoke.h \
-    $(TASKMAN_DIR)/server.h \
-    $(TASKMAN_DIR)/spawn.h \
-    $(TASKMAN_DIR)/pathmgr.h \
-    $(TASKMAN_DIR)/console.h \
-    $(TASKMAN_DIR)/cpiofs.h \
+    $(TASKMAN_DIR)/proc/proc.h \
+    $(TASKMAN_DIR)/proc/spawn.h \
+    $(TASKMAN_DIR)/mem/mem.h \
+    $(TASKMAN_DIR)/path/path.h \
+    $(TASKMAN_DIR)/path/pathmgr.h \
+    $(TASKMAN_DIR)/path/cpiofs.h \
+    $(TASKMAN_DIR)/sys/console.h \
     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
@@ -81,25 +86,25 @@ $(OBJDIR)/main.o: $(TASKMAN_DIR)/main.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
 
-$(OBJDIR)/server.o: $(TASKMAN_DIR)/server.c $(TM_HEADERS)
+# proc/ — process registry, channels, connections, threads, pulses, spawn.
+$(OBJDIR)/proc/%.o: $(TASKMAN_DIR)/proc/%.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
 
-$(OBJDIR)/spawn.o: $(TASKMAN_DIR)/spawn.c $(TM_HEADERS)
+# mem/ — memory manager.
+$(OBJDIR)/mem/%.o: $(TASKMAN_DIR)/mem/%.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-$(OBJDIR)/pathmgr.o: $(TASKMAN_DIR)/pathmgr.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(OBJDIR)/console.o: $(TASKMAN_DIR)/console.c $(TM_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
-$(OBJDIR)/cpiofs.o: $(TASKMAN_DIR)/cpiofs.c $(TM_HEADERS)
+# path/ — pathmgr + cpiofs + IO dispatch.
+$(OBJDIR)/path/%.o: $(TASKMAN_DIR)/path/%.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+
+# sys/ — console (other system services later).
+$(OBJDIR)/sys/%.o: $(TASKMAN_DIR)/sys/%.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
 # libcpio from core/.  Same .o as elfloader uses to navigate its own
 # CPIO; we just compile a second copy with taskman's flags.
@@ -108,8 +113,6 @@ $(OBJDIR)/cpio.o: $(LIBCPIO)/src/cpio.c
 	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
 
 # Embed the userland CPIO archive in a custom section via .incbin.
-# Two symbols (_userland_cpio_start / _end) bracket it so taskman's
-# C side can walk it at runtime.
 $(OBJDIR)/userland_archive.S: $(USERLAND_CPIO)
 	@mkdir -p $(@D)
 	@printf '%s\n' \
@@ -128,15 +131,21 @@ $(OBJDIR)/userland_archive.o: $(OBJDIR)/userland_archive.S
 TASKMAN_OBJS := \
     $(OBJDIR)/start.o \
     $(OBJDIR)/main.o \
-    $(OBJDIR)/server.o \
-    $(OBJDIR)/spawn.o \
-    $(OBJDIR)/pathmgr.o \
-    $(OBJDIR)/console.o \
-    $(OBJDIR)/cpiofs.o \
+    $(OBJDIR)/proc/process.o \
+    $(OBJDIR)/proc/channel.o \
+    $(OBJDIR)/proc/connect.o \
+    $(OBJDIR)/proc/thread.o \
+    $(OBJDIR)/proc/pulse.o \
+    $(OBJDIR)/proc/spawn.o \
+    $(OBJDIR)/mem/mmap.o \
+    $(OBJDIR)/path/pathmgr.o \
+    $(OBJDIR)/path/cpiofs.o \
+    $(OBJDIR)/path/io.o \
+    $(OBJDIR)/sys/console.o \
     $(OBJDIR)/cpio.o \
     $(OBJDIR)/userland_archive.o
 
-# Link.  --whole-archive on libqsoe-tm.a so all 7 IPC handlers come in
+# Link.  --whole-archive on libqsoe-tm.a so all IPC handlers come in
 # even when taskman's own code doesn't directly reference them.
 $(TASKMAN_ELF): $(TASKMAN_OBJS) $(LIBQSOE_TM_A)
 	@mkdir -p $(@D)

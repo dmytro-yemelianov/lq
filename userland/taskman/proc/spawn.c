@@ -8,11 +8,11 @@
  */
 
 #include "spawn.h"
-#include "sel4_syscalls.h"
-#include "qsoe_invoke.h"
-#include "server.h"
-#include "pathmgr.h"
-#include "../libqsoe/include/qsoe/slots.h"
+#include "../sel4_syscalls.h"
+#include "../qsoe_invoke.h"
+#include "proc.h"
+#include "../path/pathmgr.h"
+#include "../../libqsoe/include/qsoe/slots.h"
 
 /* ELF64 minimal types — just enough to walk PHDRs. */
 typedef unsigned char  u8;
@@ -127,10 +127,8 @@ static int scratch_unmap(seL4_CPtr frame)
     return (int)qsoe_riscv_page_unmap(frame);
 }
 
-/* The shared spawn state — single-shot for v0.3.0. */
-extern seL4_CPtr s_untyped;   /* defined in server.c */
-extern seL4_CPtr s_cnode_root;
-extern seL4_CPtr s_next_slot;
+/* The shared spawn state — defined in proc/process.c, declared
+ * extern via proc.h.  No re-declaration needed here. */
 
 /* Allocate one untyped retype into the next free slot. Returns the
  * slot on success, 0 on failure. */
@@ -661,54 +659,5 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_tcb_resume(tcb);
     if (err) { sel4_debug_puts("spawn: TCB_Resume failed\n"); return -ENOMEM; }
 
-    return 0;
-}
-
-/* ----------------------------------------------------------------------
- * v0.6.4 Memory Manager.
- *
- * tm_mmap_serve — serve one TM_REQ_MMAP.  Allocates Mega_Pages from
- * taskman's main untyped pool, maps them contiguously into the
- * caller's VSpace at its mmap_top cursor, advances mmap_top, returns
- * the base vaddr.
- *
- * v0.6.4 limitations:
- *   - Granularity is 2 MiB; callers asking for less get a 2 MiB
- *     mapping anyway.
- *   - No munmap, so addresses are bump-allocated and never reclaimed.
- *   - No L0 PT lazy-allocation: each Mega_Page goes straight into the
- *     L1 it shares with neighbours, which works because Sv39 has one
- *     L1 entry per 1 GiB and we never grow past 1 GiB per process.
- *     v0.7+ will lift that.
- */
-int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long *out_vaddr)
-{
-    tm_process_t *proc = tm_process_lookup(caller);
-    if (!proc) return -ESRCH;
-    if (len == 0) return -EINVAL;
-
-    /* Round up to a multiple of QSOE_MEGA_PAGE. */
-    unsigned long bytes = (len + QSOE_MEGA_PAGE - 1) & ~(QSOE_MEGA_PAGE - 1);
-    unsigned long base  = proc->mmap_top;
-    unsigned long pages = bytes / QSOE_MEGA_PAGE;
-
-    for (unsigned long i = 0; i < pages; ++i) {
-        seL4_CPtr frame = alloc_object(seL4_RISCV_Mega_Page, 0);
-        if (!frame) {
-            sel4_debug_puts("tm_mmap_serve: Mega_Page alloc failed\n");
-            return -ENOMEM;
-        }
-        seL4_Word err = qsoe_riscv_page_map(frame, proc->vspace,
-                                            base + i * QSOE_MEGA_PAGE,
-                                            QSOE_RIGHTS_ALL,
-                                            QSOE_VM_ATTR_DEFAULT);
-        if (err) {
-            sel4_debug_puts("tm_mmap_serve: Page_Map failed\n");
-            return -ENOMEM;
-        }
-    }
-
-    proc->mmap_top = base + bytes;
-    *out_vaddr = base;
     return 0;
 }

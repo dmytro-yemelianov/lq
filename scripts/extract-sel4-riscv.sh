@@ -10,7 +10,7 @@
 # Usage:
 #   ./extract-sel4-riscv.sh [output_dir]
 #
-# If output_dir is not specified, defaults to "./qsoe".
+# If output_dir is not specified, defaults to "core".
 #
 # Placement file format:
 #   # Comment lines start with #
@@ -37,7 +37,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PLACEMENT_FILE="${SCRIPT_DIR}/placement.txt"
 MANIFEST_URL="https://github.com/seL4/sel4test-manifest.git"
 SOURCE_DIR_NAME="sel4test-full"
-OUTPUT_DIR="${1:-./qsoe}"
+OUTPUT_DIR="${1:-./core}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -360,6 +360,29 @@ echo "  Patterns: ${patterns} processed"
 echo "  Missing:  ${missing} files/patterns"
 echo "  Skipped:  ${skipped} lines"
 echo
+
+# Apply patches from scripts/patches/*.patch in lexicographic order.
+# Each patch is a unified diff against $(OUTPUT_DIR); a failure aborts
+# the extract loudly so we notice when upstream drift breaks a patch.
+PATCH_DIR="${SCRIPT_DIR}/patches"
+if [[ -d "${PATCH_DIR}" ]]; then
+    step "Applying patches from ${PATCH_DIR}"
+    applied=0
+    shopt -s nullglob
+    for pf in "${PATCH_DIR}"/*.patch; do
+        info "  ${pf##*/}"
+        if ! patch -p1 -d "${OUTPUT_DIR}" -i "${pf}" >/dev/null; then
+            error "Patch failed to apply: ${pf}"
+            error "Upstream likely drifted — rebase the patch and retry."
+            exit 1
+        fi
+        applied=$((applied + 1))
+    done
+    shopt -u nullglob
+    echo "  ${applied} patch(es) applied"
+    echo
+fi
+
 info "Output: ${OUTPUT_DIR}"
 
 # Show directory structure summary (limit depth for large trees)

@@ -39,6 +39,13 @@ typedef struct qsoe_tcb {
     /* ThreadCtl-managed. */
     char       name[16];
     unsigned   runmask;
+
+    /* v0.7 per-thread signal mask, backing pthread_sigmask().  Same
+     * 128-byte layout as musl's sigset_t so a sigset_t* can be
+     * memcpy'd directly in/out.  Honored by signal delivery when
+     * the signal thread evolves to consult it (v0.7 delivery is
+     * mask-unaware; the storage works regardless). */
+    unsigned char sig_mask[128];
 } qsoe_tcb_t;
 
 /* The main thread of every process has static storage so the crt0 can

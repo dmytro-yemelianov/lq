@@ -1,21 +1,30 @@
 /*
  * taskman — central system server (QSOE).
  *
- * v0.2: wires up the four QNX-style IPC lifecycle calls
- * (ChannelCreate / ChannelDestroy / ConnectAttach / ConnectDetach)
- * via libqsoe and exercises them in a self-test. The dispatch loop
- * for serving these calls from *other* processes lands in v0.3, when
- * we have a second process to call from.
+ * main.c owns the dispatch loop (Recv → handler → ReplyRecv).  The
+ * handlers themselves live in subsystem dirs:
+ *   proc/  — processes / threads / channels / connections / pulses
+ *   mem/   — mmap
+ *   path/  — pathmgr + cpiofs + open/close/io
+ *   sys/   — console (and other system services)
+ *
+ * v0.7 split: server.{c,h} retired; each handler imported from its
+ * subsystem header.
  */
 
 #include "sel4_syscalls.h"
 #include "sel4_types.h"
 #include "qsoe_invoke.h"
-#include "server.h"
-#include "spawn.h"
-#include "pathmgr.h"
-#include "console.h"
-#include "cpiofs.h"
+
+#include "proc/proc.h"
+#include "proc/spawn.h"
+#include "mem/mem.h"
+#include "path/path.h"
+#include "path/pathmgr.h"
+#include "path/cpiofs.h"
+#include "sys/console.h"
+#include "sys/platform.h"
+
 #include "../libqsoe/include/qsoe/qrv.h"
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
@@ -25,9 +34,7 @@
 extern char _userland_cpio_start[];
 extern char _userland_cpio_end[];
 
-/* Dispatch one incoming message. Inputs: the request's badge + MRs.
- * Outputs: the reply tag and the reply MRs (up to 4 — most calls only
- * fill 0 or 1; the introspection calls fill up to 3). */
+/* Dispatch one incoming message. */
 static seL4_MessageInfo_t
 tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3,
@@ -47,6 +54,30 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     *out_no_reply = 0;
 
     switch (label) {
+    /* ---------- sysmgr ---------- */
+    case TM_REQ_DEBUG_SLOT_COUNT:
+        *out_mr0 = (seL4_Word)s_next_slot;
+        reply_len = 1;
+        break;
+    case TM_REQ_CLOCK_FREQ: {
+        /* RISC-V `time` CSR frequency.  v0.7: hardcoded for qemu-virt;
+         * v0.8 reads /cpus/timebase-frequency from the FDT instead. */
+        *out_mr0 = (seL4_Word)TM_CLOCK_FREQ_HZ;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_PING_CLIENTINFO: {
+        /* Demo: exercise ConnectClientInfo from inside the dispatch
+         * loop.  The badge IS the scoid of the calling connection. */
+        struct _client_info ci;
+        int rc = ConnectClientInfo((int)badge, &ci, 0);
+        *out_mr0 = mr0 + 1;
+        *out_mr1 = (rc == 0) ? (seL4_Word)ci.pid : (seL4_Word)-1;
+        reply_len = 2;
+        break;
+    }
+
+    /* ---------- procmgr ---------- */
     case TM_REQ_CHANNEL_CREATE: {
         int chid = (int)mr0;
         unsigned flags = (unsigned)mr1;
@@ -57,32 +88,25 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_CHANNEL_DESTROY: {
-        seL4_CPtr recv_slot = (seL4_CPtr)mr0;
-        int rc = tm_channel_destroy(caller, recv_slot);
+        int rc = tm_channel_destroy(caller, (seL4_CPtr)mr0);
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
     case TM_REQ_CONNECT_ATTACH: {
-        pid_t target_pid = (pid_t)mr0;
-        int target_chid = (int)mr1;
-        unsigned flags = (unsigned)mr2;
         unsigned long send_slot = 0;
-        int rc = tm_connect_attach(caller, target_pid, target_chid,
-                                    flags, &send_slot);
+        int rc = tm_connect_attach(caller, (pid_t)mr0, (int)mr1,
+                                    (unsigned)mr2, &send_slot);
         if (rc) { err = (seL4_Word)(-rc); }
         else    { *out_mr0 = send_slot; reply_len = 1; }
         break;
     }
     case TM_REQ_CONNECT_DETACH: {
-        seL4_CPtr send_slot = (seL4_CPtr)mr0;
-        int rc = tm_connect_detach(caller, send_slot);
+        int rc = tm_connect_detach(caller, (seL4_CPtr)mr0);
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
     case TM_REQ_CONNECT_SERVER_INFO: {
-        pid_t server_pid = 0;
-        int server_chid = 0;
-        seL4_Word scoid = 0;
+        pid_t server_pid = 0; int server_chid = 0; seL4_Word scoid = 0;
         int rc = tm_connect_server_info(caller, (seL4_CPtr)mr0,
                                          &server_pid, &server_chid, &scoid);
         if (rc) { err = (seL4_Word)(-rc); }
@@ -95,8 +119,7 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_CONNECT_CLIENT_INFO: {
-        pid_t client_pid = 0, sid = 0;
-        unsigned cflags = 0;
+        pid_t client_pid = 0, sid = 0; unsigned cflags = 0;
         int rc = tm_connect_client_info((seL4_Word)mr0,
                                          &client_pid, &sid, &cflags);
         if (rc) { err = (seL4_Word)(-rc); }
@@ -116,17 +139,28 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         else    { *out_mr0 = (seL4_Word)old; reply_len = 1; }
         break;
     }
+    case TM_REQ_THREAD_ALLOC: {
+        int new_tid = 0;
+        seL4_CPtr tcb_slot = 0, ntfn_slot = 0;
+        unsigned prio_byte = (unsigned)(mr3 & 0xffu);
+        unsigned affinity  = (unsigned)((mr3 >> 8) & 0xffu);
+        int rc = tm_thread_alloc(caller,
+                                  (unsigned long)mr0, (unsigned)mr1,
+                                  (unsigned long)mr2,
+                                  prio_byte, affinity,
+                                  &new_tid, &tcb_slot, &ntfn_slot);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else {
+            *out_mr0 = (seL4_Word)tcb_slot;
+            *out_mr1 = (seL4_Word)ntfn_slot;
+            *out_mr2 = (seL4_Word)new_tid;
+            reply_len = 3;
+        }
+        break;
+    }
     case TM_REQ_PROCESS_CREATE: {
-        /* v0.4.4 wire layout:
-         *   MR0 = argc       MR1 = envc
-         *   MR2 = path_len   MR3 = total_strs_bytes (sum over all strings)
-         *   ipcbuf->msg[4..] = path bytes + argv strings + envp strings,
-         *     each string NUL-terminated.
-         *
-         * The kernel only transfers msg[4..length-1]; MR0..3 are
-         * register-passed. Strings are unpacked into a static staging
-         * area below, scanned for NULs to build argv[]/envp[] pointer
-         * arrays, and handed to tm_process_create_by_name. */
+        /* MR0=argc, MR1=envc, MR2=path_len, MR3=total_strs_bytes;
+         * strings live at ipcbuf->msg[4..]. */
         int argc = (int)mr0;
         int envc = (int)mr1;
         unsigned plen = (unsigned)mr2;
@@ -142,18 +176,16 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             err = (seL4_Word)EINVAL;
             break;
         }
-        /* Copy strings out of the IPC buffer into the staging area. */
         const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
         for (unsigned i = 0; i < total_strs; ++i) s_staging[i] = (char)src[i];
 
-        /* Path comes first; argv strings next; envp strings last. */
         const char *path = s_staging;
-        unsigned off = plen + 1;  /* one extra byte for the NUL after path */
+        unsigned off = plen + 1;
         for (int i = 0; i < argc; ++i) {
             if (off >= total_strs) { err = (seL4_Word)EINVAL; break; }
             s_argv[i] = &s_staging[off];
             while (off < total_strs && s_staging[off] != 0) ++off;
-            ++off;  /* skip the NUL */
+            ++off;
         }
         if (err) break;
         for (int i = 0; i < envc; ++i) {
@@ -171,34 +203,30 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
                                             &new_pid);
         if (rc) { err = (seL4_Word)(-rc); }
         else {
-            /* v0.6.1: record the parent so the child's eventual
-             * procmgr_detach or exit can find whom to reply to. */
             tm_process_set_parent(new_pid, caller);
             *out_mr0 = (seL4_Word)new_pid;
             reply_len = 1;
         }
         break;
     }
-    case TM_REQ_DEBUG_SLOT_COUNT: {
-        /* Diagnostic: return taskman's bump-pointer for cap-leak tests. */
-        extern seL4_CPtr s_next_slot;
-        *out_mr0 = (seL4_Word)s_next_slot;
-        reply_len = 1;
+    case TM_REQ_PROCESS_TERMINATE: {
+        pid_t target = (pid_t)mr0;
+        if (target == 0) target = caller;
+        int rc = tm_process_terminate(target, (int)mr1);
+        if (rc) { err = (seL4_Word)(-rc); }
+        else if (target == caller) {
+            *out_no_reply = 1;
+        }
         break;
     }
     case TM_REQ_PULSE_SEND: {
-        /* MR0 = connection slot (in caller's CSpace), MR1 = priority,
-         * MR2 = code (signed), MR3 = value. */
         int rc = tm_pulse_send(caller, (seL4_CPtr)mr0,
                                 (int)mr1, (int)(int8_t)mr2, (int)mr3);
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
     case TM_REQ_PULSE_FETCH: {
-        /* MR0 = recv_slot. Reply MR0=code, MR1=value, MR2=sender_pid,
-         * MR3=scoid. label=0 success, ENOENT empty. */
-        tm_pulse_t p;
-        int scoid = 0;
+        tm_pulse_t p; int scoid = 0;
         int rc = tm_pulse_fetch(caller, (seL4_CPtr)mr0, &p, &scoid);
         if (rc) { err = (seL4_Word)(-rc); }
         else {
@@ -210,159 +238,14 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         }
         break;
     }
-    case TM_REQ_PROCESS_TERMINATE: {
-        /* MR0 = target pid (0 = self), MR1 = exit status.
-         * For self-terminate, the caller's TCB is revoked inside the
-         * handler — we signal the dispatch loop to skip Reply. */
-        pid_t target = (pid_t)mr0;
-        if (target == 0) target = caller;
-        int rc = tm_process_terminate(target, (int)mr1);
-        if (rc) { err = (seL4_Word)(-rc); }
-        else if (target == caller) {
-            /* Caller's TCB is gone — there's no thread to reply to. */
-            *out_no_reply = 1;
-        }
-        break;
-    }
-    case TM_REQ_THREAD_ALLOC: {
-        int new_tid = 0;
-        seL4_CPtr tcb_slot = 0, ntfn_slot = 0;
-        /* MR3 packs prio (low 8 bits) + affinity (next 8 bits). */
-        unsigned prio_byte    = (unsigned)(mr3 & 0xffu);
-        unsigned affinity     = (unsigned)((mr3 >> 8) & 0xffu);
-        int rc = tm_thread_alloc(caller,
-                                  (unsigned long)mr0, (unsigned)mr1,
-                                  (unsigned long)mr2,
-                                  prio_byte, affinity,
-                                  &new_tid, &tcb_slot, &ntfn_slot);
-        if (rc) { err = (seL4_Word)(-rc); }
-        else {
-            *out_mr0 = (seL4_Word)tcb_slot;
-            *out_mr1 = (seL4_Word)ntfn_slot;
-            *out_mr2 = (seL4_Word)new_tid;
-            reply_len = 3;
-        }
-        break;
-    }
-    case TM_REQ_OPEN: {
-        /* MR0 = path length in bytes. Path bytes ride in msg[4..]. */
-        unsigned plen = (unsigned)mr0;
-        if (plen == 0 || plen >= 128) { err = (seL4_Word)EINVAL; break; }
-
-        /* Copy + NUL-terminate the path locally so resolve() sees a
-         * proper C string. */
-        static char s_open_path[128];
-        const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
-        for (unsigned i = 0; i < plen; ++i) s_open_path[i] = (char)src[i];
-        s_open_path[plen] = 0;
-
-        tm_pathmgr_obj_t obj;
-        unsigned consumed = 0;
-        int rc = tm_pathmgr_resolve(s_open_path, &obj, &consumed);
-        if (rc) { err = (seL4_Word)(-rc); break; }
-
-        /* ConnectAttach mints a badged Send cap on
-         * (server_pid, server_chid) into the caller's CSpace.
-         * Same code path for in-taskman and external resmgrs. */
-        seL4_CPtr slot = 0;
-        rc = tm_connect_attach(caller, obj.server_pid, obj.server_chid,
-                                0, &slot);
-        if (rc) { err = (seL4_Word)(-rc); break; }
-
-        /* v0.6.0: handlers that need per-fd state populate it here.
-         * cpiofs stores the (data, size) of the resolved file so
-         * subsequent IO_READ can resume from the right offset. */
-        if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CPIOFS) {
-            seL4_Word badge = 0;
-            if (tm_connection_badge_by_slot(caller, slot, &badge) == 0) {
-                int orc = tm_cpiofs_open(s_open_path, consumed, badge);
-                if (orc) {
-                    /* Roll back the mint — file not found. */
-                    tm_connect_detach(caller, slot);
-                    err = (seL4_Word)(-orc);
-                    break;
-                }
-            }
-        }
-        *out_mr0 = slot;
-        reply_len = 1;
-        break;
-    }
-    case TM_REQ_CLOSE: {
-        /* MR0 = the connection slot in the caller's CSpace. */
-        seL4_CPtr slot = (seL4_CPtr)mr0;
-        int rc = tm_connect_detach(caller, slot);
-        if (rc) err = (seL4_Word)(-rc);
-        break;
-    }
-    case TM_REQ_IO_WRITE: {
-        /* Badge identifies the connection; we look up which channel
-         * it points at and route. MR0 = nbytes (the count of bytes
-         * the client placed into msg[4..]). */
-        unsigned nbytes = (unsigned)mr0;
-        pid_t srv_pid = 0;
-        int srv_chid = 0;
-        if (tm_channel_by_badge(badge, &srv_pid, &srv_chid) != 0) {
-            err = (seL4_Word)EBADF;
-            break;
-        }
-        if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
-            unsigned wrote = tm_console_write(nbytes);
-            *out_mr0 = (seL4_Word)wrote;
-            reply_len = 1;
-        } else if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
-            err = (seL4_Word)EROFS;  /* cpiofs is read-only */
-        } else {
-            err = (seL4_Word)ENOSYS;  /* external resmgr — v0.6+ */
-        }
-        break;
-    }
-    case TM_REQ_IO_READ: {
-        unsigned want = (unsigned)mr0;
-        pid_t srv_pid = 0;
-        int srv_chid = 0;
-        if (tm_channel_by_badge(badge, &srv_pid, &srv_chid) != 0) {
-            err = (seL4_Word)EBADF;
-            break;
-        }
-        if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
-            unsigned got = 0;
-            int rc = tm_console_read(want, &got);
-            if (rc) { err = (seL4_Word)(-rc); break; }
-            *out_mr0 = (seL4_Word)got;
-            reply_len = 1;
-        } else if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
-            unsigned got = 0;
-            int rc = tm_cpiofs_read(badge, want, &got);
-            if (rc) { err = (seL4_Word)(-rc); break; }
-            *out_mr0 = (seL4_Word)got;
-            /* The byte payload lives in msg[4..]; the kernel only
-             * transfers msg[4..length-1] across IPC, so the reply
-             * length needs to cover those words (the +4 accounts for
-             * the four register-passed MRs). */
-            reply_len = 4 + (got + 7) / 8;
-        } else {
-            err = (seL4_Word)ENOSYS;
-        }
-        break;
-    }
     case TM_REQ_PROC_DETACH: {
-        /* MR0 = status. The caller is the detacher (its own pid). */
-        int status = (int)mr0;
-        int rc = tm_process_detach(caller, status);
+        int rc = tm_process_detach(caller, (int)mr0);
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
     case TM_REQ_WAITPID: {
-        /* MR0 = pid to wait on. Reply MR0 = status, label = 0 on
-         * success. If the child hasn't detached/exited yet, taskman
-         * SaveCallers the parent's reply slot and parks it on the
-         * child's record; out_no_reply=1 tells the dispatcher to skip
-         * the reply phase. The deferred reply fires from
-         * tm_process_detach when the child finally signals. */
         pid_t child = (pid_t)mr0;
-        int status = 0;
-        int parked = 0;
+        int status = 0; int parked = 0;
         int rc = tm_process_waitpid(caller, child, &status, &parked);
         if (rc) {
             err = (seL4_Word)(-rc);
@@ -374,9 +257,176 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         }
         break;
     }
+    case TM_REQ_REGISTER_SIGNAL_CHID: {
+        tm_process_t *proc = tm_process_lookup(caller);
+        if (!proc) { err = (seL4_Word)ESRCH; break; }
+        proc->signal_chid = (int)mr0;
+        break;
+    }
+    case TM_REQ_GET_SIGNAL_CHID: {
+        pid_t target = (pid_t)mr0;
+        tm_process_t *proc = tm_process_lookup(target);
+        if (!proc || proc->signal_chid == 0) {
+            err = (seL4_Word)ESRCH;
+            break;
+        }
+        *out_mr0 = (seL4_Word)target;
+        *out_mr1 = (seL4_Word)proc->signal_chid;
+        reply_len = 2;
+        break;
+    }
+    case TM_REQ_CHDIR: {
+        int rc = tm_chdir(caller, (unsigned)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_GETCWD: {
+        unsigned len = 0;
+        int rc = tm_getcwd(caller, &len);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)len;
+        /* Bytes ride in msg[4..]; framing covers the MR0..3 quad
+         * plus enough words for the path payload. */
+        reply_len = 4 + (len + 7) / 8;
+        break;
+    }
+    case TM_REQ_DUP_CAP: {
+        int rc = tm_dup_cap(caller, (seL4_CPtr)mr0, (seL4_CPtr)mr1);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_UMASK: {
+        /* MR0 = new mask (-1 means "query only").  Reply MR0 = old mask. */
+        unsigned old = 0;
+        int set = (int)(long)mr0;
+        int rc = tm_umask(caller, set, &old);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)old;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_SET_CRED: {
+        /* mr0 = ruid<<32|euid, mr1 = suid<<32|rgid, mr2 = egid<<32|sgid.
+         * 0xFFFFFFFF in any 32-bit field means "no change". */
+        unsigned ruid = (unsigned)(mr0 & 0xFFFFFFFFu);
+        unsigned euid = (unsigned)((mr0 >> 32) & 0xFFFFFFFFu);
+        unsigned suid = (unsigned)(mr1 & 0xFFFFFFFFu);
+        unsigned rgid = (unsigned)((mr1 >> 32) & 0xFFFFFFFFu);
+        unsigned egid = (unsigned)(mr2 & 0xFFFFFFFFu);
+        unsigned sgid = (unsigned)((mr2 >> 32) & 0xFFFFFFFFu);
+        int rc = tm_set_cred(caller, ruid, euid, suid, rgid, egid, sgid);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_PROC_SELF_INFO: {
+        /* v0.7: backs POSIX getpid/getppid/getuid/etc.  Caller's pid
+         * is in the badge; no MR inputs.  Reply layout (8 32-bit
+         * fields, packed two per 64-bit MR):
+         *   mr0 = pid     | (ppid << 32)
+         *   mr1 = ruid    | (euid << 32)
+         *   mr2 = suid    | (rgid << 32)
+         *   mr3 = egid    | (sgid << 32)
+         */
+        pid_t pid = 0, ppid = 0;
+        tm_cred_t cred;
+        int rc = tm_proc_self_info(caller, &pid, &ppid, &cred);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = ((seL4_Word)(uint32_t)pid)  | ((seL4_Word)(uint32_t)ppid      << 32);
+        *out_mr1 = ((seL4_Word)cred.ruid)      | ((seL4_Word)cred.euid           << 32);
+        *out_mr2 = ((seL4_Word)cred.suid)      | ((seL4_Word)cred.rgid           << 32);
+        *out_mr3 = ((seL4_Word)cred.egid)      | ((seL4_Word)cred.sgid           << 32);
+        reply_len = 4;
+        break;
+    }
+
+    /* ---------- memmgr ---------- */
+    case TM_REQ_MMAP: {
+        unsigned long base = 0;
+        int rc = tm_mmap_serve(caller, (unsigned long)mr0, &base);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)base;
+        reply_len = 1;
+        break;
+    }
+
+    /* ---------- pathmgr / IO ---------- */
+    case TM_REQ_OPEN: {
+        seL4_CPtr slot = 0;
+        int rc = tm_io_open(caller, (unsigned)mr0, &slot);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = slot;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_CLOSE: {
+        int rc = tm_io_close(caller, (seL4_CPtr)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_IO_WRITE: {
+        unsigned wrote = 0;
+        int rc = tm_io_write(caller, badge, (unsigned)mr0, &wrote);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)wrote;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_IO_READ: {
+        unsigned got = 0;
+        int rc = tm_io_read(caller, badge, (unsigned)mr0, &got);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)got;
+        /* The byte payload lives in msg[4..]; the kernel only
+         * transfers msg[4..length-1] across IPC, so the reply
+         * length needs to cover those words (the +4 accounts for
+         * the four register-passed MRs). */
+        reply_len = 4 + (got + 7) / 8;
+        break;
+    }
+    case TM_REQ_UNLINK: {
+        int rc = tm_unlink(caller, (unsigned)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_FSTAT: {
+        unsigned bytes = 0;
+        int rc = tm_fstat(caller, badge, &bytes);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)bytes;
+        reply_len = 4 + (bytes + 7) / 8;
+        break;
+    }
+    case TM_REQ_READLINK: {
+        unsigned bytes = 0;
+        int rc = tm_readlink(caller, (unsigned)mr0, &bytes);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)bytes;
+        reply_len = 4 + (bytes + 7) / 8;
+        break;
+    }
+    case TM_REQ_LSEEK: {
+        /* MR0 = whence, MR1 = signed 64-bit offset. */
+        long off = 0;
+        int rc = tm_lseek(caller, badge, (int)mr0, (long)mr1, &off);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)off;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_READDIR: {
+        unsigned bytes = 0;
+        int rc = tm_readdir(caller, badge, &bytes);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)bytes;
+        reply_len = 4 + (bytes + 7) / 8;
+        break;
+    }
+    case TM_REQ_ACCESS: {
+        int rc = tm_access(caller, (unsigned)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
     case TM_REQ_PATHMGR_REGISTER: {
-        /* MR0 = path_len, MR1 = chid. Caller (from badge) is the
-         * announcing resmgr; path bytes in msg[4..]. */
         unsigned plen = (unsigned)mr0;
         int chid = (int)mr1;
         if (plen == 0 || plen >= 128) { err = (seL4_Word)EINVAL; break; }
@@ -396,8 +446,6 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_PATHMGR_REPATH: {
-        /* MR0 = path_len, MR1 = new server pid, MR2 = new server chid,
-         * MR3 = new handler_kind. Path bytes in msg[4..]. */
         unsigned plen = (unsigned)mr0;
         if (plen == 0 || plen >= 128) { err = (seL4_Word)EINVAL; break; }
         static char s_repath[128];
@@ -415,55 +463,7 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
-    case TM_REQ_REGISTER_SIGNAL_CHID: {
-        /* Caller's signal thread tells taskman the chid (in caller's
-         * own coid namespace) of the channel it listens on for
-         * signal pulses.  MR0 = chid.  Reply label = 0 on success,
-         * ESRCH if caller pid is unknown. */
-        tm_process_t *proc = tm_process_lookup(caller);
-        if (!proc) { err = (seL4_Word)ESRCH; break; }
-        proc->signal_chid = (int)mr0;
-        break;
-    }
-    case TM_REQ_GET_SIGNAL_CHID: {
-        /* kill(target, sig) asks taskman where to send the pulse.
-         * MR0 = target pid.  Reply: MR0 = target pid, MR1 = chid.
-         * Label = ESRCH if target unknown or hasn't registered. */
-        pid_t target = (pid_t)mr0;
-        tm_process_t *proc = tm_process_lookup(target);
-        if (!proc || proc->signal_chid == 0) {
-            err = (seL4_Word)ESRCH;
-            break;
-        }
-        *out_mr0 = (seL4_Word)target;
-        *out_mr1 = (seL4_Word)proc->signal_chid;
-        reply_len = 2;
-        break;
-    }
-    case TM_REQ_MMAP: {
-        /* Memory Manager: allocate Mega_Pages on demand and map them
-         * into the caller's vspace.  MR0 = length (bytes).  Reply:
-         * MR0 = base vaddr.  Label = errno on failure. */
-        unsigned long len = (unsigned long)mr0;
-        unsigned long base = 0;
-        int rc = tm_mmap_serve(caller, len, &base);
-        if (rc) { err = (seL4_Word)(-rc); break; }
-        *out_mr0 = (seL4_Word)base;
-        reply_len = 1;
-        break;
-    }
-    case TM_REQ_PING_CLIENTINFO: {
-        /* Demo: exercise ConnectClientInfo from inside the dispatch
-         * loop. The badge attached to this incoming message IS the
-         * scoid of the calling connection. We return the client's
-         * pid in MR1 alongside the usual +1 echo in MR0. */
-        struct _client_info ci;
-        int rc = ConnectClientInfo((int)badge, &ci, 0);
-        *out_mr0 = mr0 + 1;
-        *out_mr1 = (rc == 0) ? (seL4_Word)ci.pid : (seL4_Word)-1;
-        reply_len = 2;
-        break;
-    }
+
     default:
         /* Application-level message (v0.3 demo). Echo back with MR0
          * incremented, so tester sees the round-trip succeed. */
@@ -487,13 +487,10 @@ static unsigned cstrlen(const char *s)
 
 static void print_banner(void)
 {
-    /* Clear-screen via Ctrl-L, then a bordered banner sized to fit
-     * "QSOE: Quick & Secure Operating Environment <version>". */
     static const char *prefix = "QSOE: Quick & Secure Operating Environment ";
     unsigned inner = 1 + cstrlen(prefix) + cstrlen(QSOE_VSHORT) + 1;
 
     sel4_debug_putchar('\f');
-
     sel4_debug_putchar('+');
     for (unsigned i = 0; i < inner; ++i) sel4_debug_putchar('-');
     sel4_debug_puts("+\n");
@@ -524,11 +521,6 @@ static seL4_CPtr find_largest_ram_untyped(seL4_BootInfo *bi)
     return bi->untyped.start + best;
 }
 
-/* v0.6.1: find the device-untyped covering a given physical address.
- * The seL4 kernel publishes device regions as isDevice=1 untypeds
- * in BootInfo, typically one per platform device. For the QEMU virt
- * 16550 UART at 0x10000000 we expect a 4 KiB untyped at that exact
- * paddr. Returns 0 if no covering untyped exists. */
 static seL4_CPtr find_device_untyped_for_paddr(seL4_BootInfo *bi,
                                                 unsigned long paddr)
 {
@@ -548,6 +540,9 @@ int main(seL4_BootInfo *bi)
 {
     print_banner();
     qsoe_libqsoe_init(bi->ipcBuffer, QSOE_PID_TASKMAN);
+    /* taskman knows the platform timer frequency directly (it's what
+     * the TM_REQ_CLOCK_FREQ handler returns); no self-IPC. */
+    qsoe_time_freq_hz = TM_CLOCK_FREQ_HZ;
 
     seL4_CPtr ut = find_largest_ram_untyped(bi);
     if (ut == 0) {
@@ -555,11 +550,6 @@ int main(seL4_BootInfo *bi)
         for (;;) __asm__ volatile("nop");
     }
 
-    /* v0.6.1: find the device-untyped covering the 16550 UART. We
-     * tolerate "not found" — drivers can still load without that
-     * cap (writes go through the existing in-taskman console
-     * fallback), but devc-ser8250 will refuse to bring up the
-     * hardware. */
     seL4_CPtr uart_ut = find_device_untyped_for_paddr(bi, 0x10000000UL);
     tm_set_uart_untyped(uart_ut);
     if (uart_ut == 0) {
@@ -568,13 +558,7 @@ int main(seL4_BootInfo *bi)
 
     tm_init(ut, seL4_CapInitThreadCNode, bi->empty.start);
 
-    /* v0.3.0: spawn tester. We don't yet have taskman's primary
-     * endpoint allocated by ChannelCreate — for v0.3.0 we create it
-     * the same way we will in v0.3.2, by hand, so that spawn() can
-     * mint a Send cap to it for tester's CSpace slot 1. */
-    seL4_CPtr primary_ep = bi->empty.start; /* very next free slot */
-    /* Bump tm_init's allocator past it so spawn() doesn't reuse it. */
-    extern seL4_CPtr s_next_slot;
+    seL4_CPtr primary_ep = bi->empty.start;
     s_next_slot = bi->empty.start + 1;
     seL4_Word rerr = qsoe_untyped_retype(ut, seL4_EndpointObject, 0,
                                           seL4_CapInitThreadCNode, 0, 0,
@@ -583,28 +567,17 @@ int main(seL4_BootInfo *bi)
         sel4_debug_puts("FATAL: failed to retype primary endpoint\n");
         for (;;) __asm__ volatile("nop");
     }
-    /* Register taskman's primary channel in the registry so ConnectAttach
-     * from other processes can find it as (pid=1, chid=1). The master
-     * and recv cap are the same slot — taskman invokes the cap directly
-     * for both seL4_Recv (server-side) and as the mint source for new
-     * connections. */
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, 1,
                                       primary_ep, primary_ep) != 0) {
         sel4_debug_puts("FATAL: failed to register primary channel\n");
         for (;;) __asm__ volatile("nop");
     }
 
-    /* v0.5.0: register the console channel (TM_CONSOLE_CHID, shares
-     * primary_ep so the dispatch loop receives all traffic on one
-     * Recv; we route by badge -> connection -> channel). Then bring
-     * up the path manager and register /dev/console pointing at the
-     * in-taskman console handler. */
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CONSOLE_CHID,
                                       primary_ep, primary_ep) != 0) {
         sel4_debug_puts("FATAL: failed to register console channel\n");
         for (;;) __asm__ volatile("nop");
     }
-    /* v0.6.0: register the cpiofs channel (also shares primary_ep). */
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CPIOFS_CHID,
                                       primary_ep, primary_ep) != 0) {
         sel4_debug_puts("FATAL: failed to register cpiofs channel\n");
@@ -624,9 +597,6 @@ int main(seL4_BootInfo *bi)
             for (;;) __asm__ volatile("nop");
         }
     }
-    /* v0.6.0: register cpiofs at "/". Longest-prefix-match means
-     * /dev/console and (future) /dev/ser1 still resolve to their
-     * specific handlers; everything else under / goes to cpiofs. */
     {
         tm_pathmgr_obj_t obj = {
             .server_pid   = QSOE_PID_TASKMAN,
@@ -640,19 +610,12 @@ int main(seL4_BootInfo *bi)
         }
     }
 
-    /* v0.4.1: hand the embedded CPIO and primary endpoint to server.c
-     * so TM_REQ_PROCESS_CREATE handlers can locate ELFs and badge
-     * SYSMGR caps. */
     unsigned long cpio_len = (unsigned long)
         (_userland_cpio_end - _userland_cpio_start);
     tm_set_userland_cpio(_userland_cpio_start, cpio_len);
     tm_set_primary_ep(primary_ep);
     tm_cpiofs_set_cpio(_userland_cpio_start, cpio_len);
 
-    /* v0.6.1: taskman launches /sbin/init at boot, not the test
-     * binary directly. init is responsible for spawning every
-     * other userland program (drivers, getty, eventually tester).
-     * Until v0.6.1 the chain is: taskman -> init -> tester. */
     unsigned long elf_size = 0;
     const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
                                      "bin/init.elf", &elf_size);
@@ -683,9 +646,6 @@ int main(seL4_BootInfo *bi)
     }
     sel4_debug_puts("taskman: dispatcher ready\n");
 
-    /* Dispatch loop: ReplyRecv pattern. seL4_Recv blocks until the
-     * first message; thereafter ReplyRecv atomically sends the reply
-     * to the previous caller and waits for the next. */
     seL4_Word badge;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
     seL4_MessageInfo_t info = qsoe_sys_recv(primary_ep, &badge,
@@ -698,8 +658,6 @@ int main(seL4_BootInfo *bi)
                                                      &r0, &r1, &r2, &r3,
                                                      &no_reply);
         if (no_reply) {
-            /* Caller's TCB was revoked (e.g. self-terminate). Skip the
-             * reply phase and just receive the next request. */
             mr0 = 0; mr1 = 0; mr2 = 0; mr3 = 0;
             info = qsoe_sys_recv(primary_ep, &badge,
                                   &mr0, &mr1, &mr2, &mr3);

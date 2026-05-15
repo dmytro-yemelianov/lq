@@ -379,3 +379,276 @@ projects/musllibc/patches/arch/riscv64/             userland/libc/patches/arch/r
 
 # src/misc/: setdomainname is a Linux extension.
 !userland/libc/src/misc/setdomainname.c
+
+## List of all files in which __syscall is encountered
+!userland/libc/src/thread/pthread_kill.c
+!userland/libc/src/thread/__syscall_cp.c
+!userland/libc/src/thread/pthread_setschedprio.c
+!userland/libc/src/thread/synccall.c
+!userland/libc/src/thread/pthread_getschedparam.c
+!userland/libc/src/thread/thrd_yield.c
+!userland/libc/src/thread/__set_thread_area.c
+!userland/libc/src/thread/pthread_cancel.c
+!userland/libc/src/thread/riscv64/syscall_cp.s
+!userland/libc/src/thread/pthread_sigmask.c
+!userland/libc/src/thread/pthread_setschedparam.c
+!userland/libc/src/thread/__unmapself.c
+!userland/libc/src/thread/pthread_mutexattr_setrobust.c
+!userland/libc/src/misc/pty.c
+!userland/libc/src/misc/syscall.c
+!userland/libc/src/misc/getrusage.c
+!userland/libc/src/misc/setrlimit.c
+!userland/libc/src/misc/ioctl.c
+!userland/libc/src/stat/fchmod.c
+!userland/libc/src/stat/fstat.c
+!userland/libc/src/stat/futimesat.c
+!userland/libc/src/stat/fchmodat.c
+!userland/libc/src/stat/fstatat.c
+!userland/libc/src/stat/utimensat.c
+!userland/libc/src/exit/abort.c
+!userland/libc/src/exit/_Exit.c
+!userland/libc/src/internal/emulate_wait4.c
+!userland/libc/src/internal/pthread_impl.h
+!userland/libc/src/internal/syscall_ret.c
+!userland/libc/src/internal/syscall.h
+!userland/libc/src/conf/sysconf.c
+!userland/libc/src/malloc/lite_malloc.c
+!userland/libc/src/malloc/mallocng/glue.h
+!userland/libc/src/malloc/oldmalloc/malloc.c
+!userland/libc/src/unistd/geteuid.c
+!userland/libc/src/unistd/fchown.c
+!userland/libc/src/unistd/getpid.c
+!userland/libc/src/unistd/getgid.c
+!userland/libc/src/unistd/fchdir.c
+!userland/libc/src/unistd/setxid.c
+!userland/libc/src/unistd/getuid.c
+!userland/libc/src/unistd/readlink.c
+!userland/libc/src/unistd/getegid.c
+!userland/libc/src/unistd/getppid.c
+!userland/libc/src/unistd/dup2.c
+!userland/libc/src/unistd/dup3.c
+!userland/libc/src/unistd/readlinkat.c
+!userland/libc/src/unistd/faccessat.c
+!userland/libc/src/unistd/getpgrp.c
+!userland/libc/src/unistd/sync.c
+!userland/libc/src/unistd/close.c
+!userland/libc/src/unistd/pipe2.c
+!userland/libc/src/sched/sched_setscheduler.c
+!userland/libc/src/sched/sched_setparam.c
+!userland/libc/src/sched/sched_getcpu.c
+!userland/libc/src/sched/sched_getparam.c
+!userland/libc/src/sched/sched_getscheduler.c
+!userland/libc/src/sched/sched_rr_get_interval.c
+!userland/libc/src/sched/affinity.c
+!userland/libc/src/fcntl/posix_fallocate.c
+!userland/libc/src/fcntl/posix_fadvise.c
+!userland/libc/src/fcntl/open.c
+!userland/libc/src/fcntl/fcntl.c
+!userland/libc/src/dirent/opendir.c
+!userland/libc/src/dirent/readdir.c
+!userland/libc/src/signal/sigtimedwait.c
+!userland/libc/src/signal/getitimer.c
+!userland/libc/src/signal/setitimer.c
+!userland/libc/src/signal/sigaction.c
+!userland/libc/src/signal/sigsetjmp_tail.c
+!userland/libc/src/signal/block.c
+!userland/libc/src/stdio/tmpnam.c
+!userland/libc/src/stdio/remove.c
+!userland/libc/src/stdio/__fopen_rb_ca.c
+!userland/libc/src/stdio/pclose.c
+!userland/libc/src/stdio/tempnam.c
+!userland/libc/src/stdio/freopen.c
+!userland/libc/src/stdio/tmpfile.c
+!userland/libc/src/stdio/__fdopen.c
+!userland/libc/src/stdio/popen.c
+!userland/libc/src/stdio/__stdout_write.c
+!userland/libc/src/stdio/fopen.c
+!userland/libc/src/env/__init_tls.c
+!userland/libc/src/env/__libc_start_main.c
+!userland/libc/src/network/recvmmsg.c
+!userland/libc/src/network/socket.c
+!userland/libc/src/network/socketpair.c
+!userland/libc/src/network/res_msend.c
+!userland/libc/src/network/if_nametoindex.c
+!userland/libc/src/network/accept4.c
+!userland/libc/src/network/if_indextoname.c
+!userland/libc/src/network/netlink.c
+!userland/libc/src/network/setsockopt.c
+!userland/libc/src/network/getsockopt.c
+!userland/libc/src/mman/posix_madvise.c
+!userland/libc/src/mman/mmap.c
+!userland/libc/src/select/select.c
+!userland/libc/src/select/ppoll.c
+!userland/libc/src/select/pselect.c
+!userland/libc/src/time/clock_gettime.c
+!userland/libc/src/time/timer_delete.c
+!userland/libc/src/time/timer_create.c
+!userland/libc/src/time/__map_file.c
+!userland/libc/src/time/clock_nanosleep.c
+!userland/libc/src/time/timer_settime.c
+!userland/libc/src/time/times.c
+!userland/libc/src/time/clock_getres.c
+!userland/libc/src/time/clock_settime.c
+!userland/libc/src/time/clock_getcpuclockid.c
+!userland/libc/src/time/nanosleep.c
+!userland/libc/src/time/timer_gettime.c
+!userland/libc/ldso/dynlink.c
+!userland/libc/arch/riscv64/syscall_arch.h
+!userland/libc/patches/arch/riscv64/syscall_arch.h
+
+# === musllibc: Locale subsystem entirely excluded ===
+# Directive (v0.7+): QSOE 0.7..0.99 carry no locale support.  This drops
+# every musl file that either implements locale or includes
+# locale_impl.h (which itself drags in pthread_impl.h, ergo SYS_futex).
+# QSOE-native replacements for the handful that matter in practice
+# (strerror, strsignal, getopt, asctime_r, strftime, ...) land in
+# userland/libc/qsoe/ on demand, one at a time.
+!userland/libc/src/locale/
+!userland/libc/src/multibyte/
+!userland/libc/src/internal/locale_impl.h
+!userland/libc/src/ctype/__ctype_get_mb_cur_max.c
+!userland/libc/src/errno/__errno_location.c
+!userland/libc/src/errno/strerror.c
+!userland/libc/src/misc/getopt.c
+!userland/libc/src/misc/syslog.c
+!userland/libc/src/network/gai_strerror.c
+!userland/libc/src/network/hstrerror.c
+!userland/libc/src/regex/fnmatch.c
+!userland/libc/src/regex/regerror.c
+!userland/libc/src/stdio/fgetwc.c
+!userland/libc/src/stdio/fputwc.c
+!userland/libc/src/stdio/fputws.c
+!userland/libc/src/stdio/fwide.c
+!userland/libc/src/stdio/ungetwc.c
+!userland/libc/src/string/strsignal.c
+!userland/libc/src/time/asctime_r.c
+!userland/libc/src/time/strftime.c
+!userland/libc/src/time/wcsftime.c
+
+# === musllibc: pthread_impl.h consumers excluded ===
+# pthread_impl.h itself carries `__syscall(SYS_futex,...)` inline, so
+# anything that includes it is a syscall-hackery consumer.  QSOE's
+# threading surface comes from libqsoe (QNX ThreadCreate / channels);
+# a POSIX pthread layer built on top of that is a future iteration.
+# Until then, the entire src/thread/ subtree is excluded along with
+# the 17 non-thread translation units that also pull in pthread_impl.h.
+!userland/libc/src/thread/
+!userland/libc/src/misc/wordexp.c
+!userland/libc/src/exit/abort_lock.c
+!userland/libc/src/temp/__randname.c
+!userland/libc/src/process/system.c
+!userland/libc/src/signal/sigqueue.c
+!userland/libc/src/signal/siglongjmp.c
+!userland/libc/src/signal/raise.c
+!userland/libc/src/stdio/funlockfile.c
+!userland/libc/src/stdio/ftrylockfile.c
+!userland/libc/src/stdio/__lockfile.c
+!userland/libc/src/stdio/getc.h
+!userland/libc/src/stdio/putc.h
+!userland/libc/src/stdio/flockfile.c
+!userland/libc/src/env/__stack_chk_fail.c
+!userland/libc/src/env/__reset_tls.c
+!userland/libc/src/network/h_errno.c
+!userland/libc/src/time/timer_getoverrun.c
+
+# === musllibc: Plain syscall() callers ===
+# These 58 files use the public `syscall(...)` wrapper (not __syscall)
+# to issue raw Linux syscalls directly.  The wrapper itself was excluded
+# with the rest of the __syscall machinery; these would not link anyway.
+# QSOE-native replacements for the ones that matter go in
+# userland/libc/qsoe/ on demand.
+!userland/libc/src/misc/getpriority.c
+!userland/libc/src/misc/getresgid.c
+!userland/libc/src/misc/getresuid.c
+!userland/libc/src/misc/getrlimit.c
+!userland/libc/src/misc/setpriority.c
+!userland/libc/src/misc/uname.c
+!userland/libc/src/mman/madvise.c
+!userland/libc/src/mman/mincore.c
+!userland/libc/src/mman/mlockall.c
+!userland/libc/src/mman/mlock.c
+!userland/libc/src/mman/mprotect.c
+!userland/libc/src/mman/mremap.c
+!userland/libc/src/mman/munlockall.c
+!userland/libc/src/mman/munlock.c
+!userland/libc/src/mman/munmap.c
+!userland/libc/src/sched/sched_get_priority_max.c
+!userland/libc/src/sched/sched_yield.c
+!userland/libc/src/signal/kill.c
+!userland/libc/src/signal/sigaltstack.c
+!userland/libc/src/signal/sigpending.c
+!userland/libc/src/stat/chmod.c
+!userland/libc/src/stat/mkdirat.c
+!userland/libc/src/stat/mkdir.c
+!userland/libc/src/stat/mknodat.c
+!userland/libc/src/stat/mknod.c
+!userland/libc/src/stat/statvfs.c
+!userland/libc/src/stat/umask.c
+!userland/libc/src/stdio/rename.c
+!userland/libc/src/stdio/__stdio_close.c
+!userland/libc/src/stdio/__stdio_read.c
+!userland/libc/src/stdio/__stdio_write.c
+!userland/libc/src/termios/tcgetwinsize.c
+!userland/libc/src/termios/tcsetwinsize.c
+!userland/libc/src/unistd/access.c
+!userland/libc/src/unistd/chdir.c
+!userland/libc/src/unistd/chown.c
+!userland/libc/src/unistd/dup.c
+!userland/libc/src/unistd/fchownat.c
+!userland/libc/src/unistd/ftruncate.c
+!userland/libc/src/unistd/getcwd.c
+!userland/libc/src/unistd/getgroups.c
+!userland/libc/src/unistd/getpgid.c
+!userland/libc/src/unistd/getsid.c
+!userland/libc/src/unistd/isatty.c
+!userland/libc/src/unistd/lchown.c
+!userland/libc/src/unistd/linkat.c
+!userland/libc/src/unistd/link.c
+!userland/libc/src/unistd/lseek.c
+!userland/libc/src/unistd/pipe.c
+!userland/libc/src/unistd/renameat.c
+!userland/libc/src/unistd/rmdir.c
+!userland/libc/src/unistd/setpgid.c
+!userland/libc/src/unistd/setsid.c
+!userland/libc/src/unistd/symlinkat.c
+!userland/libc/src/unistd/symlink.c
+!userland/libc/src/unistd/truncate.c
+!userland/libc/src/unistd/unlinkat.c
+!userland/libc/src/unistd/unlink.c
+
+# === musllibc: syscall_cp() callers ===
+# `syscall_cp` is the cancellation-point variant.  Its definition
+# (src/thread/__syscall_cp.c) is already excluded; the 17 callers
+# (read/write/openat/poll/fsync/...) move to userland/libc/qsoe/
+# as we need them.
+!userland/libc/src/fcntl/openat.c
+!userland/libc/src/mman/msync.c
+!userland/libc/src/network/sendmmsg.c
+!userland/libc/src/select/poll.c
+!userland/libc/src/signal/sigsuspend.c
+!userland/libc/src/termios/tcdrain.c
+!userland/libc/src/unistd/fdatasync.c
+!userland/libc/src/unistd/fsync.c
+!userland/libc/src/unistd/pause.c
+!userland/libc/src/unistd/pread.c
+!userland/libc/src/unistd/preadv.c
+!userland/libc/src/unistd/pwrite.c
+!userland/libc/src/unistd/pwritev.c
+!userland/libc/src/unistd/read.c
+!userland/libc/src/unistd/readv.c
+!userland/libc/src/unistd/write.c
+!userland/libc/src/unistd/writev.c
+!userland/libc/src/unistd/ttyname.c
+!userland/libc/src/unistd/ttyname_r.c
+
+# putc.c / getc.c family — orphaned by excluding putc.h/getc.h
+# (those headers included pthread_impl.h for per-FILE locks).
+!userland/libc/src/stdio/putc.c
+!userland/libc/src/stdio/getc.c
+!userland/libc/src/stdio/getchar.c
+!userland/libc/src/stdio/fgetc.c
+!userland/libc/src/stdio/fputc.c
+!userland/libc/src/stdio/putchar.c
+
+# Network: no TCP/IP stack in QSOE yet; whole subsystem out.
+!userland/libc/src/network/

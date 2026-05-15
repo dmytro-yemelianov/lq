@@ -7,8 +7,8 @@
 #ifndef QSOE_TASKMAN_SPAWN_H
 #define QSOE_TASKMAN_SPAWN_H
 
-#include "sel4_types.h"
-#include "../libqsoe/include/qsoe/qrv.h"
+#include "../sel4_types.h"
+#include "../../libqsoe/include/qsoe/qrv.h"
 
 /*
  * tm_spawn — spawn a new user-space process from an in-memory ELF.
@@ -42,15 +42,6 @@ int tm_spawn(const void *elf, unsigned long elf_len,
  * resolves the cap slot. 0 = no UART device-untyped available. */
 void tm_set_uart_untyped(seL4_CPtr ut_slot);
 
-/* v0.6.4 Memory Manager: serve one TM_REQ_MMAP.
- *
- * Rounds `len` up to a multiple of 2 MiB, allocates that many
- * Mega_Pages from taskman's main untyped pool, maps them contiguously
- * into the caller's VSpace starting at the process's mmap_top cursor,
- * advances mmap_top, returns the base vaddr.
- *
- * Returns 0 on success and writes the base vaddr to *out_vaddr;
- * negative errno on failure. */
-int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long *out_vaddr);
+/* tm_mmap_serve lives in mem/mmap.c (see mem/mem.h). */
 
 #endif /* QSOE_TASKMAN_SPAWN_H */

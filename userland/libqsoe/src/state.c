@@ -15,6 +15,10 @@ static unsigned long g_fd_chid_slot   [QSOE_MAX_FD_CHANNELS];
 static unsigned long g_side_chid_slot [QSOE_MAX_SIDE_CHANNELS];
 static unsigned long g_fd_coid_slot   [QSOE_MAX_FD_CONNECTIONS];
 static unsigned long g_side_coid_slot [QSOE_MAX_SIDE_CONNECTIONS];
+/* v0.7 per-fd flags for POSIX fcntl(F_GETFD/SETFD/GETFL/SETFL).
+ * One 32-bit word per fd-pool entry; side-channel coids don't use
+ * flags so no parallel array there. */
+static unsigned       g_fd_coid_flags  [QSOE_MAX_FD_CONNECTIONS];
 
 static qsoe_spinlock_t g_state_lock;
 
@@ -183,6 +187,44 @@ unsigned long qsoe_state_coid_to_slot(int coid)
 void qsoe_state_force_bind_coid(int coid, unsigned long slot)
 {
     qsoe_state_bind_coid(coid, slot);
+}
+
+unsigned qsoe_state_get_coid_flags(int coid)
+{
+    unsigned out = 0;
+    qsoe_spin_lock(&g_state_lock);
+    if (!is_side(coid) && coid >= 0 && coid < QSOE_MAX_FD_CONNECTIONS) {
+        out = g_fd_coid_flags[coid];
+    }
+    qsoe_spin_unlock(&g_state_lock);
+    return out;
+}
+
+void qsoe_state_set_coid_flags(int coid, unsigned flags)
+{
+    qsoe_spin_lock(&g_state_lock);
+    if (!is_side(coid) && coid >= 0 && coid < QSOE_MAX_FD_CONNECTIONS) {
+        g_fd_coid_flags[coid] = flags;
+    }
+    qsoe_spin_unlock(&g_state_lock);
+}
+
+int qsoe_state_alloc_coid_ge(int start)
+{
+    int out = -1;
+    if (start < 0) start = 0;
+    if (start >= QSOE_MAX_FD_CONNECTIONS) return -1;
+    qsoe_spin_lock(&g_state_lock);
+    for (int i = start; i < QSOE_MAX_FD_CONNECTIONS; ++i) {
+        if (g_fd_coid_slot[i] == 0) {
+            g_fd_coid_slot[i]  = QSOE_SLOT_RESERVED;
+            g_fd_coid_flags[i] = 0;
+            out = i;
+            break;
+        }
+    }
+    qsoe_spin_unlock(&g_state_lock);
+    return out;
 }
 
 /* v0.6.4: empty-CSpace-slot allocator.  Returns a fresh CPtr in the

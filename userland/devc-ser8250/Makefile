@@ -37,7 +37,7 @@ ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 \
                -mcmodel=medany -mstrict-align
 
 TM_CFLAGS := $(ARCH_CFLAGS) \
-    -ffreestanding -nostdlib -nostdinc \
+    -std=c11 -ffreestanding -nostdlib -nostdinc \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
     -fno-builtin -Wall -Wextra \
     -I$(GEN) \

@@ -47,7 +47,7 @@ ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 \
                -mcmodel=medany -mstrict-align
 
 TM_CFLAGS   := $(ARCH_CFLAGS) \
-    -ffreestanding -nostdlib -nostdinc \
+    -std=c11 -ffreestanding -nostdlib -nostdinc \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
     -fno-builtin -Wall -Wextra \
     -I$(GEN) \
@@ -62,11 +62,13 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/sel4_syscalls.h \
     $(TASKMAN_DIR)/sel4_types.h \
     $(TASKMAN_DIR)/qsoe_invoke.h \
-    $(TASKMAN_DIR)/server.h \
-    $(TASKMAN_DIR)/spawn.h \
-    $(TASKMAN_DIR)/pathmgr.h \
-    $(TASKMAN_DIR)/console.h \
-    $(TASKMAN_DIR)/cpiofs.h \
+    $(TASKMAN_DIR)/proc/proc.h \
+    $(TASKMAN_DIR)/proc/spawn.h \
+    $(TASKMAN_DIR)/mem/mem.h \
+    $(TASKMAN_DIR)/path/path.h \
+    $(TASKMAN_DIR)/path/pathmgr.h \
+    $(TASKMAN_DIR)/path/cpiofs.h \
+    $(TASKMAN_DIR)/sys/console.h \
     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
@@ -93,12 +95,13 @@ $(GEN)/qsoe/sys_version.h: $(wildcard $(TOP)/.git/HEAD $(TOP)/.git/index)
 # Source lists.
 # Normal flavour: full surface (everything in src/).
 NORMAL_SRCS := state.c msg.c process.c thread.c channel.c connect.c \
-               start_main.c io.c syscall_dispatch.c float128_stubs.c \
-               signal.c musl_stubs.c malloc.c
+               start_main.c io.c mmap.c proc_info.c time.c \
+               float128_stubs.c signal.c malloc.c
 
 # In-taskman flavour: subset — taskman doesn't need its own start_main,
 # its own syscall dispatcher, or the float128 stubs.
-TM_VAR_SRCS := state.c msg.c process.c thread.c channel.c connect.c io.c
+TM_VAR_SRCS := state.c msg.c process.c thread.c channel.c connect.c io.c \
+               time.c
 
 NORMAL_OBJS := $(patsubst %.c,$(NORMAL_OBJ)/%.o,$(NORMAL_SRCS))
 TM_VAR_OBJS := $(patsubst %.c,$(TM_OBJ)/%.o,$(TM_VAR_SRCS))

@@ -12,9 +12,10 @@
  * whose connection resolves to TM_CONSOLE_CHID lands here.
  */
 
-#include "sel4_syscalls.h"
-#include "sel4_types.h"
-#include "../libqsoe/include/qsoe/qrv.h"
+#include "console.h"
+#include "../sel4_syscalls.h"
+#include "../sel4_types.h"
+#include "../../libqsoe/include/qsoe/qrv.h"
 
 /* Bound by the IPC buffer payload area (msg[4..119] = 116 words =
  * 928 bytes). Larger writes are chunked client-side in qsoe_write. */
@@ -41,4 +42,22 @@ int tm_console_read(unsigned want, unsigned *out_got)
     (void)want;
     *out_got = 0;
     return -EAGAIN;
+}
+
+int tm_console_stat(tm_stat_t *out)
+{
+    if (!out) return -EINVAL;
+    unsigned char *p = (unsigned char *)out;
+    for (unsigned i = 0; i < sizeof *out; ++i) p[i] = 0;
+
+    out->st_dev     = 5;                  /* synthetic dev for /dev/console */
+    out->st_ino     = 1;
+    out->st_mode    = TM_S_IFCHR | 0666;  /* character device, rw for all */
+    out->st_nlink   = 1;
+    out->st_uid     = 0;
+    out->st_gid     = 0;
+    out->st_rdev    = (5UL << 8) | 1;     /* maj=5, min=1 */
+    out->st_size    = 0;
+    out->st_blksize = 256;
+    return 0;
 }

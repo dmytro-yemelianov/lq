@@ -41,6 +41,18 @@ void          qsoe_state_bind_coid(int coid, unsigned long slot);
 unsigned long qsoe_state_coid_to_slot(int coid);
 void          qsoe_state_force_bind_coid(int coid, unsigned long slot);
 
+/* v0.7 per-fd flag bag, backing POSIX fcntl(F_GETFD/F_SETFD/F_GETFL/
+ * F_SETFL).  One 32-bit word per fd in the FD pool; side-channel
+ * coids don't expose flags (they aren't user-facing).  Zero on
+ * alloc; cleared when the coid is unbound. */
+unsigned      qsoe_state_get_coid_flags(int coid);
+void          qsoe_state_set_coid_flags(int coid, unsigned flags);
+
+/* Lowest free fd ≥ `start` for fcntl(F_DUPFD).  Returns the fd or
+ * -1 if the pool is exhausted.  The slot is left RESERVED so a
+ * subsequent bind doesn't race against alloc_coid. */
+int           qsoe_state_alloc_coid_ge(int start);
+
 /* v0.4 thread pool accessors. */
 qsoe_tcb_t   *qsoe_tcb_of_tid(int tid);
 qsoe_tcb_t   *qsoe_worker_alloc(void);

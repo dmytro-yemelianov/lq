@@ -231,15 +231,21 @@ $(ELFBUILD)/linker.lds_pp: $(ELFSRC)/linker.lds $(GEN_HEADERS)
 # ----------------------------------------------------------------------------
 
 # Headers shared across taskman/libqsoe TUs.
+# v0.7: taskman was split into sys/ proc/ mem/ path/ subdirs; the
+# headers now live under those.  Keep them all in TM_HEADERS as the
+# coarse "if anything changed, rebuild" trigger.
 TM_HEADERS := \
     $(TASKMAN_DIR)/sel4_syscalls.h \
     $(TASKMAN_DIR)/sel4_types.h \
     $(TASKMAN_DIR)/qsoe_invoke.h \
-    $(TASKMAN_DIR)/server.h \
-    $(TASKMAN_DIR)/spawn.h \
-    $(TASKMAN_DIR)/pathmgr.h \
-    $(TASKMAN_DIR)/console.h \
-    $(TASKMAN_DIR)/cpiofs.h \
+    $(TASKMAN_DIR)/proc/proc.h \
+    $(TASKMAN_DIR)/proc/spawn.h \
+    $(TASKMAN_DIR)/mem/mem.h \
+    $(TASKMAN_DIR)/path/path.h \
+    $(TASKMAN_DIR)/path/pathmgr.h \
+    $(TASKMAN_DIR)/path/cpiofs.h \
+    $(TASKMAN_DIR)/sys/console.h \
+    $(TASKMAN_DIR)/sys/platform.h \
     $(LIBQSOE_DIR)/include/qsoe/qrv.h \
     $(LIBQSOE_DIR)/include/qsoe/slots.h \
     $(LIBQSOE_DIR)/include/qsoe/tls.h \
