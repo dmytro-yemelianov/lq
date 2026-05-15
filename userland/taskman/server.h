@@ -22,6 +22,13 @@
 #define TM_MAX_THREADS    256   /* across all processes */
 #define TM_MAX_TID_PER_PROC 32  /* matches libqsoe's thread pool size */
 
+/* v0.6.4: per-process mmap region.  Sits above stack/IPC-buffer
+ * (which end at 0x200000) and runs upwards in 2 MiB-aligned chunks.
+ * Same address libqsoe-side malloc.c uses for its bump-from-mmap
+ * tracking. */
+#define QSOE_MMAP_BASE  0x2000000UL    /* 32 MiB */
+#define QSOE_MEGA_PAGE  0x200000UL     /* 2 MiB */
+
 typedef struct {
     int       in_use;
     pid_t     pid;
@@ -57,6 +64,26 @@ typedef struct {
     int       exit_state;
     int       exit_status;
     seL4_CPtr waiter_reply_slot;
+
+    /* v0.6.4 signals-as-pulses.
+     *
+     * signal_chid : chid (in this process's own coid namespace) of
+     *               the channel its signal thread listens on.  0 =
+     *               not registered yet (process hasn't called
+     *               TM_REQ_REGISTER_SIGNAL_CHID).  Set once at
+     *               process startup by _qsoe_start_main, looked up
+     *               by kill(pid, sig) → TM_REQ_GET_SIGNAL_CHID.
+     */
+    int       signal_chid;
+
+    /* v0.6.4 Memory Manager state.
+     *
+     * mmap_top : next free 2 MiB-aligned vaddr in this process's
+     *            address space, served by TM_REQ_MMAP.  Initialised by
+     *            spawn.c to the bottom of the mmap region (above any
+     *            image-side mappings).  Bumped upwards per request;
+     *            v0.7+ will track per-mapping records for munmap. */
+    unsigned long mmap_top;
 } tm_process_t;
 
 /* v0.4: per-thread registry entry. Master caps live in taskman's CSpace

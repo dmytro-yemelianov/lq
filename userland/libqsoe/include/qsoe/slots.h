@@ -26,6 +26,16 @@
 #define QSOE_CAP_UART_FRAME     7  /* 4 KiB device-untyped covering UART MMIO */
 #define QSOE_CAP_IRQ_NTFN       8  /* Notification the IRQHandler is bound to */
 
+/* v0.6.4: cap to the process's own CNode root.  Lets a user-space
+ * resmgr invoke seL4_CNode_SaveCaller from inside its own process
+ * (mirrors taskman's tm_process_waitpid park pattern) to defer
+ * replies until data arrives.  devc-ser8250 uses this to park
+ * blocking readers; the IRQ thread later wakes them via pulse +
+ * Send-on-saved-slot.  Depth on the child side is 12 — the radix of
+ * the freshly-retyped CNode. */
+#define QSOE_CAP_CNODE_SELF     9
+#define QSOE_CAP_CNODE_DEPTH    12
+
 #define QSOE_CAP_WELL_KNOWN_END 16 /* slots [2..15] reserved; dynamics start at 16 */
 
 /* By convention pid 1 is taskman itself. */

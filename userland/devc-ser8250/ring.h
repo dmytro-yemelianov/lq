@@ -32,5 +32,6 @@ void     ser_ring_init(struct ser_ring *r);
 int      ser_ring_push(struct ser_ring *r, unsigned char b);  /* 0 ok, -1 full */
 int      ser_ring_pop (struct ser_ring *r, unsigned char *b); /* 0 ok, -1 empty */
 unsigned ser_ring_drain(struct ser_ring *r, unsigned char *dst, unsigned max);
+int      ser_ring_empty(struct ser_ring *r);                  /* 1 = empty */
 
 #endif

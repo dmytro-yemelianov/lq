@@ -39,8 +39,66 @@
  * thread (consumer). The TX path is polled, no ring needed. */
 static struct ser_ring g_rx_ring;
 
-/* Forward decl. */
+/* v0.6.4 RX-park state (mirrors QRV's pending_rcvid pattern).
+ *
+ * g_pulse_coid       : side-channel self-connection coid the IRQ
+ *                      thread MsgSendPulses on to wake the main
+ *                      thread when it has filled the ring.
+ * g_pending_*        : at most one blocking reader at a time.  Slot
+ *                      holds the SaveCaller'd reply cap; want is
+ *                      the byte count the caller asked for.  Both
+ *                      0 means no reader is parked.
+ *
+ * Pulse code carried in MsgSendPulse — we only ever send one
+ * meaningful code so the value is informational; main thread checks
+ * pending state, not the code. */
+#define PULSE_CODE_RX_READY  1
+static int           g_pulse_coid = -1;
+static unsigned long g_pending_reader_slot;
+static unsigned      g_pending_reader_want;
+
+/* Forward decls. */
 void *uart_irq_thread(void *arg);
+extern unsigned long qsoe_state_alloc_empty_slot(void);
+extern void          qsoe_state_free_empty_slot(unsigned long slot);
+
+/* Drain whatever pulse records taskman queued on our channel when
+ * the IRQ thread sent the wake pulse — otherwise the queue fills
+ * after a few sends and future MsgSendPulse calls return EAGAIN.
+ * We don't care about the contents, just that the queue is empty. */
+static void devc_drain_pulse_queue(seL4_CPtr recv_slot)
+{
+    for (;;) {
+        seL4_Word p_mr0 = (seL4_Word)recv_slot, p_mr1 = 0, p_mr2 = 0, p_mr3 = 0;
+        seL4_MessageInfo_t p_tag = seL4_MessageInfo_new(TM_REQ_PULSE_FETCH,
+                                                        0, 0, 1);
+        seL4_MessageInfo_t p_reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, p_tag,
+                                                   &p_mr0, &p_mr1, &p_mr2, &p_mr3);
+        if (seL4_MessageInfo_get_label(p_reply) != 0) break;
+    }
+}
+
+/* Deliver bytes from the RX ring to the parked reader (Send on the
+ * SaveCaller'd reply slot) and clear the park state.  Caller must
+ * have verified that pending_reader_slot != 0 AND the ring has at
+ * least one byte. */
+static void devc_deliver_to_parked(void)
+{
+    unsigned want = g_pending_reader_want;
+    if (want > 928) want = 928;
+    unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+    unsigned got = ser_ring_drain(&g_rx_ring, dst, want);
+    if (got == 0) return;  /* should not happen — caller checked */
+
+    seL4_Word mr0 = (seL4_Word)got, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_Word reply_len = 4 + (got + 7) / 8;
+    seL4_MessageInfo_t reply = seL4_MessageInfo_new(0, 0, 0, reply_len);
+    qsoe_sys_send(g_pending_reader_slot, reply, mr0, mr1, mr2, mr3);
+
+    qsoe_state_free_empty_slot(g_pending_reader_slot);
+    g_pending_reader_slot = 0;
+    g_pending_reader_want = 0;
+}
 
 /* Bind the IRQ Notification to our own (main thread's) TCB.
  * Without this the kernel has nowhere to deliver the signal. After
@@ -105,6 +163,20 @@ int main(int argc, char **argv, char **envp)
     printf("[devc-ser8250] /dev/ser1 registered (chid=%d)\n", chid);
     fflush(stdout);
 
+    /* v0.6.4 self-connect for the IRQ-thread → main-thread wake.
+     * Side-channel flag keeps this connection out of the fd
+     * namespace (lives in [bit 30] coid range, same as SYSMGR_COID).
+     * The pulse arrives at our own channel as a bound-Notification
+     * signal — Recv wakes with badge & QSOE_NTFN_BADGE_BIT. */
+    g_pulse_coid = ConnectAttach(ND_LOCAL_NODE, qsoe_self_pid, chid,
+                                  0, QSOE_SIDE_CHANNEL);
+    if (g_pulse_coid < 0) {
+        printf("[devc-ser8250] ConnectAttach(self) failed: errno=%d\n",
+               qsoe_errno);
+        fflush(stdout);
+        return 1;
+    }
+
     /* "Stay resident": tell taskman we're ready. init's waitpid()
      * unblocks at this point. */
     if (procmgr_detach(0) != 0) {
@@ -112,50 +184,107 @@ int main(int argc, char **argv, char **envp)
         fflush(stdout);
     }
 
-    /* Main dispatch loop. ReplyRecv pattern on our own channel. */
+    /* Main dispatch loop.  Three wake sources, all funnelled through
+     * one seL4_Recv on our serving EP:
+     *
+     *   1. Client IPC (TM_REQ_IO_WRITE / IO_READ): badge = client scoid,
+     *      QSOE_NTFN_BADGE_BIT *not* set.  Normal request/reply.
+     *   2. IRQ-thread wake pulse (RX bytes arrived): badge has
+     *      QSOE_NTFN_BADGE_BIT set (the bound Notification fired).
+     *      We drain the pulse queue and, if a reader is parked,
+     *      Send the deferred reply on the saved slot.
+     *   3. Unknown badge: ENOSYS.
+     *
+     * When a TM_REQ_IO_READ finds the ring empty, SaveCaller saves
+     * the implicit reply cap; we set need_reply=0 and re-Recv
+     * without replying — the deferred Send will eventually unblock
+     * the client.  Single-reader: a second blocking read while
+     * another is parked returns EBUSY. */
     extern unsigned long qsoe_state_chid_to_slot(int chid);
     seL4_CPtr recv_slot = (seL4_CPtr)qsoe_state_chid_to_slot(chid);
 
-    seL4_Word badge;
+    seL4_Word badge = 0;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
     seL4_MessageInfo_t info = qsoe_sys_recv(recv_slot, &badge,
-                                             &mr0, &mr1, &mr2, &mr3);
+                                            &mr0, &mr1, &mr2, &mr3);
     for (;;) {
-        unsigned label = (unsigned)seL4_MessageInfo_get_label(info);
         seL4_Word err = 0;
         seL4_Word reply_len = 0;
         seL4_Word r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        int need_reply = 1;
 
-        switch (label) {
-        case TM_REQ_IO_WRITE: {
-            unsigned nbytes = (unsigned)mr0;
-            unsigned char *src = (unsigned char *)&qsoe_ipcbuf->msg[4];
-            for (unsigned i = 0; i < nbytes; ++i) {
-                uart_tx_byte(src[i]);
+        if (badge & QSOE_NTFN_BADGE_BIT) {
+            /* Wake from bound Notification — the IRQ thread pulsed
+             * us because the RX ring has data. */
+            devc_drain_pulse_queue(recv_slot);
+            if (g_pending_reader_slot != 0 && !ser_ring_empty(&g_rx_ring)) {
+                devc_deliver_to_parked();
             }
-            r0 = (seL4_Word)nbytes;
-            reply_len = 1;
-            break;
-        }
-        case TM_REQ_IO_READ: {
-            unsigned want = (unsigned)mr0;
-            if (want > 928) want = 928;
-            unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
-            unsigned got = ser_ring_drain(&g_rx_ring, dst, want);
-            r0 = (seL4_Word)got;
-            reply_len = 4 + (got + 7) / 8;
-            break;
-        }
-        default:
-            /* Unknown label — bounce back with an error. */
-            err = ENOSYS;
-            break;
+            need_reply = 0;  /* nothing to reply to — Notification, not IPC */
+        } else {
+            unsigned label = (unsigned)seL4_MessageInfo_get_label(info);
+            switch (label) {
+            case TM_REQ_IO_WRITE: {
+                unsigned nbytes = (unsigned)mr0;
+                unsigned char *src = (unsigned char *)&qsoe_ipcbuf->msg[4];
+                for (unsigned i = 0; i < nbytes; ++i) {
+                    uart_tx_byte(src[i]);
+                }
+                r0 = (seL4_Word)nbytes;
+                reply_len = 1;
+                break;
+            }
+            case TM_REQ_IO_READ: {
+                unsigned want = (unsigned)mr0;
+                if (want == 0) want = 1;
+                if (want > 928) want = 928;
+                unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+                unsigned got = ser_ring_drain(&g_rx_ring, dst, want);
+                if (got > 0) {
+                    r0 = (seL4_Word)got;
+                    reply_len = 4 + (got + 7) / 8;
+                    break;
+                }
+                /* Ring empty — park (QRV-style). */
+                if (g_pending_reader_slot != 0) {
+                    err = EBUSY;
+                    break;
+                }
+                unsigned long slot = qsoe_state_alloc_empty_slot();
+                if (slot == 0) { err = ENOMEM; break; }
+                if (qsoe_cnode_save_caller(QSOE_CAP_CNODE_SELF, slot,
+                                           QSOE_CAP_CNODE_DEPTH) != 0) {
+                    qsoe_state_free_empty_slot(slot);
+                    err = EAGAIN;
+                    break;
+                }
+                g_pending_reader_slot = slot;
+                g_pending_reader_want = want;
+                /* Race re-check: the IRQ thread may have filled the
+                 * ring and pulsed *between* our empty check and the
+                 * SaveCaller.  If so, deliver inline now and leave
+                 * the dispatch loop in the no-reply state. */
+                if (!ser_ring_empty(&g_rx_ring)) {
+                    devc_deliver_to_parked();
+                }
+                need_reply = 0;
+                break;
+            }
+            default:
+                err = ENOSYS;
+                break;
+            }
         }
 
-        seL4_MessageInfo_t reply = seL4_MessageInfo_new(err, 0, 0, reply_len);
-        mr0 = r0; mr1 = r1; mr2 = r2; mr3 = r3;
-        info = qsoe_sys_reply_recv(recv_slot, reply, &badge,
-                                    &mr0, &mr1, &mr2, &mr3);
+        if (need_reply) {
+            seL4_MessageInfo_t reply = seL4_MessageInfo_new(err, 0, 0, reply_len);
+            mr0 = r0; mr1 = r1; mr2 = r2; mr3 = r3;
+            info = qsoe_sys_reply_recv(recv_slot, reply, &badge,
+                                       &mr0, &mr1, &mr2, &mr3);
+        } else {
+            info = qsoe_sys_recv(recv_slot, &badge,
+                                 &mr0, &mr1, &mr2, &mr3);
+        }
     }
 }
 
@@ -168,7 +297,16 @@ void *uart_irq_thread(void *arg)
         (void)qsoe_sys_wait(QSOE_CAP_IRQ_NTFN);
 
         /* Drain whatever the UART FIFO has into the ring. */
-        (void)uart_drain_rx(&g_rx_ring);
+        unsigned drained = uart_drain_rx(&g_rx_ring);
+
+        /* v0.6.4 wake the main thread (mirrors QRV's IST →
+         * MsgSendPulse(pulse_coid, PULSE_CODE_RX) path).  Only fire
+         * the pulse when we actually moved data — empty wakes
+         * (spurious IRQs, double-fire after a missed unmask) would
+         * just churn the bound Notification. */
+        if (drained > 0 && g_pulse_coid >= 0) {
+            (void)MsgSendPulse(g_pulse_coid, 10, PULSE_CODE_RX_READY, 0);
+        }
 
         /* Tell the kernel we serviced this interrupt; re-arm. */
         (void)qsoe_irq_handler_ack(QSOE_CAP_IRQ_HANDLER);

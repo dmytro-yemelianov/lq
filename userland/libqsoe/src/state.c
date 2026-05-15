@@ -184,3 +184,43 @@ void qsoe_state_force_bind_coid(int coid, unsigned long slot)
 {
     qsoe_state_bind_coid(coid, slot);
 }
+
+/* v0.6.4: empty-CSpace-slot allocator.  Returns a fresh CPtr in the
+ * caller's own CSpace, suitable as a destination for
+ * seL4_CNode_SaveCaller (and any future cap-receive paths from
+ * inside the process).  Range starts at 0x800 — well past the
+ * chid/coid pools, well inside the child's 4096-slot CNode.
+ * Send-on-slot semantics (non-MCS seL4) consume the saved reply cap
+ * exactly once; the slot is then handed back via _free_ for reuse. */
+#define QSOE_EMPTY_SLOT_BASE  0x800UL
+#define QSOE_EMPTY_SLOT_MAX   0x1000UL
+#define QSOE_EMPTY_SLOT_FREE_MAX 16
+
+static unsigned long g_next_empty_slot = QSOE_EMPTY_SLOT_BASE;
+static unsigned long g_empty_slot_free[QSOE_EMPTY_SLOT_FREE_MAX];
+static int g_empty_slot_free_count;
+
+unsigned long qsoe_state_alloc_empty_slot(void);
+unsigned long qsoe_state_alloc_empty_slot(void)
+{
+    unsigned long out = 0;
+    qsoe_spin_lock(&g_state_lock);
+    if (g_empty_slot_free_count > 0) {
+        out = g_empty_slot_free[--g_empty_slot_free_count];
+    } else if (g_next_empty_slot < QSOE_EMPTY_SLOT_MAX) {
+        out = g_next_empty_slot++;
+    }
+    qsoe_spin_unlock(&g_state_lock);
+    return out;
+}
+
+void qsoe_state_free_empty_slot(unsigned long slot);
+void qsoe_state_free_empty_slot(unsigned long slot)
+{
+    if (slot == 0) return;
+    qsoe_spin_lock(&g_state_lock);
+    if (g_empty_slot_free_count < QSOE_EMPTY_SLOT_FREE_MAX) {
+        g_empty_slot_free[g_empty_slot_free_count++] = slot;
+    }
+    qsoe_spin_unlock(&g_state_lock);
+}

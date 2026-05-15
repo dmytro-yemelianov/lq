@@ -161,6 +161,12 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].exit_state     = 0;
         g_processes[i].exit_status    = 0;
         g_processes[i].waiter_reply_slot = 0;
+        g_processes[i].signal_chid    = 0;
+        /* mmap region starts at the bottom of what used to be the
+         * pre-allocated heap (above image + IPC buffer + stack at
+         * 0x1FE000).  Mega_Page-aligned.  Each TM_REQ_MMAP rounds the
+         * request up to 2 MiB and bumps mmap_top by that amount. */
+        g_processes[i].mmap_top       = QSOE_MMAP_BASE;
         return 0;
     }
     return -ENOMEM;

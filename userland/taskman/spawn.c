@@ -55,10 +55,13 @@ struct elf64_phdr {
 
 /* Scratch vaddr in taskman's VSpace, used to memcpy ELF bytes into a
  * frame before we Page_Map that frame into the child's VSpace. The
- * value is chosen so the intermediate page tables that the kernel
- * already set up to cover taskman's user image also cover it
- * (everything in the same Sv39 2 MiB region). */
-#define TM_SCRATCH_VADDR 0x100000UL
+ * value MUST be above taskman.elf's own image range (otherwise spawn
+ * fails with "vaddr already mapped") AND within the [0..2MB] Sv39
+ * L2-leaf region that the kernel already created intermediate page
+ * tables for (otherwise FrameMap fails with "missing PT").
+ * 0x180000 = 1.5 MB sits comfortably above the image (~1.4 MB) and
+ * still inside the kernel-prepared 2 MB region. */
+#define TM_SCRATCH_VADDR 0x180000UL
 
 /* Child VSpace layout. Image, stack, and IPC buffer share the first
  * 2 MiB region [0, 0x200000) and use one L1 + one L0 PT. The heap
@@ -69,8 +72,10 @@ struct elf64_phdr {
 #define CHILD_STACK_TOP    0x1FE000UL  /* sp starts here, grows down */
 #define CHILD_STACK_PAGES  2
 #define CHILD_IPC_BUFFER   0x1FE000UL  /* one page, just above the stack */
-#define CHILD_HEAP_BASE    0x800000UL  /* one 2-MiB Mega_Page maps here */
-#define CHILD_HEAP_BYTES   0x200000UL  /* 2 MiB — enough for musl printf */
+/* v0.6.4: no pre-allocated heap.  Memory comes on demand via
+ * TM_REQ_MMAP — see tm_mmap_serve below.  The bottom of that region
+ * is QSOE_MMAP_BASE (= 0x2000000, 32 MiB), well above the image,
+ * stack, and IPC buffer that live in [0, 0x200000). */
 
 /* Image can grow up to one Sv39 L0 PT's coverage — 2 MiB. Beyond that
  * we'd need ensure_l0_pt() to lazily allocate per-2-MiB-region PTs as
@@ -97,10 +102,24 @@ static void qmemset(void *dst, int v, unsigned long n)
 /* Map a frame temporarily into taskman's vspace at TM_SCRATCH_VADDR. */
 static int scratch_map(seL4_CPtr frame)
 {
-    return (int)qsoe_riscv_page_map(frame, seL4_CapInitThreadVSpace,
-                                    TM_SCRATCH_VADDR,
-                                    QSOE_RIGHTS_ALL,
-                                    QSOE_VM_ATTR_DEFAULT);
+    int rc = (int)qsoe_riscv_page_map(frame, seL4_CapInitThreadVSpace,
+                                       TM_SCRATCH_VADDR,
+                                       QSOE_RIGHTS_ALL,
+                                       QSOE_VM_ATTR_DEFAULT);
+    if (rc) {
+        sel4_debug_puts("spawn: scratch_map: vaddr=");
+        for (int i = 7; i >= 0; --i) {
+            unsigned d = (TM_SCRATCH_VADDR >> (i*4)) & 0xF;
+            sel4_debug_putchar(d < 10 ? '0' + d : 'a' + d - 10);
+        }
+        sel4_debug_puts(" rc=");
+        for (int i = 1; i >= 0; --i) {
+            unsigned d = ((unsigned)rc >> (i*4)) & 0xF;
+            sel4_debug_putchar(d < 10 ? '0' + d : 'a' + d - 10);
+        }
+        sel4_debug_puts("\n");
+    }
+    return rc;
 }
 
 static int scratch_unmap(seL4_CPtr frame)
@@ -444,28 +463,18 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                           QSOE_RIGHTS_ALL);
     if (err) { sel4_debug_puts("spawn: copy OWN_UNTYPED failed\n"); return -ENOMEM; }
 
-    /* 4c. v0.5.1: heap region. Allocate one 2 MiB Mega_Page and map
-     *     it at CHILD_HEAP_BASE. musl's lite_malloc uses brk to grow
-     *     a heap inside this region; our qsoe_brk in syscall_dispatch
-     *     gates the break pointer to stay within bounds. The page
-     *     gets zeroed via scratch_map BEFORE mapping into the child
-     *     (frames can only be mapped in one VSpace at a time, same
-     *     constraint as the stack). */
-    seL4_CPtr heap_frame = alloc_object(seL4_RISCV_Mega_Page, 0);
-    if (!heap_frame) {
-        sel4_debug_puts("spawn: heap frame alloc failed\n");
-        return -ENOMEM;
-    }
-    /* Don't bother zeroing the heap page via scratch_map — Mega_Pages
-     * are 2 MiB and our scratch slot is one 4 KiB page; would require
-     * 512 map/unmap cycles. seL4 retypes objects zero-initialised, so
-     * the fresh Mega_Page is already zero. */
-    err = qsoe_riscv_page_map(heap_frame, vspace, CHILD_HEAP_BASE,
-                              QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-    if (err) {
-        sel4_debug_puts("spawn: heap Page_Map failed\n");
-        return -ENOMEM;
-    }
+    /* 5b'. v0.6.4: copy the child's own CNode cap into its slot
+     *      QSOE_CAP_CNODE_SELF so the child can invoke
+     *      seL4_CNode_SaveCaller on its own CSpace from inside —
+     *      required for resmgr park-the-caller patterns
+     *      (devc-ser8250 RX). */
+    err = qsoe_cnode_copy(cnode, QSOE_CAP_CNODE_SELF, 12,
+                          s_cnode_root, cnode, 64,
+                          QSOE_RIGHTS_ALL);
+    if (err) { sel4_debug_puts("spawn: copy CNODE_SELF failed\n"); return -ENOMEM; }
+
+    /* 4c. v0.6.4: no pre-allocated heap.  Memory comes on demand via
+     * TM_REQ_MMAP after the child runs.  See tm_mmap_serve below. */
 
     /* 5c. v0.5.0/v0.6.1: stdio inheritance. Resolve the CURRENT
      *     /dev/console binding via the path manager — early in boot
@@ -652,5 +661,54 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_tcb_resume(tcb);
     if (err) { sel4_debug_puts("spawn: TCB_Resume failed\n"); return -ENOMEM; }
 
+    return 0;
+}
+
+/* ----------------------------------------------------------------------
+ * v0.6.4 Memory Manager.
+ *
+ * tm_mmap_serve — serve one TM_REQ_MMAP.  Allocates Mega_Pages from
+ * taskman's main untyped pool, maps them contiguously into the
+ * caller's VSpace at its mmap_top cursor, advances mmap_top, returns
+ * the base vaddr.
+ *
+ * v0.6.4 limitations:
+ *   - Granularity is 2 MiB; callers asking for less get a 2 MiB
+ *     mapping anyway.
+ *   - No munmap, so addresses are bump-allocated and never reclaimed.
+ *   - No L0 PT lazy-allocation: each Mega_Page goes straight into the
+ *     L1 it shares with neighbours, which works because Sv39 has one
+ *     L1 entry per 1 GiB and we never grow past 1 GiB per process.
+ *     v0.7+ will lift that.
+ */
+int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long *out_vaddr)
+{
+    tm_process_t *proc = tm_process_lookup(caller);
+    if (!proc) return -ESRCH;
+    if (len == 0) return -EINVAL;
+
+    /* Round up to a multiple of QSOE_MEGA_PAGE. */
+    unsigned long bytes = (len + QSOE_MEGA_PAGE - 1) & ~(QSOE_MEGA_PAGE - 1);
+    unsigned long base  = proc->mmap_top;
+    unsigned long pages = bytes / QSOE_MEGA_PAGE;
+
+    for (unsigned long i = 0; i < pages; ++i) {
+        seL4_CPtr frame = alloc_object(seL4_RISCV_Mega_Page, 0);
+        if (!frame) {
+            sel4_debug_puts("tm_mmap_serve: Mega_Page alloc failed\n");
+            return -ENOMEM;
+        }
+        seL4_Word err = qsoe_riscv_page_map(frame, proc->vspace,
+                                            base + i * QSOE_MEGA_PAGE,
+                                            QSOE_RIGHTS_ALL,
+                                            QSOE_VM_ATTR_DEFAULT);
+        if (err) {
+            sel4_debug_puts("tm_mmap_serve: Page_Map failed\n");
+            return -ENOMEM;
+        }
+    }
+
+    proc->mmap_top = base + bytes;
+    *out_vaddr = base;
     return 0;
 }

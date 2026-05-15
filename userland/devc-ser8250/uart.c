@@ -51,6 +51,24 @@ unsigned uart_drain_rx(struct ser_ring *r)
     unsigned n = 0;
     while (uart_reg_read(UART_LSR) & LSR_RX_READY) {
         unsigned char b = uart_reg_read(UART_RHR);
+
+        /* v0.6.4 minimum line discipline: a terminal sends \r (0x0D)
+         * when the user presses Enter, but qsh's lexer treats \n as
+         * end-of-line.  Translate inbound \r → \n the way a cooked
+         * TTY's ICRNL would.  Full termios deferred. */
+        if (b == '\r') b = '\n';
+
+        /* v0.6.4 minimum echo: send the byte back so the user sees
+         * what they typed.  Newlines need to be \r\n on the wire so
+         * a regular terminal advances to the next line correctly. */
+        if (b == '\n') {
+            uart_tx_byte('\r');
+            uart_tx_byte('\n');
+        } else if (b >= 0x20 && b < 0x7f) {
+            uart_tx_byte(b);
+        }
+        /* Control characters (other than \n above) — do not echo. */
+
         if (ser_ring_push(r, b) != 0) break;  /* ring full; drop further */
         ++n;
     }

@@ -437,14 +437,25 @@ $(DSER_ELF): | devc-ser8250
 # ----------------------------------------------------------------------------
 
 
-$(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF)
+QSH_ELF := $(BUILD)/qsh.elf
+
+# qsh is built by userland/qsh/Makefile.
+.PHONY: qsh.elf-build
+qsh.elf-build: $(LIBQSOE_A) $(LIBC_A)
+	+$(MAKE) -C $(TOP)/userland/qsh all
+
+$(QSH_ELF): | qsh.elf-build
+	@true
+
+$(USERLAND_CPIO): $(INIT_ELF) $(TESTER_ELF) $(HELLO_ELF) $(DSER_ELF) $(QSH_ELF)
 	@mkdir -p $(BUILD)/cpio-root/bin
 	@cp $(INIT_ELF)   $(BUILD)/cpio-root/bin/init.elf
 	@cp $(TESTER_ELF) $(BUILD)/cpio-root/bin/tester.elf
 	@cp $(HELLO_ELF)  $(BUILD)/cpio-root/bin/hello.elf
 	@cp $(DSER_ELF)   $(BUILD)/cpio-root/bin/devc-ser8250.elf
+	@cp $(QSH_ELF)    $(BUILD)/cpio-root/bin/qsh.elf
 	@cd $(BUILD)/cpio-root && \
-	    printf '%s\n' bin/init.elf bin/tester.elf bin/hello.elf bin/devc-ser8250.elf | \
+	    printf '%s\n' bin/init.elf bin/tester.elf bin/hello.elf bin/devc-ser8250.elf bin/qsh.elf | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)

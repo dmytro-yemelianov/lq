@@ -5,6 +5,167 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.6.4] — 2026-05-15
+
+**Milestone: qsh runs and accepts input from the real interrupt-driven
+console.**  Boot to `# ` prompt; commands typed at the QEMU terminal
+flow through `devc-ser8250` (16550 UART driver) end-to-end into the
+shell and back out.
+
+### Memory model: no brk anywhere
+- `lite_malloc.c`, `oldmalloc/`, `mallocng/` filtered out of `libc.a`
+  in `userland/libc/Makefile` — all three musl backends call `SYS_brk`.
+- New `userland/libqsoe/src/malloc.c` provides
+  `malloc/realloc/free/calloc` plus the musl-internal aliases
+  (`__libc_malloc`, `__libc_malloc_impl`, `__libc_free`,
+  `__libc_realloc`, `__libc_calloc`) using only `mmap`.  Bump-pointer
+  arena grown on demand by 2 MiB Mega_Pages; `free` is a no-op for
+  v0.6.4 — proper freelist deferred.
+- `SYS_brk` removed from `qsoe_syscall_dispatch`; `SYS_mmap` (riscv64
+  #222) added.
+- `qsoe_mmap(addr, length, prot, flags, fd, off)` in
+  `syscall_dispatch.c` sends `TM_REQ_MMAP` to taskman's Memory
+  Manager.
+
+### Memory Manager in taskman
+- New wire label `TM_REQ_MMAP = 0x2c`.
+- New `tm_mmap_serve` in `userland/taskman/spawn.c` — allocates
+  Mega_Pages from taskman's untyped pool on demand and maps them
+  contiguously into the caller's vspace at its `mmap_top` cursor.
+- New per-process `mmap_top` field on `tm_process_t`, initialised to
+  `QSOE_MMAP_BASE = 0x2000000` (32 MiB).
+- Pre-allocated heap region deleted from `tm_spawn` — memory is now
+  fully on-demand.
+
+### Interrupt-driven console input (read path)
+- `devc-ser8250` refactored to the QRV two-thread design with the
+  park/wake handoff implemented in QSOE primitives:
+  - IRQ thread: `seL4_Wait(IRQ_NTFN)` → `uart_drain_rx` →
+    `MsgSendPulse(self_coid, ...)` to wake the main thread →
+    `irq_handler_ack`.
+  - Main thread: single `seL4_Recv` loop, distinguishes IPC vs. wake
+    by `badge & QSOE_NTFN_BADGE_BIT`.  On `TM_REQ_IO_READ` with empty
+    ring: `seL4_CNode_SaveCaller` into a fresh slot, store as
+    `g_pending_reader_slot`, re-Recv without replying.  On
+    bound-Notification wake: drain pulse queue and, if a reader is
+    parked + ring has data, `seL4_Send` the deferred reply on the
+    saved slot.  Race re-check after the stash mirrors QRV.  Single
+    blocking reader; a second concurrent reader gets `EBUSY`.
+- Minimum line discipline in `uart_drain_rx`: inbound `\r → \n`
+  (terminals send CR on Enter) + echo each printable byte back via
+  `uart_tx_byte` so the user can see typing.  Full termios deferred.
+
+### CSpace plumbing
+- New well-known slot `QSOE_CAP_CNODE_SELF = 9` — cap to the
+  process's own CNode, minted by `spawn.c` so user-space resmgrs can
+  invoke `seL4_CNode_SaveCaller` from inside their own process.
+  `QSOE_CAP_CNODE_DEPTH = 12` matches the freshly-retyped 12-bit
+  CNode radix.
+- New libqsoe slot allocator
+  `qsoe_state_alloc_empty_slot/free_empty_slot` — bumps in
+  `[0x800..0x1000)`, recycles freed slots through a small free list.
+  Used as `SaveCaller` destinations.
+
+### Signal API (compile-and-link scaffolding)
+- `userland/libqsoe/src/signal.c` (new) — `signal`/`sigaction`/`kill`/
+  `raise` plus signal-thread bootstrap that calls
+  `TM_REQ_REGISTER_SIGNAL_CHID`.  Wire labels
+  `TM_REQ_REGISTER_SIGNAL_CHID = 0x2a` and
+  `TM_REQ_GET_SIGNAL_CHID = 0x2b` plus per-process `signal_chid`
+  field on `tm_process_t`.
+- `qsoe_signal_init` is stubbed in v0.6.4 — pulse delivery into the
+  signal thread needs per-TCB notification binding which the kernel
+  currently rejects (one bound notification per TCB).  Deferred to
+  v0.6.5.  Stub prints a one-time warning and increments
+  `qsoe_signal_init_entered` so it can't silently rot.
+
+### musl-internal stubs
+- `userland/libqsoe/src/musl_stubs.c` (new) — `__lsysinfo`, `__wait`,
+  `__timedwait_cp` stubs needed at link time.  Each stub prints a
+  loud "first-hit" warning and increments a counter
+  (`qsoe_stub_hits_*`).
+
+### init / qsh wiring
+- `init` spawns qsh with `argv = { "qsh", "-i", 0 }` so `FTALKING`
+  is set without depending on `isatty()`.  `PS1=#` exported via the
+  child envp.
+
+### Errors / wire-protocol
+- New error `EBUSY = 16` in `qsoe/qrv.h`.
+- New wire label `TM_REQ_MMAP = 0x2c`.
+
+### Known gaps / deferred
+- No line editor: backspace, arrow keys, history navigation don't
+  work — typed input is taken as-is.  Full termios + edit.c port is
+  v0.7+.
+- `qsh pwd` errors out with "Destination address required" — no
+  `getcwd`/filesystem yet.
+- Signal delivery into the in-process signal thread waits on
+  v0.6.5's per-TCB notification binding work.
+- musl-stub real implementations tracked in TaskList #71.
+
+## [v0.6.3] — 2026-05-14
+
+**Stream A landing: QRV's mksh-derived shell ported into QSOE as
+`userland/qsh/`, ready to compile clean and link against
+libqsoe + musl.**
+
+### Added
+- Full qsh source tree in `userland/qsh/` (mksh-derived; license
+  attribution preserved in `License-mksh-orig.txt` + per-header
+  comments).
+- `qsh_error.h` — designed `qsh_error_t` + `QSH_TRY()` for future
+  setjmp/longjmp rip-out.
+
+### Changed
+- **Branding sweep** — all mksh/MKSH/Mksh/mksh_, ksh_/KSH_, mir/MIR
+  vendor tags, mbsd*, mbcc* replaced with qsh/QSH equivalents.
+- **mbsdint.h → qsh_intmath.h** (deep trim deferred).
+- **Obsolete primitives stripped** — termios scaffolding deleted
+  entirely (`x_mkraw`, `qsh_tcget/set`, `tty_state`, `struct termios`
+  all gone; line discipline lives in `edit.c` against raw bytes from
+  `devc-ser8250`).  TIOCGWINSZ branch out of `var_special.c`; magic-
+  number table out of `exec.c`.
+- **musl posix `setjmp`/`longjmp`** linked (BSD `_setjmp`/`_longjmp`
+  pair upstream relied on doesn't exist in musl).  Full rip-out to
+  explicit `qsh_error_t` propagation deferred to v0.6.4+.
+- **File-size refactor** — `histrap` → `history + history_file +
+  trap`; `tree` → `tree + tree_format`; `syn` → `syn + syn_compound
+  + error`; `eval` → `eval + eval_expand`; `misc` → `misc + misc_str
+  + misc_path`; `var` → `var + var_special`; `exec` → `exec + exec_io`.
+- **Global unifdef purge** — 2826 lines removed by pinning
+  `HAVE_*`/`QSH_*` gates from `qsh_config.h`.  Dead-platform sweep
+  removed `__OS2__` and EBCDIC blocks across 6 files (~390 lines).
+
+### Build modularisation
+- `userland/libc/Makefile` — standalone musl build.
+- `userland/libqsoe/Makefile` — produces `libqsoe.a` (normal) +
+  `libqsoe-tm.a` (`-DQSOE_LIBQSOE_IN_TASKMAN`).
+- `userland/taskman/Makefile` — `taskman.elf`, with embedded
+  userland CPIO via `.incbin`.
+- `userland/devc-ser8250/Makefile` — 16550 UART driver.
+- Top-level `Makefile` shrunk ~250 lines; each component reachable
+  via `cd userland/<name> && make clean all`.
+
+### libc cleanup
+- `scripts/extract-sel4-riscv.sh` gained recursive directory-
+  exclusion pattern (`path/**/dirname/`).
+- `placement.txt` expanded — non-RISC-V arch subdirs and
+  Linux-specific subtrees / files (clone/exec/wait family in
+  `src/process/`, futex/clone users in `src/thread/`, setresuid
+  family, setdomainname) excluded.  190 files removed from
+  `core/userland/libc/src/`.  Makefile's find collapsed to single
+  recursive find.
+- musl per-arch `.S`/`.s` files (`setjmp.S`, `longjmp.S`, ...) now
+  compiled into `libc.a` — fixed a bug where their `.o` stubs were
+  empty.
+
+### Build state
+- 0 compile failures across 5 user ELFs + taskman + qsoe.elf.
+- `make qsh` target compiles all 30 `.c` files clean; 8 link
+  warnings (posix_spawn/waitpid/`__wait` — satisfied by libqsoe at
+  real-link time via `userland/qsh/Makefile`).
+
 ## [v0.6.2] — 2026-05-14
 
 ### Added

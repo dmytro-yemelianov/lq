@@ -50,6 +50,12 @@ void _qsoe_start_main(pid_t pid, int argc, char **argv, char **envp)
     qsoe_state_force_bind_coid(1, QSOE_CAP_STDOUT_CONNECT);
     qsoe_state_force_bind_coid(2, QSOE_CAP_STDERR_CONNECT);
 
+    /* v0.6.4: bring up the signal thread BEFORE main() so signal
+     * delivery is live for the duration of the program.  Failure
+     * here is non-fatal — main() runs without signal delivery. */
+    extern int qsoe_signal_init(void);
+    (void)qsoe_signal_init();
+
     int rc = main(argc, argv, envp);
     _exit(rc);
 }

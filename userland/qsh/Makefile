@@ -60,31 +60,33 @@ QSH_CFLAGS   := $(ARCH_CFLAGS) -O2 -g \
 SRCS := $(notdir $(wildcard $(QSH_DIR)/*.c))
 OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(SRCS))
 
-LIBQSOE_OBJS := $(patsubst %.c,$(OBJDIR)/libqsoe/%.o,$(LIBQSOE_SRCS))
+# Pre-built archives from sibling submakes.
+LIBQSOE_A := $(BUILD)/libqsoe.a
 
 all: $(QSH_ELF)
 
+# Need start.S like the other userland ELFs.  Reuse hello/start.S
+# verbatim — it does the standard QSOE crt0 (clear gp/tp, set up
+# initial stack, jump to _qsoe_start_main).
+$(OBJDIR)/start.o: $(TOP)/userland/hello/start.S | $(OBJDIR)
+	$(CC) $(ARCH_CFLAGS) -c -o $@ $<
+
 # Link.  Same shape as hello.elf in the top-level Makefile.
-$(QSH_ELF): $(OBJS) $(LIBQSOE_OBJS) $(LIBC_A)
+$(QSH_ELF): $(OBJDIR)/start.o $(OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(ARCH_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(LIBQSOE_OBJS) $(OBJS) $(LIBC_A)
+	    -o $@ $(OBJDIR)/start.o $(OBJS) \
+	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
+	    $(LIBC_A)
 
 # Compile each qsh .c into its .o, no abort on error so we surface all
 # failures in a single pass.
 $(OBJDIR)/%.o: $(QSH_DIR)/%.c | $(OBJDIR)
 	$(CC) $(QSH_CFLAGS) -c -o $@ $< || (rm -f $@; false)
 
-# libqsoe objects.
-$(OBJDIR)/libqsoe/%.o: $(LIBQSOE_DIR)/src/%.c | $(OBJDIR)/libqsoe
-	$(CC) $(QSH_CFLAGS) -c -o $@ $<
-
 $(OBJDIR):
-	@mkdir -p $@
-
-$(OBJDIR)/libqsoe:
 	@mkdir -p $@
 
 clean:

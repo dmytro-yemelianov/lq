@@ -415,6 +415,43 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
+    case TM_REQ_REGISTER_SIGNAL_CHID: {
+        /* Caller's signal thread tells taskman the chid (in caller's
+         * own coid namespace) of the channel it listens on for
+         * signal pulses.  MR0 = chid.  Reply label = 0 on success,
+         * ESRCH if caller pid is unknown. */
+        tm_process_t *proc = tm_process_lookup(caller);
+        if (!proc) { err = (seL4_Word)ESRCH; break; }
+        proc->signal_chid = (int)mr0;
+        break;
+    }
+    case TM_REQ_GET_SIGNAL_CHID: {
+        /* kill(target, sig) asks taskman where to send the pulse.
+         * MR0 = target pid.  Reply: MR0 = target pid, MR1 = chid.
+         * Label = ESRCH if target unknown or hasn't registered. */
+        pid_t target = (pid_t)mr0;
+        tm_process_t *proc = tm_process_lookup(target);
+        if (!proc || proc->signal_chid == 0) {
+            err = (seL4_Word)ESRCH;
+            break;
+        }
+        *out_mr0 = (seL4_Word)target;
+        *out_mr1 = (seL4_Word)proc->signal_chid;
+        reply_len = 2;
+        break;
+    }
+    case TM_REQ_MMAP: {
+        /* Memory Manager: allocate Mega_Pages on demand and map them
+         * into the caller's vspace.  MR0 = length (bytes).  Reply:
+         * MR0 = base vaddr.  Label = errno on failure. */
+        unsigned long len = (unsigned long)mr0;
+        unsigned long base = 0;
+        int rc = tm_mmap_serve(caller, len, &base);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)base;
+        reply_len = 1;
+        break;
+    }
     case TM_REQ_PING_CLIENTINFO: {
         /* Demo: exercise ConnectClientInfo from inside the dispatch
          * loop. The badge attached to this incoming message IS the

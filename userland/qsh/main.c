@@ -560,6 +560,11 @@ main(int argc, const char *argv[])
     int rv;
     Source *s;
 
+    /* v0.6.4 trace: confirm we got past crt0 + libqsoe init. */
+    extern int printf(const char *, ...);
+    printf("[qsh] main entered, argc=%d argv[0]=%s\n",
+           argc, argc > 0 ? argv[0] : "(none)");
+
     main_init(argc, argv, &s);
     if (as_builtin) {
         rv = c_builtin(e->loc->argv) & 0xFF;

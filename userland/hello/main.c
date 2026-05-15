@@ -24,6 +24,28 @@
 #include "../libqsoe/include/qsoe/qrv.h"
 #include "../libqsoe/include/qsoe/slots.h"
 
+/* v0.6.4 signal-self-test.  Handler runs in the signal thread; sets
+ * a flag the main thread polls below.  If we get back to main with
+ * got_sigusr1 = 1, the whole pulse-as-signal path worked end-to-end:
+ *   raise(SIGUSR1)
+ *     → ConnectAttach(self, signal_chid)
+ *     → MsgSendPulse(coid, code=SIGUSR1)
+ *     → signal thread wakes from MsgReceive
+ *     → looks up qsoe_signal_handlers[SIGUSR1]
+ *     → invokes us here. */
+#define SIGUSR1 10
+typedef void (*sighandler_t)(int);
+extern sighandler_t signal(int sig, sighandler_t fn);
+extern int          raise(int sig);
+
+static volatile int got_sigusr1;
+
+static void sigusr1_handler(int sig)
+{
+    (void)sig;
+    got_sigusr1 = 1;
+}
+
 int main(int argc, char **argv, char **envp)
 {
     /* The printf demo. If you're reading this output, every layer
@@ -40,6 +62,39 @@ int main(int argc, char **argv, char **envp)
     fprintf(stderr, "[hello] this line went to stderr (fd=2)\n");
     fflush(stdout);
     fflush(stderr);
+
+    /* v0.6.4 — signal self-test.  Install a handler, raise() the
+     * signal to self, wait for the signal thread to run it. */
+    extern int qsoe_signal_chid;
+    extern int qsoe_signal_init_chid_err;
+    extern int qsoe_signal_init_thread_err;
+    extern int qsoe_signal_init_done;
+    extern int qsoe_signal_init_entered;
+    extern int qsoe_signal_init_past_chid_check;
+    extern int qsoe_signal_init_chid_seen;
+    printf("[hello] signal-test: entered=%d past=%d chid_seen=%d "
+           "chid=%d done=%d chid_err=%d thread_err=%d\n",
+           qsoe_signal_init_entered, qsoe_signal_init_past_chid_check,
+           qsoe_signal_init_chid_seen,
+           qsoe_signal_chid, qsoe_signal_init_done,
+           qsoe_signal_init_chid_err, qsoe_signal_init_thread_err);
+    fflush(stdout);
+    signal(SIGUSR1, sigusr1_handler);
+    printf("[hello] signal-test: handler installed, calling raise(SIGUSR1)\n");
+    fflush(stdout);
+    int raise_rc = raise(SIGUSR1);
+    printf("[hello] signal-test: raise(SIGUSR1) -> %d\n", raise_rc);
+    fflush(stdout);
+
+    /* Crude wait for the signal thread to schedule. */
+    for (int i = 0; i < 10000000 && !got_sigusr1; ++i)
+        for (volatile int j = 0; j < 100; ++j);
+    if (got_sigusr1)
+        printf("[hello] signal-test: PASS — handler ran in signal thread\n");
+    else
+        printf("[hello] signal-test: FAIL — handler did not run "
+               "(got_sigusr1=%d)\n", got_sigusr1);
+    fflush(stdout);
 
     /* v0.4.3 server demo — ChannelCreate + MsgReceive loop. */
     int chid = ChannelCreate(0);

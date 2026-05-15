@@ -86,6 +86,19 @@ $(MUSL_GEN)/src/internal/version.h:
 # So a plain recursive find is now sufficient.
 MUSL_SRCS_ALL := $(shell find $(MUSL_DIR)/src -name '*.c' -o -name '*.S' -o -name '*.s')
 
+# v0.6.4: no brk anywhere in QSOE.  All three musl malloc backends
+# (lite_malloc, oldmalloc, mallocng) call SYS_brk.  Strip them
+# entirely — libqsoe's malloc.c provides malloc/free/realloc/calloc
+# + the __libc_* aliases via mmap.  realloc.c / free.c / calloc.c /
+# libc_calloc.c / aligned_alloc.c / memalign.c / posix_memalign.c /
+# reallocarray.c are tiny wrappers; they stay (they just call
+# __libc_*).
+MUSL_SRCS_ALL := $(filter-out \
+    $(MUSL_DIR)/src/malloc/lite_malloc.c \
+    $(wildcard $(MUSL_DIR)/src/malloc/oldmalloc/*.c) \
+    $(wildcard $(MUSL_DIR)/src/malloc/mallocng/*.c), \
+    $(MUSL_SRCS_ALL))
+
 # Split by extension for the patsubst rules below.
 MUSL_C_SRCS   := $(filter %.c,$(MUSL_SRCS_ALL))
 MUSL_ASM_SRCS := $(filter %.S %.s,$(MUSL_SRCS_ALL))

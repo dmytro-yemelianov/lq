@@ -93,5 +93,28 @@ int main(int argc, char **argv, char **envp)
     printf("[init] tester exited, status=%d\n", status);
     fflush(stdout);
 
+    /* v0.6.4: spawn qsh as the interactive shell.  -i forces
+     * FTALKING (interactive) mode so qsh prints PS1 before each
+     * read; isatty() would otherwise also turn it on, but our
+     * v0.6.4 ioctl stub returns ENOTTY, so we pass it explicitly. */
+    const char *qsh_argv[] = { "qsh", "-i", 0 };
+    const char *qsh_envp[] = { "PATH=/bin", "PS1=# ", "QSOE_VER=0.6.4", 0 };
+    pid_t qsh_pid = 0;
+    rc = posix_spawn(&qsh_pid, "qsh.elf", 0, 0,
+                     (char *const *)qsh_argv, (char *const *)qsh_envp);
+    if (rc != 0) {
+        printf("[init] posix_spawn(qsh) failed, rc=%d\n", rc);
+        fflush(stdout);
+        for (;;) qsoe_sys_yield();
+    }
+    printf("[init] spawned qsh, pid=%d\n", (int)qsh_pid);
+    fflush(stdout);
+
+    /* Wait for qsh to exit (the user typed `exit`, or it crashed). */
+    int qsh_status = 0;
+    wrc = waitpid(qsh_pid, &qsh_status, 0);
+    printf("[init] qsh exited, status=%d (wrc=%d)\n", qsh_status, wrc);
+    fflush(stdout);
+
     for (;;) qsoe_sys_yield();
 }

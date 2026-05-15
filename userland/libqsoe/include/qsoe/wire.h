@@ -60,6 +60,29 @@ enum {
      *           the in-taskman handler to a real UART driver. */
     TM_REQ_PATHMGR_REGISTER     = 0x28,
     TM_REQ_PATHMGR_REPATH       = 0x29,
+    /* v0.6.4 signals-as-pulses.
+     * REGISTER_SIGNAL_CHID: caller's signal thread tells taskman the
+     *                      chid (in caller's coid namespace) it listens
+     *                      on.  MR0 = chid.  Reply label = 0.
+     * GET_SIGNAL_CHID:     kill(pid, sig) asks taskman for the target
+     *                      process's signal-channel coordinates.
+     *                      MR0 = target pid.
+     *                      Reply: MR0 = target_pid, MR1 = chid.
+     *                      Reply label = ESRCH if target unknown or
+     *                      hasn't registered yet.
+     */
+    TM_REQ_REGISTER_SIGNAL_CHID = 0x2a,
+    TM_REQ_GET_SIGNAL_CHID      = 0x2b,
+    /* v0.6.4: Memory Manager.  POSIX mmap routed to taskman; taskman
+     * allocates Mega_Pages on demand and maps them into the caller's
+     * vspace at the next free 2 MiB-aligned slot, starting at the
+     * per-process mmap_top cursor.  No brk anywhere in the system —
+     * malloc in libqsoe goes through this.
+     *
+     * MMAP:  MR0 = length (bytes; rounded up to 2 MiB by taskman).
+     *        Reply: MR0 = base vaddr.  Label = ENOMEM on failure.
+     */
+    TM_REQ_MMAP                 = 0x2c,
 };
 
 /* Reply label conventions: 0 on success, positive QNX errno on failure.

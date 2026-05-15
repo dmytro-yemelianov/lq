@@ -72,7 +72,7 @@ incremental builds are seconds.
 ## Current status
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
-of **v0.6.1**:
+of **v0.6.4**:
 
 - QNX-style synchronous IPC: `ChannelCreate`/`Destroy`,
   `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`
@@ -91,8 +91,11 @@ of **v0.6.1**:
   processes inherit fds 0/1/2 bound to `/dev/console`
 - **musl libc** linked into spawned binaries; `__sysinfo` indirection
   routes musl's "syscalls" into libqsoe; `printf` works end-to-end
-- Per-process heap (2 MiB Mega_Page) backing musl's `lite_malloc`
-  via `brk()`
+- **mmap-only memory model** — no `brk` anywhere in QSOE.  musl's
+  three malloc backends are filtered out of `libc.a`; libqsoe
+  provides its own `malloc`/`realloc`/`free` over `mmap`, which
+  routes to taskman's Memory Manager (`TM_REQ_MMAP`).  Memory is
+  allocated on demand in 2 MiB Mega_Page chunks.
 - **cpiofs** — embedded `userland.cpio` mounted as a read-only
   filesystem at `/`; `open("/bin/hello.elf")` works from any program
 - **`/sbin/init`** owns userland orchestration; taskman just
@@ -101,7 +104,15 @@ of **v0.6.1**:
   synchronisation; the parent blocks until the child says ready
 - **`devc-ser8250`** — first real userland resmgr: drives the 16550
   UART via PLIC interrupts on a dedicated IRQ thread, registers at
-  `/dev/ser1`, and init redirects `/dev/console` to it at boot
+  `/dev/ser1`, and init redirects `/dev/console` to it at boot.
+  Blocking reads park the caller via `seL4_CNode_SaveCaller`; the
+  IRQ thread wakes them via a self-`MsgSendPulse` on each RX batch
+  (the QRV two-thread design, in QSOE primitives).
+- **qsh** — mksh-derived shell ported from QRV, **boots to a `# `
+  prompt** on the real console and runs commands typed at the QEMU
+  terminal.  Line editing (backspace, arrows, history) and a
+  working filesystem are v0.7+ work; for v0.6.4 the input is raw
+  with minimum `\r → \n` translation and echo in `devc-ser8250`.
 
 ## Documentation
 

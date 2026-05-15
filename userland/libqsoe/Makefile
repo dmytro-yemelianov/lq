@@ -93,7 +93,8 @@ $(GEN)/qsoe/sys_version.h: $(wildcard $(TOP)/.git/HEAD $(TOP)/.git/index)
 # Source lists.
 # Normal flavour: full surface (everything in src/).
 NORMAL_SRCS := state.c msg.c process.c thread.c channel.c connect.c \
-               start_main.c io.c syscall_dispatch.c float128_stubs.c
+               start_main.c io.c syscall_dispatch.c float128_stubs.c \
+               signal.c musl_stubs.c malloc.c
 
 # In-taskman flavour: subset — taskman doesn't need its own start_main,
 # its own syscall dispatcher, or the float128 stubs.

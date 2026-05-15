@@ -17,6 +17,11 @@
  */
 
 #include "../include/qsoe/qrv.h"
+#include "../include/qsoe/slots.h"
+#include "../include/qsoe/wire.h"
+
+#include "sel4_types.h"
+#include "qsoe_invoke.h"
 
 #define SYS_close       57
 #define SYS_openat      56
@@ -27,7 +32,7 @@
 #define SYS_writev      66
 #define SYS_exit        93
 #define SYS_exit_group  94
-#define SYS_brk        214
+#define SYS_mmap       222
 #define SYS_set_tid_address 96
 #define SYS_ioctl       29
 #define SYS_set_robust_list 99
@@ -40,8 +45,11 @@ struct musl_iovec {
     unsigned long iov_len;
 };
 
-/* Forward decl of the brk implementation (real one lands in step 2). */
-void *qsoe_brk(void *addr);
+/* Forward decl of qsoe_mmap (real impl below).  Memory comes from
+ * taskman's Memory Manager via TM_REQ_MMAP — no brk anywhere in
+ * QSOE. */
+void *qsoe_mmap(void *addr, unsigned long length, int prot, int flags,
+                int fd, long off);
 
 static long do_writev(int fd, const struct musl_iovec *iov, int iovcnt)
 {
@@ -109,9 +117,12 @@ long qsoe_syscall_dispatch(long n, long a, long b, long c, long d, long e, long 
     case SYS_lseek:
         /* v0.5.1: not supported for the console; printf doesn't seek. */
         return -ESPIPE;
-    case SYS_brk:
-        /* Provided by qsoe_brk in libqsoe; landed in step 2. */
-        return (long)qsoe_brk((void *)a);
+    case SYS_mmap:
+        /* musl's __mmap calls this: a=addr, b=length, c=prot, d=flags,
+         * e=fd, f=offset.  qsoe_mmap routes to taskman's Memory
+         * Manager via TM_REQ_MMAP. */
+        return (long)qsoe_mmap((void *)a, (unsigned long)b, (int)c,
+                               (int)d, (int)e, (long)f);
     case SYS_exit:
     case SYS_exit_group:
         _exit((int)a);
@@ -159,28 +170,26 @@ int *__errno_location(void) { return &qsoe_libc_errno; }
  * that name so the linker can resolve either. */
 int *___errno_location(void) __attribute__((weak, alias("__errno_location")));
 
-/* qsoe_brk — the heap break primitive. spawn.c reserves a 2 MiB
- * Mega_Page mapped at CHILD_HEAP_BASE; this function tracks the
- * current break pointer within that region.
+/* qsoe_mmap — POSIX mmap routed to taskman's Memory Manager.
  *
- * Linux brk(addr) returns the resulting break. musl's lite_malloc
- * compares the returned value against the requested one to decide
- * whether the kernel honoured the request. brk(0) — used by sbrk(0)
- * and by lite_malloc's init path — returns the current break. */
-#define QSOE_HEAP_BASE   0x800000UL
-#define QSOE_HEAP_LIMIT  (QSOE_HEAP_BASE + 0x200000UL)  /* 2 MiB */
+ * v0.6.4 supports MAP_ANONYMOUS only.  addr/prot/flags/fd/off are
+ * ignored except for sanity: an mmap of a file (fd >= 0) is rejected
+ * with -ENODEV.  Taskman rounds length up to 2 MiB and returns a
+ * fresh 2 MiB-aligned region. */
+#define QSOE_MAP_FAILED  ((void *)-1)
 
-static unsigned long s_brk = QSOE_HEAP_BASE;
-
-void *qsoe_brk(void *addr)
+void *qsoe_mmap(void *addr, unsigned long length, int prot, int flags,
+                int fd, long off)
 {
-    unsigned long want = (unsigned long)addr;
-    if (want == 0) return (void *)s_brk;
-    if (want < QSOE_HEAP_BASE || want > QSOE_HEAP_LIMIT) {
-        /* Linux semantics: out-of-range request returns the current
-         * break unchanged (callers detect failure by comparing). */
-        return (void *)s_brk;
-    }
-    s_brk = want;
-    return (void *)s_brk;
+    (void)addr; (void)prot; (void)flags; (void)off;
+    if (fd >= 0) { qsoe_errno = ENODEV; return QSOE_MAP_FAILED; }
+    if (length == 0) { qsoe_errno = EINVAL; return QSOE_MAP_FAILED; }
+
+    seL4_Word mr0 = (seL4_Word)length, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_MMAP, 0, 0, 1);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err != 0) { qsoe_errno = (int)err; return QSOE_MAP_FAILED; }
+    return (void *)(unsigned long)mr0;
 }

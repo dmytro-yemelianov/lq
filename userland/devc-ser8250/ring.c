@@ -49,3 +49,12 @@ unsigned ser_ring_drain(struct ser_ring *r, unsigned char *dst, unsigned max)
     qsoe_spin_unlock(&r->lock);
     return n;
 }
+
+int ser_ring_empty(struct ser_ring *r)
+{
+    int empty;
+    qsoe_spin_lock(&r->lock);
+    empty = (r->count == 0);
+    qsoe_spin_unlock(&r->lock);
+    return empty;
+}

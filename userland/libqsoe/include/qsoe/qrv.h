@@ -65,6 +65,7 @@ typedef unsigned int  gid_t;
 #define EFBIG         27
 #define ECHILD        10
 #define ENODEV        19
+#define EBUSY         16
 #define ENOSYS        89
 #define EHOSTUNREACH 113
 
