@@ -254,3 +254,35 @@ int tm_pathmgr_symlink(const char *link_path, const char *target_path)
     node->target[tlen] = 0;
     return 0;
 }
+
+int tm_pathmgr_child_at(const char *path, unsigned idx,
+                        char *name_out, unsigned name_cap,
+                        unsigned *out_namelen)
+{
+    if (!path || path[0] != '/' || !g_root) return -EINVAL;
+    if (!name_out || name_cap == 0 || !out_namelen) return -EINVAL;
+
+    /* Walk to the exact node for `path` (same shape as repath). */
+    pm_node_t *node = g_root;
+    const char *p = path;
+    const char *comp;
+    unsigned len;
+    while (pm_next_component(&p, &comp, &len)) {
+        pm_node_t *child = pm_find_child(node, comp, len);
+        if (!child) return -EINVAL;
+        node = child;
+    }
+
+    /* Skip `idx` siblings, return the next. */
+    pm_node_t *c = node->child;
+    unsigned i = 0;
+    for (; c && i < idx; c = c->sibling, ++i) { }
+    if (!c) return -ENOENT;
+
+    unsigned nlen = c->name_len;
+    if (nlen + 1 > name_cap) nlen = name_cap - 1;   /* truncate, NUL-safe */
+    for (unsigned k = 0; k < nlen; ++k) name_out[k] = c->name[k];
+    name_out[nlen] = 0;
+    *out_namelen = nlen;
+    return 0;
+}

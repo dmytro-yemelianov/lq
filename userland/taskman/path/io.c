@@ -10,6 +10,7 @@
 #include "path.h"
 #include "pathmgr.h"
 #include "cpiofs.h"
+#include "pmdir.h"
 #include "../sys/console.h"
 #include "../sys/devnull.h"
 #include "../sys/devzero.h"
@@ -50,6 +51,16 @@ int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot)
                 return orc;
             }
         }
+    } else if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_PMDIR) {
+        /* Synthetic dir backed by pathmgr's own tree (e.g. /dev). */
+        seL4_Word badge = 0;
+        if (tm_connection_badge_by_slot(caller, slot, &badge) == 0) {
+            int orc = tm_pmdir_open(s_open_path, badge);
+            if (orc) {
+                tm_connect_detach(caller, slot);
+                return orc;
+            }
+        }
     }
     *out_slot = slot;
     return 0;
@@ -74,6 +85,9 @@ int tm_io_close(pid_t caller, seL4_Word badge)
     if (srv_pid == QSOE_PID_TASKMAN &&
         (srv_chid == TM_DEVNULL_CHID || srv_chid == TM_DEVZERO_CHID)) {
         return 0;   /* /dev/null and /dev/zero are stateless too */
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_PMDIR_CHID) {
+        return tm_pmdir_close(badge);
     }
     /* External resmgrs (e.g. /sbin/pipe): they receive TM_REQ_CLOSE
      * directly on their own channel (the fd's cap points at them);
@@ -208,6 +222,12 @@ int tm_fstat(pid_t caller, seL4_Word badge, unsigned *out_bytes)
         *out_bytes = (unsigned)sizeof *out;
         return 0;
     }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_PMDIR_CHID) {
+        int rc = tm_pmdir_stat(out);
+        if (rc) return rc;
+        *out_bytes = (unsigned)sizeof *out;
+        return 0;
+    }
     /* External resmgrs: route a stat probe over the connection
      * once their wire protocol exists.  Not wired yet. */
     return -ENOSYS;
@@ -289,6 +309,19 @@ int tm_readdir(pid_t caller, seL4_Word badge, unsigned *out_bytes)
         unsigned namelen = 0;
         int d_type = 0;
         int rc = tm_cpiofs_readdir(badge, name, &namelen, &d_type);
+        if (rc) return rc;
+        p[0] = (unsigned char)d_type;
+        for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];
+        p[1 + namelen] = 0;
+        *out_bytes = 1 + namelen + 1;
+        return 0;
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_PMDIR_CHID) {
+        unsigned char *p = (unsigned char *)&qsoe_ipcbuf->msg[4];
+        char name[256];
+        unsigned namelen = 0;
+        int d_type = 0;
+        int rc = tm_pmdir_readdir(badge, name, &namelen, &d_type);
         if (rc) return rc;
         p[0] = (unsigned char)d_type;
         for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];

@@ -756,8 +756,7 @@ int main(seL4_BootInfo *bi)
 
     seL4_CPtr ut = find_largest_ram_untyped(bi);
     if (ut == 0) {
-        tm_err("no RAM untyped");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("no RAM untyped");
     }
 
     seL4_CPtr uart_ut = find_device_untyped_for_paddr(bi, 0x10000000UL);
@@ -775,34 +774,32 @@ int main(seL4_BootInfo *bi)
                                           seL4_CapInitThreadCNode, 0, 0,
                                           primary_ep, 1);
     if (rerr != 0) {
-        tm_err("failed to retype primary endpoint");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("failed to retype primary endpoint");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, 1,
                                       primary_ep, primary_ep) != 0) {
-        tm_err("failed to register primary channel");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("failed to register primary channel");
     }
 
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CONSOLE_CHID,
                                       primary_ep, primary_ep) != 0) {
-        tm_err("failed to register console channel");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("failed to register console channel");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CPIOFS_CHID,
                                       primary_ep, primary_ep) != 0) {
-        tm_err("failed to register cpiofs channel");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("failed to register cpiofs channel");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_DEVNULL_CHID,
                                       primary_ep, primary_ep) != 0) {
-        tm_err("failed to register /dev/null channel");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("failed to register /dev/null channel");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_DEVZERO_CHID,
                                       primary_ep, primary_ep) != 0) {
-        tm_err("failed to register /dev/zero channel");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("failed to register /dev/zero channel");
+    }
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_PMDIR_CHID,
+                                      primary_ep, primary_ep) != 0) {
+        tm_crash("failed to register pmdir channel");
     }
 
     tm_pathmgr_init();
@@ -814,8 +811,7 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_CONSOLE,
         };
         if (tm_pathmgr_register("/dev/console", &obj) != 0) {
-            tm_err("pathmgr register /dev/console failed");
-            for (;;) __asm__ volatile("nop");
+            tm_crash("pathmgr register /dev/console failed");
         }
     }
     {
@@ -826,8 +822,7 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_CPIOFS,
         };
         if (tm_pathmgr_register("/", &obj) != 0) {
-            tm_err("pathmgr register / failed");
-            for (;;) __asm__ volatile("nop");
+            tm_crash("pathmgr register / failed");
         }
     }
 
@@ -837,8 +832,7 @@ int main(seL4_BootInfo *bi)
      * how qsh detects its tty — once this resolves, qsh's edit.c
      * editor (with arrow-key history) takes over. */
     if (tm_pathmgr_symlink("/dev/tty", "/dev/console") != 0) {
-        tm_err("pathmgr symlink /dev/tty failed");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("pathmgr symlink /dev/tty failed");
     }
     /* /dev/null and /dev/zero — POSIX-essential pseudo-devices,
      * each backed by a trivial taskman-internal resmgr (sys/devnull.c
@@ -852,8 +846,7 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_NULL,
         };
         if (tm_pathmgr_register("/dev/null", &obj) != 0) {
-            tm_err("pathmgr register /dev/null failed");
-            for (;;) __asm__ volatile("nop");
+            tm_crash("pathmgr register /dev/null failed");
         }
     }
     {
@@ -864,8 +857,24 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_ZERO,
         };
         if (tm_pathmgr_register("/dev/zero", &obj) != 0) {
-            tm_err("pathmgr register /dev/zero failed");
-            for (;;) __asm__ volatile("nop");
+            tm_crash("pathmgr register /dev/zero failed");
+        }
+    }
+
+    /* Synthetic /dev directory.  Without this, the implicit "dev"
+     * parent node in pathmgr's tree (created by every /dev/<X>
+     * registration above) has no obj → ls /dev falls back to
+     * cpiofs and gets ENOENT.  PMDIR's open + readdir walk
+     * pathmgr's own child list. */
+    {
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = QSOE_PID_TASKMAN,
+            .server_chid  = TM_PMDIR_CHID,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_TASKMAN_PMDIR,
+        };
+        if (tm_pathmgr_register("/dev", &obj) != 0) {
+            tm_crash("pathmgr register /dev failed");
         }
     }
 
@@ -879,13 +888,11 @@ int main(seL4_BootInfo *bi)
     const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
                                      "sbin/init", &elf_size);
     if (!elf) {
-        tm_err("sbin/init not found in CPIO");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("sbin/init not found in CPIO");
     }
     pid_t init_pid = tm_pid_alloc();
     if (!init_pid) {
-        tm_err("pid allocator empty");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("pid allocator empty");
     }
     tm_info("spawning /sbin/init (pid=%d)...", (long)init_pid);
     static const char *boot_argv0 = "init";
@@ -895,8 +902,7 @@ int main(seL4_BootInfo *bi)
                        /*envc=*/0, 0,
                        /*elf_name=*/"sbin/init");
     if (sr != 0) {
-        tm_err("tm_spawn returned non-zero");
-        for (;;) __asm__ volatile("nop");
+        tm_crash("tm_spawn returned non-zero");
     }
     tm_info("dispatcher ready");
 

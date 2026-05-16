@@ -551,6 +551,33 @@ static void serve(int chid)
             out_bytes = r * 8;
             break;
         }
+
+        /* Generic fd-shape probes from the libc side.  ls(1)'s lstat()
+         * lands here once the client has opened /dev/pci.  Reply with
+         * a char-device stat so isatty(fd)==0 and ls prints "crw...". */
+        case TM_REQ_FSTAT: {
+            tm_stat_t *st = (tm_stat_t *)&rbuf[32];
+            for (unsigned i = 0; i < sizeof *st; ++i)
+                ((unsigned char *)st)[i] = 0;
+            st->st_dev     = 9;
+            st->st_ino     = 1;
+            st->st_mode    = TM_S_IFCHR | 0666;
+            st->st_nlink   = 1;
+            st->st_rdev    = (9UL << 8) | 1;
+            st->st_blksize = 256;
+            unsigned want  = (unsigned)sizeof *st;
+            for (int i = 0; i < 32; ++i) rbuf[i] = 0;
+            rbuf[0] = (unsigned char)( want        & 0xff);
+            rbuf[1] = (unsigned char)((want >>  8) & 0xff);
+            rbuf[2] = (unsigned char)((want >> 16) & 0xff);
+            rbuf[3] = (unsigned char)((want >> 24) & 0xff);
+            MsgReply(rcvid, 0, rbuf, 32 + (int)sizeof *st);
+            continue;
+        }
+        case TM_REQ_CLOSE:
+            MsgReply(rcvid, 0, 0, 0);
+            continue;
+
         default:
             break;
         }

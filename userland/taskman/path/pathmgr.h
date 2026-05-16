@@ -27,6 +27,11 @@
 #define PATHMGR_HANDLER_TASKMAN_CPIOFS  2  /* v0.6.0 */
 #define PATHMGR_HANDLER_TASKMAN_NULL    3  /* v0.8.0 */
 #define PATHMGR_HANDLER_TASKMAN_ZERO    4  /* v0.8.0 */
+#define PATHMGR_HANDLER_TASKMAN_PMDIR   5  /* synthetic dir backed by
+                                            * the pathmgr's own tree —
+                                            * used for /dev so ls(1)
+                                            * can enumerate registered
+                                            * device nodes */
 
 /* Internal taskman channel ids beyond the primary (1). All share the
  * primary endpoint; (TASKMAN_PID, *_CHID) is registered in the
@@ -37,6 +42,7 @@
 #define TM_CPIOFS_CHID   3
 #define TM_DEVNULL_CHID  4
 #define TM_DEVZERO_CHID  5
+#define TM_PMDIR_CHID    6   /* synthetic pathmgr directories (/dev) */
 
 typedef struct tm_pathmgr_obj {
     pid_t    server_pid;
@@ -76,5 +82,16 @@ int tm_pathmgr_repath(const char *path, const tm_pathmgr_obj_t *new_obj);
  * -EINVAL on bad input, -ENOMEM if the pool is full, -EEXIST if
  * link_path is already registered with a different attachment. */
 int tm_pathmgr_symlink(const char *link_path, const char *target_path);
+
+/* Enumerate direct children of the pathmgr node at `path`.  `idx` is
+ * zero-based; on a match the child's name (NUL-terminated) is
+ * written to `name_out` (caller-sized; clamped to cap) and *namelen
+ * gets its length.  Returns 0 on hit, -ENOENT past the end, -EINVAL
+ * for a bad path / unknown node.  Used by tm_pmdir_readdir (for
+ * /dev) and by tm_cpiofs_readdir (to merge pathmgr children of "/"
+ * with CPIO entries so ls / sees "dev" alongside "bin", "sbin"). */
+int tm_pathmgr_child_at(const char *path, unsigned idx,
+                        char *name_out, unsigned name_cap,
+                        unsigned *out_namelen);
 
 #endif /* QSOE_TASKMAN_PATHMGR_H */

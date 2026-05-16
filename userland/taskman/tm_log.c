@@ -133,3 +133,33 @@ void tm_log_emit(tm_log_level_t lvl, const char *fmt, ...)
     va_end(ap);
     put_char('\n');
 }
+
+/* ---- Terminal failure ------------------------------------------- */
+
+void tm_crash(const char *fmt, ...)
+{
+    /* Loud, unmistakable banner.  Three lines on either side so the
+     * message stays visible even when interleaved with whatever else
+     * was writing to the kernel-debug console at the moment of the
+     * crash. */
+    put_str("\n\n");
+    put_str("=================================================================\n");
+    put_str("*** TASKMAN CRASH ***  taskman has hit an unrecoverable error.\n");
+    put_str("    Reason: ");
+    va_list ap;
+    va_start(ap, fmt);
+    vemit(fmt, ap);
+    va_end(ap);
+    put_char('\n');
+    put_str("    The system is halted.  The boot hart will idle in WFI.\n");
+    put_str("=================================================================\n\n");
+
+    /* Halt the boot hart.  WFI traps to S-mode on RISC-V from U-mode,
+     * but the seL4 kernel just resumes us — so loop forever rather
+     * than rely on the trap.  Other harts that may be running keep
+     * scheduling; they hit nothing useful since taskman dispatch is
+     * dead, but that's the kernel's problem now. */
+    for (;;) {
+        __asm__ volatile ("wfi" ::: "memory");
+    }
+}

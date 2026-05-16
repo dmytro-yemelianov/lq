@@ -54,6 +54,16 @@ void tm_log_emit(tm_log_level_t lvl, const char *fmt, ...);
  * debug console.  Must NOT be used for logging — see the level macros. */
 void tm_raw_putc(char c);
 
+/* Terminal-failure exit for taskman.  Emits a banner the operator
+ * cannot miss (`*** TASKMAN CRASH ***`), prints the printf-style
+ * reason, then halts the boot hart forever (wfi in a tight loop).
+ * Used in place of the historical `for (;;) __asm__ volatile("nop");`
+ * spin so future log readers / the kernel-debug capture both
+ * surface that taskman gave up rather than livelocked.  Never
+ * returns. */
+__attribute__((noreturn))
+void tm_crash(const char *fmt, ...);
+
 /* Level macros.  Each expands to a single tm_log_emit call; usable
  * anywhere a regular function call would fit, including inside
  * expressions/statements with single semicolons. */

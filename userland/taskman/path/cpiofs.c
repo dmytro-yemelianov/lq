@@ -4,6 +4,7 @@
  */
 
 #include "cpiofs.h"
+#include "pathmgr.h"
 #include "../sel4_syscalls.h"
 #include "../proc/proc.h"
 #include <qsoe-system.h>
@@ -153,10 +154,20 @@ static struct {
      * session; readdir skips a candidate that matches any prior
      * entry.  The cap is `MAX_SUBDIRS_SEEN`; if the directory has
      * more subdirs than that, the overflow ones get listed multiple
-     * times — bump the constant if it ever bites. */
+     * times — bump the constant if it ever bites.  Also used to
+     * dedup pathmgr-root children we merge in after CPIO walk
+     * completes (so "dev" doesn't double-up if /dev ever also lives
+     * in the CPIO archive). */
     unsigned  subdirs_seen_n;
     char      subdirs_seen[TM_CPIOFS_MAX_SUBDIRS_SEEN]
                           [TM_CPIOFS_SUBDIR_NAMELEN];
+
+    /* Phase + cursor for the pathmgr-merge tail that runs after
+     * the CPIO walk completes.  Only the root-prefix slot enters
+     * this phase; all other prefixes terminate at -ENOENT as
+     * before. */
+    unsigned char pm_phase;        /* 0 = walking CPIO; 1 = walking pathmgr root */
+    unsigned      pm_next_idx;
 } g_cpiofs_dirs[TM_CPIOFS_MAX_DIRS];
 
 static unsigned q_strlen(const char *s)
@@ -176,6 +187,8 @@ static int dir_slot_alloc(seL4_Word badge, const char *prefix)
             g_cpiofs_dirs[i].prefix_len      = len;
             g_cpiofs_dirs[i].next_idx        = 0;
             g_cpiofs_dirs[i].subdirs_seen_n  = 0;
+            g_cpiofs_dirs[i].pm_phase        = 0;
+            g_cpiofs_dirs[i].pm_next_idx     = 0;
             g_cpiofs_dirs[i].badge           = badge;
             return i;
         }
@@ -480,7 +493,57 @@ int tm_cpiofs_readdir(seL4_Word badge, char *name_out,
             return 0;
         }
     }
-    return -ENOENT;
+
+    /* CPIO walk done.  If this is the root directory ("" prefix),
+     * fold in pathmgr's direct children — that's how "/dev" shows
+     * up alongside "/bin" and "/sbin".  Dedup against subdirs_seen
+     * so a registration of e.g. /sbin (unlikely but possible) doesn't
+     * appear twice.  Non-root prefixes terminate here. */
+    if (plen != 0) return -ENOENT;
+    g_cpiofs_dirs[slot_idx].pm_phase = 1;
+
+    for (;;) {
+        char cname[TM_CPIOFS_SUBDIR_NAMELEN];
+        unsigned cnamelen = 0;
+        int rc = tm_pathmgr_child_at("/",
+                                      g_cpiofs_dirs[slot_idx].pm_next_idx,
+                                      cname, sizeof cname, &cnamelen);
+        if (rc) return -ENOENT;
+        g_cpiofs_dirs[slot_idx].pm_next_idx++;
+
+        /* Skip if already returned by the CPIO walk. */
+        int seen = 0;
+        for (unsigned s = 0;
+             s < g_cpiofs_dirs[slot_idx].subdirs_seen_n; ++s) {
+            int match = 1;
+            for (unsigned k = 0; k < cnamelen; ++k) {
+                if (g_cpiofs_dirs[slot_idx].subdirs_seen[s][k]
+                    != cname[k]) { match = 0; break; }
+            }
+            if (match &&
+                g_cpiofs_dirs[slot_idx].subdirs_seen[s][cnamelen] == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        /* Record + return. */
+        if (g_cpiofs_dirs[slot_idx].subdirs_seen_n
+            < TM_CPIOFS_MAX_SUBDIRS_SEEN
+            && cnamelen + 1 <= TM_CPIOFS_SUBDIR_NAMELEN) {
+            unsigned s = g_cpiofs_dirs[slot_idx].subdirs_seen_n++;
+            for (unsigned k = 0; k < cnamelen; ++k) {
+                g_cpiofs_dirs[slot_idx].subdirs_seen[s][k] = cname[k];
+            }
+            g_cpiofs_dirs[slot_idx].subdirs_seen[s][cnamelen] = 0;
+        }
+        for (unsigned k = 0; k < cnamelen; ++k) name_out[k] = cname[k];
+        name_out[cnamelen] = 0;
+        *namelen_out = cnamelen;
+        *d_type_out  = 4;  /* DT_DIR */
+        return 0;
+    }
 }
 
 int tm_cpiofs_close(seL4_Word badge)
