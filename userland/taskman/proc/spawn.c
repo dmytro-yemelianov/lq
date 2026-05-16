@@ -8,8 +8,8 @@
  */
 
 #include "spawn.h"
-#include "../sel4_syscalls.h"
 #include "../qsoe_invoke.h"
+#include "../tm_log.h"
 #include "proc.h"
 #include "../path/pathmgr.h"
 #include "../path/cpiofs.h"
@@ -115,17 +115,8 @@ static int scratch_map(seL4_CPtr frame)
                                        QSOE_RIGHTS_ALL,
                                        QSOE_VM_ATTR_DEFAULT);
     if (rc) {
-        sel4_debug_puts("spawn: scratch_map: vaddr=");
-        for (int i = 7; i >= 0; --i) {
-            unsigned d = (TM_SCRATCH_VADDR >> (i*4)) & 0xF;
-            sel4_debug_putchar(d < 10 ? '0' + d : 'a' + d - 10);
-        }
-        sel4_debug_puts(" rc=");
-        for (int i = 1; i >= 0; --i) {
-            unsigned d = ((unsigned)rc >> (i*4)) & 0xF;
-            sel4_debug_putchar(d < 10 ? '0' + d : 'a' + d - 10);
-        }
-        sel4_debug_puts("\n");
+        tm_err("spawn: scratch_map: vaddr=%08x rc=%02x",
+               (unsigned long)TM_SCRATCH_VADDR, (unsigned long)rc);
     }
     return rc;
 }
@@ -307,7 +298,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             while (p < eol && b[p] != ' ' && b[p] != '\t') ++p;
             unsigned long interp_end = p;
             if (interp_end == interp_start || b[interp_start] != '/') {
-                sel4_debug_puts("spawn: shebang interp missing or not absolute\n");
+                tm_err("spawn: shebang interp missing or not absolute");
                 return -ENOEXEC;
             }
             while (p < eol && (b[p] == ' ' || b[p] == '\t')) ++p;
@@ -329,9 +320,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             unsigned long interp_size = 0;
             const void *interp_blob = tm_cpio_lookup(interp_cpio, &interp_size);
             if (!interp_blob) {
-                sel4_debug_puts("spawn: shebang interpreter not found: ");
-                sel4_debug_puts(interp_cpio);
-                sel4_debug_puts("\n");
+                tm_err("spawn: shebang interpreter not found: %s", interp_cpio);
                 return -ENOENT;
             }
             /* Recursion limit: interpreter must itself be ELF. */
@@ -339,7 +328,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             if (interp_size < 4 ||
                 ib[0] != 0x7f || ib[1] != 'E' ||
                 ib[2] != 'L'  || ib[3] != 'F') {
-                sel4_debug_puts("spawn: nested shebang not supported\n");
+                tm_err("spawn: nested shebang not supported");
                 return -ENOEXEC;
             }
 
@@ -400,11 +389,11 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     /* Sanity-check the ELF header. */
     if (eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' ||
         eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') {
-        sel4_debug_puts("spawn: not an ELF\n");
+        tm_err("spawn: not an ELF");
         return -EINVAL;
     }
     if (eh->e_ident[4] != 2 /* ELFCLASS64 */) {
-        sel4_debug_puts("spawn: not ELF64\n");
+        tm_err("spawn: not ELF64");
         return -EINVAL;
     }
 
@@ -424,7 +413,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * any Page_Map can succeed on it. */
     seL4_Word err = qsoe_riscv_asidpool_assign(seL4_CapInitThreadASIDPool, vspace);
     if (err) {
-        sel4_debug_puts("spawn: ASIDPool_Assign failed\n");
+        tm_err("spawn: ASIDPool_Assign failed");
         return -ENOMEM;
     }
 
@@ -435,12 +424,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     seL4_CPtr l1_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
     if (!l1_pt) return -ENOMEM;
     err = qsoe_riscv_pagetable_map(l1_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
-    if (err) { sel4_debug_puts("spawn: L1 PageTable_Map failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: L1 PageTable_Map failed"); return -ENOMEM; }
 
     seL4_CPtr l0_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
     if (!l0_pt) return -ENOMEM;
     err = qsoe_riscv_pagetable_map(l0_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
-    if (err) { sel4_debug_puts("spawn: L0 PageTable_Map failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: L0 PageTable_Map failed"); return -ENOMEM; }
 
     /* 3. Walk PT_LOAD segments. For each page in the segment:
      *    allocate frame, scratch-map into taskman, memcpy the ELF
@@ -461,7 +450,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             if (!frame) return -ENOMEM;
 
             err = scratch_map(frame);
-            if (err) { sel4_debug_puts("spawn: scratch_map failed\n"); return -ENOMEM; }
+            if (err) { tm_err("spawn: scratch_map failed"); return -ENOMEM; }
 
             /* Compute how many bytes of FileSiz fall in this page. */
             u64 page_off = v - vstart;
@@ -491,7 +480,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             __asm__ volatile ("fence rw, rw" ::: "memory");
 
             err = scratch_unmap(frame);
-            if (err) { sel4_debug_puts("spawn: scratch_unmap failed\n"); return -ENOMEM; }
+            if (err) { tm_err("spawn: scratch_unmap failed"); return -ENOMEM; }
 
             /* Map into the child. Permissions follow the PHDR flags. */
             seL4_CapRights_t rights = seL4_CapRights_new(
@@ -501,7 +490,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                 (ph[i].p_flags & PF_W) ? 1 : 0);
             err = qsoe_riscv_page_map(frame, vspace, v, rights,
                                        QSOE_VM_ATTR_DEFAULT);
-            if (err) { sel4_debug_puts("spawn: Page_Map (child) failed\n"); return -ENOMEM; }
+            if (err) { tm_err("spawn: Page_Map (child) failed"); return -ENOMEM; }
         }
     }
 
@@ -515,7 +504,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     if (err) return -ENOMEM;
     err = qsoe_riscv_page_map(ipc_frame, vspace, CHILD_IPC_BUFFER,
                               QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-    if (err) { sel4_debug_puts("spawn: ipc_frame Page_Map failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: ipc_frame Page_Map failed"); return -ENOMEM; }
 
     /* v0.4.4: allocate the stack region below the IPC buffer.
      * CHILD_STACK_PAGES pages cover [CHILD_STACK_BASE, CHILD_STACK_TOP).
@@ -529,7 +518,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
         stack_frames[i] = alloc_object(seL4_RISCV_4K_Page, 0);
         if (!stack_frames[i]) {
-            sel4_debug_puts("spawn: stack frame alloc failed\n");
+            tm_err("spawn: stack frame alloc failed");
             return -ENOMEM;
         }
     }
@@ -539,7 +528,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1],
                             argc, argv, envc, envp);
     if (!initial_sp) {
-        sel4_debug_puts("spawn: build_initial_stack failed\n");
+        tm_err("spawn: build_initial_stack failed");
         return -E2BIG;
     }
     /* Now map all stack pages into the child. */
@@ -548,7 +537,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         err = qsoe_riscv_page_map(stack_frames[i], vspace, va,
                                   QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
         if (err) {
-            sel4_debug_puts("spawn: stack Page_Map failed\n");
+            tm_err("spawn: stack Page_Map failed");
             return -ENOMEM;
         }
     }
@@ -561,7 +550,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_cnode_mint(cnode, QSOE_CAP_TASKMAN_EP, 12,
                           s_cnode_root, primary_ep, 64,
                           QSOE_RIGHTS_SEND, (seL4_Word)pid);
-    if (err) { sel4_debug_puts("spawn: mint TASKMAN_EP failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: mint TASKMAN_EP failed"); return -ENOMEM; }
 
     /* 5b. Untyped budget. Retype 256 KiB (2^18) of untyped out of
      *     taskman's pool; copy the resulting Untyped cap into the
@@ -571,13 +560,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     directly. */
     seL4_CPtr child_untyped = alloc_object(seL4_UntypedObject, 18);
     if (!child_untyped) {
-        sel4_debug_puts("spawn: child untyped retype failed\n");
+        tm_err("spawn: child untyped retype failed");
         return -ENOMEM;
     }
     err = qsoe_cnode_copy(cnode, QSOE_CAP_OWN_UNTYPED, 12,
                           s_cnode_root, child_untyped, 64,
                           QSOE_RIGHTS_ALL);
-    if (err) { sel4_debug_puts("spawn: copy OWN_UNTYPED failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: copy OWN_UNTYPED failed"); return -ENOMEM; }
 
     /* 5b'. v0.6.4: copy the child's own CNode cap into its slot
      *      QSOE_CAP_CNODE_SELF so the child can invoke
@@ -587,7 +576,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_cnode_copy(cnode, QSOE_CAP_CNODE_SELF, 12,
                           s_cnode_root, cnode, 64,
                           QSOE_RIGHTS_ALL);
-    if (err) { sel4_debug_puts("spawn: copy CNODE_SELF failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: copy CNODE_SELF failed"); return -ENOMEM; }
 
     /* 4c. v0.6.4: no pre-allocated heap.  Memory comes on demand via
      * TM_REQ_MMAP after the child runs.  See tm_mmap_serve below. */
@@ -602,18 +591,18 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     tm_pathmgr_obj_t console_obj;
     unsigned cons_consumed = 0;
     if (tm_pathmgr_resolve("/dev/console", &console_obj, &cons_consumed) != 0) {
-        sel4_debug_puts("spawn: /dev/console not in pathmgr\n");
+        tm_err("spawn: /dev/console not in pathmgr");
         return -EINVAL;
     }
     int console_idx = tm_channel_index(console_obj.server_pid,
                                         console_obj.server_chid);
     if (console_idx < 0) {
-        sel4_debug_puts("spawn: /dev/console channel not registered\n");
+        tm_err("spawn: /dev/console channel not registered");
         return -EINVAL;
     }
     seL4_CPtr console_master = tm_channel_master(console_idx);
     if (!console_master) {
-        sel4_debug_puts("spawn: /dev/console master cap missing\n");
+        tm_err("spawn: /dev/console master cap missing");
         return -EINVAL;
     }
     static const seL4_CPtr stdio_slots[3] = {
@@ -627,12 +616,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                               s_cnode_root, console_master, 64,
                               QSOE_RIGHTS_SEND, scoid);
         if (err) {
-            sel4_debug_puts("spawn: mint stdio cap failed\n");
+            tm_err("spawn: mint stdio cap failed");
             return -ENOMEM;
         }
         if (tm_connection_register_existing(pid, stdio_slots[i],
                                              console_idx, scoid, 0) != 0) {
-            sel4_debug_puts("spawn: register stdio connection failed\n");
+            tm_err("spawn: register stdio connection failed");
             return -ENOMEM;
         }
     }
@@ -650,7 +639,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         const seL4_Word TRIGGER_LEVEL = 0;
         const unsigned long UART_VADDR  = 0xA00000UL;  /* L1 slot 5 */
         if (!s_uart_dev_ut) {
-            sel4_debug_puts("spawn: no UART device untyped registered\n");
+            tm_err("spawn: no UART device untyped registered");
             return -ENODEV;
         }
         /* (1) Allocate an L0 PT for the 2 MiB region containing
@@ -660,7 +649,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         err = qsoe_riscv_pagetable_map(uart_l0, vspace, UART_VADDR,
                                         QSOE_VM_ATTR_DEFAULT);
         if (err) {
-            sel4_debug_puts("spawn: UART L0 PageTable_Map failed\n");
+            tm_err("spawn: UART L0 PageTable_Map failed");
             return -ENOMEM;
         }
         /* (2) Retype the UART device-untyped into a 4 KiB frame in
@@ -674,14 +663,14 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                     s_cnode_root, 0, 0,
                                     uart_dev_frame, 1);
         if (err) {
-            sel4_debug_puts("spawn: UART device retype failed\n");
+            tm_err("spawn: UART device retype failed");
             return -ENOMEM;
         }
         /* (3) Map the device frame at UART_VADDR in the child. */
         err = qsoe_riscv_page_map(uart_dev_frame, vspace, UART_VADDR,
                                    QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
         if (err) {
-            sel4_debug_puts("spawn: UART Page_Map failed\n");
+            tm_err("spawn: UART Page_Map failed");
             return -ENOMEM;
         }
         /* (4) Mint a copy of the frame cap into the child's CSpace
@@ -690,7 +679,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                s_cnode_root, uart_dev_frame, 64,
                                QSOE_RIGHTS_ALL);
         if (err) {
-            sel4_debug_puts("spawn: UART frame copy failed\n");
+            tm_err("spawn: UART frame copy failed");
             return -ENOMEM;
         }
         /* (5) IRQHandler — mint into child slot QSOE_CAP_IRQ_HANDLER. */
@@ -698,7 +687,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                     PLIC_UART_IRQ, TRIGGER_LEVEL,
                                     cnode, QSOE_CAP_IRQ_HANDLER, 12);
         if (err) {
-            sel4_debug_puts("spawn: IRQControl_GetTrigger failed\n");
+            tm_err("spawn: IRQControl_GetTrigger failed");
             return -ENOMEM;
         }
         /* (6) IRQ Notification — retype from RAM untyped directly
@@ -710,7 +699,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                     cnode, 0, 0,
                                     QSOE_CAP_IRQ_NTFN, 1);
         if (err) {
-            sel4_debug_puts("spawn: IRQ Notification retype failed\n");
+            tm_err("spawn: IRQ Notification retype failed");
             return -ENOMEM;
         }
     }
@@ -724,12 +713,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                               cnode, cnode_data,
                               vspace, 0 /*vspace_data*/,
                               CHILD_IPC_BUFFER, ipc_frame);
-    if (err) { sel4_debug_puts("spawn: TCB_Configure failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_Configure failed"); return -ENOMEM; }
 
     /* Spawned processes run below taskman. taskman blocks on Recv when
      * it has no work, so lower-priority threads always get the CPU. */
     err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB, 254);
-    if (err) { sel4_debug_puts("spawn: TCB_SetPriority failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_SetPriority failed"); return -ENOMEM; }
 
     /* 7. WriteRegisters: pc=e_entry, a0=pid, sp=initial_sp (pointing
      *    at argc in the SysV image we just wrote into the top stack
@@ -741,14 +730,14 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     ctx.gp = 0;
     ctx.a0 = (seL4_Word)pid;
     err = qsoe_tcb_write_registers(tcb, 0, &ctx);
-    if (err) { sel4_debug_puts("spawn: TCB_WriteRegisters failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_WriteRegisters failed"); return -ENOMEM; }
 
     /* 8. Register the new process in taskman's process table so the
      *    lifecycle handlers can find its CSpace + slot allocator. */
     int reg_err = tm_process_register(pid, cnode, tcb, vspace,
                                        QSOE_CAP_WELL_KNOWN_END);
     if (reg_err) {
-        sel4_debug_puts("spawn: tm_process_register failed\n");
+        tm_err("spawn: tm_process_register failed");
         return reg_err;
     }
     /* Record the child's untyped budget master for cleanup on terminate. */
@@ -762,20 +751,20 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     ConnectFlags on SYSMGR_COID would EBADF in the child. */
     int primary_idx = tm_channel_index(QSOE_PID_TASKMAN, SYSMGR_CHID);
     if (primary_idx < 0) {
-        sel4_debug_puts("spawn: primary channel not registered yet\n");
+        tm_err("spawn: primary channel not registered yet");
         return -EINVAL;
     }
     int cnreg = tm_connection_register_existing(pid, QSOE_CAP_TASKMAN_EP,
                                                 primary_idx,
                                                 (seL4_Word)pid, 0);
     if (cnreg) {
-        sel4_debug_puts("spawn: tm_connection_register_existing failed\n");
+        tm_err("spawn: tm_connection_register_existing failed");
         return cnreg;
     }
 
     /* 9. Liftoff. */
     err = qsoe_tcb_resume(tcb);
-    if (err) { sel4_debug_puts("spawn: TCB_Resume failed\n"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_Resume failed"); return -ENOMEM; }
 
     return 0;
 }

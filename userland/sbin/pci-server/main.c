@@ -32,7 +32,6 @@
 #include <sys/slog.h>
 #include <sys/slogcodes.h>
 
-#include "../../taskman/sel4_syscalls.h"
 #include "../../taskman/sel4_types.h"
 
 #define PCI_PATH         "/dev/pci"
@@ -151,7 +150,8 @@ static int ecam_init(void)
     /* Pull PCI_ECAM tag from syscfg. */
     qsoe_hwi_cursor_t c = hwi_find_tag(TM_SYSCFG_TAG_PCI_ECAM);
     if (c < 0) {
-        sel4_debug_puts("[pci-server] no PCI_ECAM tag — host bridge not in FDT?\n");
+        slogf(_SLOGC_PCI, _SLOG_ERROR,
+              "pci-server: no PCI_ECAM tag — host bridge not in FDT?");
         return -1;
     }
     unsigned char ebuf[20];
@@ -181,7 +181,7 @@ static int ecam_init(void)
                          QSOE_MAP_PHYS, -1,
                          (long)ecam_base);
     if (!va || va == QSOE_MAP_FAILED) {
-        sel4_debug_puts("[pci-server] ECAM mmap failed\n");
+        slogf(_SLOGC_PCI, _SLOG_ERROR, "pci-server: ECAM mmap failed");
         return -1;
     }
     g_ecam      = (volatile uint8_t *)va;

@@ -12,9 +12,9 @@
  * subsystem header.
  */
 
-#include "sel4_syscalls.h"
 #include "sel4_types.h"
 #include "qsoe_invoke.h"
+#include "tm_log.h"
 
 #include "proc/proc.h"
 #include "proc/spawn.h"
@@ -27,6 +27,7 @@
 #include "sys/platform.h"
 #include "sys/rsrcdb.h"
 #include "sys/syscfg.h"
+#include "sys/sync.h"
 
 #include <qsoe-system.h>
 #include "../libqsoe/include/qsoe/slots.h"
@@ -134,6 +135,25 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         *out_mr0 = (seL4_Word)written;
         unsigned bytes = written * 32u;  /* sizeof rsrc_alloc_t */
         reply_len = 4 + (bytes + 7) / 8;
+        break;
+    }
+    case TM_REQ_SYNC_WAIT: {
+        /* mr0 = vaddr (key), mr1 = mode, mr2 = expected_gen.  Either
+         * returns immediately (gen mismatch or credit consumed) or
+         * defers the reply by saving the caller — *out_no_reply
+         * tells the dispatch loop not to send a reply. */
+        int parked = 0;
+        int rc = tm_sync_wait(caller, (unsigned long)mr0,
+                               (unsigned)mr1, (long)mr2, &parked);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        if (parked) *out_no_reply = 1;
+        break;
+    }
+    case TM_REQ_SYNC_WAKE: {
+        /* mr0 = vaddr, mr1 = max_n, mr2 = mode. */
+        int rc = tm_sync_wake(caller, (unsigned long)mr0,
+                               (int)mr1, (unsigned)mr2);
+        if (rc) err = (seL4_Word)(-rc);
         break;
     }
     case TM_REQ_GET_SYSCFG: {
@@ -638,31 +658,10 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
 #define QSOE_STR(x)  QSOE_STR_(x)
 #define QSOE_VSHORT  "v" QSOE_STR(QSOE_VERSION_MAJOR) "." QSOE_STR(QSOE_VERSION_MINOR)
 
-static unsigned cstrlen(const char *s)
-{
-    unsigned n = 0;
-    while (s[n]) ++n;
-    return n;
-}
-
 static void print_banner(void)
 {
-    static const char *prefix = "QSOE: Quick & Secure Operating Environment ";
-    unsigned inner = 1 + cstrlen(prefix) + cstrlen(QSOE_VSHORT) + 1;
-
-    sel4_debug_putchar('\f');
-    sel4_debug_putchar('+');
-    for (unsigned i = 0; i < inner; ++i) sel4_debug_putchar('-');
-    sel4_debug_puts("+\n");
-
-    sel4_debug_puts("| ");
-    sel4_debug_puts(prefix);
-    sel4_debug_puts(QSOE_VSHORT);
-    sel4_debug_puts(" |\n");
-
-    sel4_debug_putchar('+');
-    for (unsigned i = 0; i < inner; ++i) sel4_debug_putchar('-');
-    sel4_debug_puts("+\n\n");
+    tm_info("QSOE: Quick & Secure Operating Environment %s booting",
+            QSOE_VSHORT);
 }
 
 static seL4_CPtr find_largest_ram_untyped(seL4_BootInfo *bi)
@@ -735,9 +734,9 @@ int main(seL4_BootInfo *bi)
     unsigned dtb_size = 0;
     const void *dtb = find_fdt_in_extra_bi(bi, &dtb_size);
     if (dtb && tm_syscfg_build(dtb) == 0) {
-        sel4_debug_puts("taskman: syscfg built from FDT\n");
+        tm_info("syscfg built from FDT");
     } else {
-        sel4_debug_puts("taskman: no FDT in extra-BI; syscfg falls back\n");
+        tm_info("no FDT in extra-BI; syscfg falls back");
     }
 
     /* Resource database — empty pool + per-class lists, then seed
@@ -757,7 +756,7 @@ int main(seL4_BootInfo *bi)
 
     seL4_CPtr ut = find_largest_ram_untyped(bi);
     if (ut == 0) {
-        sel4_debug_puts("FATAL: no RAM untyped\n");
+        tm_err("no RAM untyped");
         for (;;) __asm__ volatile("nop");
     }
 
@@ -765,7 +764,7 @@ int main(seL4_BootInfo *bi)
     tm_set_uart_untyped(uart_ut);
     tm_mem_set_bootinfo(bi);  /* needed by MAP_PHYS to walk device-UTs */
     if (uart_ut == 0) {
-        sel4_debug_puts("warn: no device-untyped at 0x10000000\n");
+        tm_warn("no device-untyped at 0x10000000");
     }
 
     tm_init(ut, seL4_CapInitThreadCNode, bi->empty.start);
@@ -776,33 +775,33 @@ int main(seL4_BootInfo *bi)
                                           seL4_CapInitThreadCNode, 0, 0,
                                           primary_ep, 1);
     if (rerr != 0) {
-        sel4_debug_puts("FATAL: failed to retype primary endpoint\n");
+        tm_err("failed to retype primary endpoint");
         for (;;) __asm__ volatile("nop");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, 1,
                                       primary_ep, primary_ep) != 0) {
-        sel4_debug_puts("FATAL: failed to register primary channel\n");
+        tm_err("failed to register primary channel");
         for (;;) __asm__ volatile("nop");
     }
 
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CONSOLE_CHID,
                                       primary_ep, primary_ep) != 0) {
-        sel4_debug_puts("FATAL: failed to register console channel\n");
+        tm_err("failed to register console channel");
         for (;;) __asm__ volatile("nop");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_CPIOFS_CHID,
                                       primary_ep, primary_ep) != 0) {
-        sel4_debug_puts("FATAL: failed to register cpiofs channel\n");
+        tm_err("failed to register cpiofs channel");
         for (;;) __asm__ volatile("nop");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_DEVNULL_CHID,
                                       primary_ep, primary_ep) != 0) {
-        sel4_debug_puts("FATAL: failed to register /dev/null channel\n");
+        tm_err("failed to register /dev/null channel");
         for (;;) __asm__ volatile("nop");
     }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_DEVZERO_CHID,
                                       primary_ep, primary_ep) != 0) {
-        sel4_debug_puts("FATAL: failed to register /dev/zero channel\n");
+        tm_err("failed to register /dev/zero channel");
         for (;;) __asm__ volatile("nop");
     }
 
@@ -815,7 +814,7 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_CONSOLE,
         };
         if (tm_pathmgr_register("/dev/console", &obj) != 0) {
-            sel4_debug_puts("FATAL: pathmgr register /dev/console failed\n");
+            tm_err("pathmgr register /dev/console failed");
             for (;;) __asm__ volatile("nop");
         }
     }
@@ -827,7 +826,7 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_CPIOFS,
         };
         if (tm_pathmgr_register("/", &obj) != 0) {
-            sel4_debug_puts("FATAL: pathmgr register / failed\n");
+            tm_err("pathmgr register / failed");
             for (;;) __asm__ volatile("nop");
         }
     }
@@ -838,7 +837,7 @@ int main(seL4_BootInfo *bi)
      * how qsh detects its tty — once this resolves, qsh's edit.c
      * editor (with arrow-key history) takes over. */
     if (tm_pathmgr_symlink("/dev/tty", "/dev/console") != 0) {
-        sel4_debug_puts("FATAL: pathmgr symlink /dev/tty failed\n");
+        tm_err("pathmgr symlink /dev/tty failed");
         for (;;) __asm__ volatile("nop");
     }
     /* /dev/null and /dev/zero — POSIX-essential pseudo-devices,
@@ -853,7 +852,7 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_NULL,
         };
         if (tm_pathmgr_register("/dev/null", &obj) != 0) {
-            sel4_debug_puts("FATAL: pathmgr register /dev/null failed\n");
+            tm_err("pathmgr register /dev/null failed");
             for (;;) __asm__ volatile("nop");
         }
     }
@@ -865,7 +864,7 @@ int main(seL4_BootInfo *bi)
             .handler_kind = PATHMGR_HANDLER_TASKMAN_ZERO,
         };
         if (tm_pathmgr_register("/dev/zero", &obj) != 0) {
-            sel4_debug_puts("FATAL: pathmgr register /dev/zero failed\n");
+            tm_err("pathmgr register /dev/zero failed");
             for (;;) __asm__ volatile("nop");
         }
     }
@@ -880,20 +879,15 @@ int main(seL4_BootInfo *bi)
     const void *elf = cpio_get_file(_userland_cpio_start, cpio_len,
                                      "sbin/init", &elf_size);
     if (!elf) {
-        sel4_debug_puts("FATAL: sbin/init not found in CPIO\n");
+        tm_err("sbin/init not found in CPIO");
         for (;;) __asm__ volatile("nop");
     }
     pid_t init_pid = tm_pid_alloc();
     if (!init_pid) {
-        sel4_debug_puts("FATAL: pid allocator empty\n");
+        tm_err("pid allocator empty");
         for (;;) __asm__ volatile("nop");
     }
-    sel4_debug_puts("taskman: spawning /sbin/init (pid=");
-    {
-        char d = '0' + (char)(init_pid & 0x7);
-        sel4_debug_putchar(d);
-    }
-    sel4_debug_puts(")...\n");
+    tm_info("spawning /sbin/init (pid=%d)...", (long)init_pid);
     static const char *boot_argv0 = "init";
     const char *boot_argv[1] = { boot_argv0 };
     int sr = tm_spawn(elf, elf_size, init_pid, primary_ep,
@@ -901,10 +895,10 @@ int main(seL4_BootInfo *bi)
                        /*envc=*/0, 0,
                        /*elf_name=*/"sbin/init");
     if (sr != 0) {
-        sel4_debug_puts("FATAL: tm_spawn returned non-zero\n");
+        tm_err("tm_spawn returned non-zero");
         for (;;) __asm__ volatile("nop");
     }
-    sel4_debug_puts("taskman: dispatcher ready\n");
+    tm_info("dispatcher ready");
 
     seL4_Word badge;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;

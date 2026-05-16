@@ -67,6 +67,27 @@ enum {
     TM_REQ_RSRC_DETACH          = 0x00a,
     TM_REQ_RSRC_QUERY           = 0x00b,
 
+    /* Sync* slow-path: address-keyed wait / wake.  See sys/sync.h for
+     * the QNX-shaped public API that sits on top.
+     *
+     *   TM_REQ_SYNC_WAIT
+     *     mr0 = user vaddr (key)
+     *     mr1 = mode: 0 = credit-absorb (mutex/sem); 1 = gen-check (cond)
+     *     mr2 = expected gen (only when mr1==1).  Block iff taskman's
+     *           tracked gen for (pid, addr) equals expected.
+     *     Replies are deferred (SaveCaller); the corresponding WAKE
+     *     releases them.
+     *
+     *   TM_REQ_SYNC_WAKE
+     *     mr0 = user vaddr
+     *     mr1 = max threads to wake (0 means all)
+     *     mr2 = mode: 0 = absorb (deposit credit if no waiter — for
+     *           mutex/sem unlock); 1 = discard (drop if no waiter —
+     *           for cond signal).  Always increments the entry's
+     *           tracked gen.                                          */
+    TM_REQ_SYNC_WAIT            = 0x00c,
+    TM_REQ_SYNC_WAKE            = 0x00d,
+
     /* ---------- procmgr (0x100..0x1FF) ---------- */
     TM_REQ_CHANNEL_CREATE       = 0x100,
     TM_REQ_CHANNEL_DESTROY      = 0x101,

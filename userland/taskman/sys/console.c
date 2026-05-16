@@ -13,8 +13,8 @@
  */
 
 #include "console.h"
-#include "../sel4_syscalls.h"
 #include "../sel4_types.h"
+#include "../tm_log.h"
 #include <qsoe-system.h>
 
 /* Bound by the IPC buffer payload area (msg[4..119] = 116 words =
@@ -30,7 +30,7 @@ unsigned tm_console_write(unsigned nbytes)
     if (nbytes > TM_CONSOLE_MAX_WRITE) nbytes = TM_CONSOLE_MAX_WRITE;
     const unsigned char *bytes = (const unsigned char *)&qsoe_ipcbuf->msg[4];
     for (unsigned i = 0; i < nbytes; ++i) {
-        sel4_debug_putchar((char)bytes[i]);
+        tm_raw_putc((char)bytes[i]);
     }
     return nbytes;
 }

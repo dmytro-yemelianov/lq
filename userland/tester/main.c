@@ -9,60 +9,46 @@
  *      server-side; we verify it returns our pid.
  */
 
-#include "../taskman/sel4_syscalls.h"
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+
 #include "../taskman/sel4_types.h"
 #include "../taskman/qsoe_invoke.h"
 #include <qsoe-system.h>
 #include "../libqsoe/include/qsoe/slots.h"
 #include "../libqsoe/include/qsoe/wire.h"
+#include <sys/sync.h>
 
-/* v0.7: tester compiles with -nostdinc but links libc.a, so we
- * forward-declare the POSIX IO entry points by hand.  The runtime
- * call resolves to libc/qsoe/{open,close,read,write}.c at link. */
-extern int  open (const char *path, int flags, ...);
-extern int  close(int fd);
-extern long read (int fd, void *buf, unsigned long count);
-extern long write(int fd, const void *buf, unsigned long count);
-
-static void puthex(unsigned long x)
-{
-    char buf[19];
-    buf[0] = '0'; buf[1] = 'x';
-    for (int i = 15; i >= 0; --i) {
-        unsigned d = x & 0xF;
-        buf[2 + i] = d < 10 ? '0' + d : 'a' + (d - 10);
-        x >>= 4;
-    }
-    buf[18] = 0;
-    sel4_debug_puts(buf);
-}
-
-static void putd(int v)
-{
-    char buf[12];
-    int n = 0, neg = 0;
-    if (v < 0) { neg = 1; v = -v; }
-    if (v == 0) buf[n++] = '0';
-    while (v > 0) { buf[n++] = '0' + (v % 10); v /= 10; }
-    if (neg) buf[n++] = '-';
-    for (int i = n - 1; i >= 0; --i) sel4_debug_putchar(buf[i]);
-}
+/* Compatibility shims for the few call sites that compose hex / decimal
+ * via short helpers.  Implemented on top of printf so every byte tester
+ * emits goes through libc's stdio path.  The %016lx / %d format strings
+ * match the historical output exactly so existing log captures stay
+ * comparable. */
+static inline void puthex(unsigned long x) { printf("0x%016lx", x); }
+static inline void putd  (int v)           { printf("%d", v);       }
 
 int main(int argc, char **argv, char **envp)
 {
-    sel4_debug_puts("[tester] alive, pid=");
+    /* /dev/console is not a tty (no isatty bit), so musl defaults
+     * stdout to fully-buffered.  Switch to unbuffered so each printf()
+     * write hits fd 1 directly — multi-threaded sections (joinable
+     * worker, detached worker, SMP spawn) write to the same stdout
+     * concurrently and line-buffered mode produced cross-thread
+     * doubling.  Unbuffered keeps each putc/printf write atomic. */
+    setvbuf(stdout, 0, _IONBF, 0);
+
+    printf("[tester] alive, pid=");
     putd((int)qsoe_self_pid);
-    sel4_debug_puts(" argc=");
+    printf(" argc=");
     putd(argc);
     if (argc > 0 && argv[0]) {
-        sel4_debug_puts(" argv[0]=");
-        sel4_debug_puts(argv[0]);
+        printf(" argv[0]=%s", argv[0]);
     }
     if (envp && envp[0]) {
-        sel4_debug_puts(" envp[0]=");
-        sel4_debug_puts(envp[0]);
+        printf(" envp[0]=%s", envp[0]);
     }
-    sel4_debug_putchar('\n');
+    putchar('\n');
 
     /* --- 0. v0.5.0 stdio smoke-test: write through fds 1 and 2,
      *        then open /dev/console explicitly and write through
@@ -77,16 +63,16 @@ int main(int argc, char **argv, char **envp)
         write(2, err_msg, err_len);
 
         int cfd = open("/dev/console", 0);
-        sel4_debug_puts("[tester] open(/dev/console) -> fd=");
+        printf("[tester] open(/dev/console) -> fd=");
         putd(cfd);
-        sel4_debug_putchar('\n');
+        putchar('\n');
         if (cfd >= 0) {
             const char *m = "[tester] write via opened /dev/console\n";
             unsigned ml = 0; while (m[ml]) ml++;
             long w = write(cfd, m, ml);
-            sel4_debug_puts("[tester] write -> ");
+            printf("[tester] write -> ");
             putd((int)w);
-            sel4_debug_putchar('\n');
+            putchar('\n');
             close(cfd);
         }
     }
@@ -99,44 +85,44 @@ int main(int argc, char **argv, char **envp)
         int rc = MsgSend(SYSMGR_COID, &payload, sizeof payload,
                           &reply, sizeof reply);
         if (rc < 0) {
-            sel4_debug_puts("[tester] MsgSend FAILED\n");
+            printf("[tester] MsgSend FAILED\n");
             break;
         }
-        sel4_debug_puts("[tester] MsgSend(");
+        printf("[tester] MsgSend(");
         putd(i);
-        sel4_debug_puts(") on SYSMGR_COID -> ");
+        printf(") on SYSMGR_COID -> ");
         putd((int)reply);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
 
     /* --- 2. ConnectServerInfo --- */
     struct _server_info si;
     int sirc = ConnectServerInfo(0, SYSMGR_COID, &si);
     if (sirc == 0) {
-        sel4_debug_puts("[tester] ConnectServerInfo: pid=");
+        printf("[tester] ConnectServerInfo: pid=");
         putd(si.pid);
-        sel4_debug_puts(" chid=");
+        printf(" chid=");
         putd(si.chid);
-        sel4_debug_puts(" scoid=");
+        printf(" scoid=");
         putd(si.scoid);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     } else {
-        sel4_debug_puts("[tester] ConnectServerInfo FAILED errno=");
+        printf("[tester] ConnectServerInfo FAILED errno=");
         putd(qsoe_errno);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
 
     /* --- 3. ConnectFlags: query, set CLOEXEC, query again --- */
     int q0 = ConnectFlags(0, SYSMGR_COID, 0, 0);
     int q1 = ConnectFlags(0, SYSMGR_COID, QSOE_COF_CLOEXEC, QSOE_COF_CLOEXEC);
     int q2 = ConnectFlags(0, SYSMGR_COID, 0, 0);
-    sel4_debug_puts("[tester] ConnectFlags: pre=");
+    printf("[tester] ConnectFlags: pre=");
     puthex((unsigned long)q0);
-    sel4_debug_puts(" prev_at_set=");
+    printf(" prev_at_set=");
     puthex((unsigned long)q1);
-    sel4_debug_puts(" post=");
+    printf(" post=");
     puthex((unsigned long)q2);
-    sel4_debug_putchar('\n');
+    putchar('\n');
 
     /* --- 4. TM_REQ_PING_CLIENTINFO: taskman's server-side
      *       ConnectClientInfo path. We pack the wire-protocol label
@@ -152,27 +138,27 @@ int main(int argc, char **argv, char **envp)
         seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
                                                   &mr0, &mr1, &mr2, &mr3);
         (void)reply;
-        sel4_debug_puts("[tester] PING_CLIENTINFO: echo=");
+        printf("[tester] PING_CLIENTINFO: echo=");
         putd((int)mr0);
-        sel4_debug_puts(" taskman_saw_pid=");
+        printf(" taskman_saw_pid=");
         putd((int)mr1);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
 
     /* --- 5a. ThreadCreate + ThreadJoin: joinable worker. --- */
     {
         extern void *worker_fn(void *);
         int tid = ThreadCreate(0, worker_fn, (void *)0xABCDUL, 0);
-        sel4_debug_puts("[tester] ThreadCreate(joinable) -> tid=");
+        printf("[tester] ThreadCreate(joinable) -> tid=");
         putd(tid);
-        sel4_debug_putchar('\n');
+        putchar('\n');
         void *status = 0;
         int jr = ThreadJoin(tid, &status);
-        sel4_debug_puts("[tester] ThreadJoin -> rc=");
+        printf("[tester] ThreadJoin -> rc=");
         putd(jr);
-        sel4_debug_puts(" status=");
+        printf(" status=");
         puthex((unsigned long)status);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
 
     /* --- 5b. Detached worker: spawn-and-forget; yield until it
@@ -183,9 +169,9 @@ int main(int argc, char **argv, char **envp)
         struct _thread_attr attr = { .flags = QSOE_PTHREAD_CREATE_DETACHED,
                                       .prio  = 254 };
         int tid = ThreadCreate(0, worker_detached_fn, 0, &attr);
-        sel4_debug_puts("[tester] ThreadCreate(detached) -> tid=");
+        printf("[tester] ThreadCreate(detached) -> tid=");
         putd(tid);
-        sel4_debug_putchar('\n');
+        putchar('\n');
         for (int i = 0; i < 8; ++i) qsoe_sys_yield();
     }
 
@@ -194,29 +180,29 @@ int main(int argc, char **argv, char **envp)
     {
         extern void *worker_loop_fn(void *);
         int tid = ThreadCreate(0, worker_loop_fn, 0, 0);
-        sel4_debug_puts("[tester] ThreadCreate(loop) -> tid=");
+        printf("[tester] ThreadCreate(loop) -> tid=");
         putd(tid);
-        sel4_debug_putchar('\n');
+        putchar('\n');
         for (int i = 0; i < 4; ++i) qsoe_sys_yield();
         int cr = ThreadCancel(tid, 0);
-        sel4_debug_puts("[tester] ThreadCancel -> rc=");
+        printf("[tester] ThreadCancel -> rc=");
         putd(cr);
-        sel4_debug_putchar('\n');
+        putchar('\n');
         void *status = 0;
         int jr = ThreadJoin(tid, &status);
-        sel4_debug_puts("[tester] ThreadJoin -> rc=");
+        printf("[tester] ThreadJoin -> rc=");
         putd(jr);
-        sel4_debug_puts(" status=");
+        printf(" status=");
         puthex((unsigned long)status);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
 
     /* --- 6. ThreadCtl(NAME). --- */
     {
         int rc = ThreadCtl(QSOE_TCTL_NAME, (void *)"main");
-        sel4_debug_puts("[tester] ThreadCtl(NAME) -> rc=");
+        printf("[tester] ThreadCtl(NAME) -> rc=");
         putd(rc);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
 
     /* --- 7. SMP: spawn 3 workers, one per hart 1/2/3, each does a few
@@ -233,21 +219,21 @@ int main(int argc, char **argv, char **envp)
             };
             tids[k] = ThreadCreate(0, worker_smp_fn,
                                     (void *)(unsigned long)cpu, &attr);
-            sel4_debug_puts("[tester] SMP ThreadCreate(cpu=");
+            printf("[tester] SMP ThreadCreate(cpu=");
             putd(cpu);
-            sel4_debug_puts(") -> tid=");
+            printf(") -> tid=");
             putd(tids[k]);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         }
         for (int k = 0; k < 3; ++k) {
             if (tids[k] > 0) {
                 void *status = 0;
                 ThreadJoin(tids[k], &status);
-                sel4_debug_puts("[tester] SMP join tid=");
+                printf("[tester] SMP join tid=");
                 putd(tids[k]);
-                sel4_debug_puts(" status=");
+                printf(" status=");
                 puthex((unsigned long)status);
-                sel4_debug_putchar('\n');
+                putchar('\n');
             }
         }
     }
@@ -261,40 +247,40 @@ int main(int argc, char **argv, char **envp)
      *         receives may find pulses already queued (faster path). --- */
     {
         int pulse_chid = ChannelCreate(QSOE_SIDE_CHANNEL);
-        sel4_debug_puts("[tester] pulse chid=");
+        printf("[tester] pulse chid=");
         puthex((unsigned long)pulse_chid);
-        sel4_debug_putchar('\n');
+        putchar('\n');
 
         int pulse_coid = ConnectAttach(ND_LOCAL_NODE, qsoe_self_pid,
                                         pulse_chid, 0, 0);
-        sel4_debug_puts("[tester] pulse coid=");
+        printf("[tester] pulse coid=");
         puthex((unsigned long)pulse_coid);
-        sel4_debug_putchar('\n');
+        putchar('\n');
 
         extern void *worker_pulse_sender_fn(void *);
         struct _thread_attr at = { 0 };
         at.runmask = 0x2;  /* hart 1 — runs in parallel with main on hart 0 */
         int sender_tid = ThreadCreate(0, worker_pulse_sender_fn,
                                        (void *)(long)pulse_coid, &at);
-        sel4_debug_puts("[tester] pulse sender tid=");
+        printf("[tester] pulse sender tid=");
         putd(sender_tid);
-        sel4_debug_putchar('\n');
+        putchar('\n');
 
         for (int i = 0; i < 3; ++i) {
             struct _pulse p;
             struct _msg_info mi;
             int rcv = MsgReceive(pulse_chid, &p, sizeof p, &mi);
-            sel4_debug_puts("[tester] MsgReceive pulse rcv=");
+            printf("[tester] MsgReceive pulse rcv=");
             putd(rcv);
-            sel4_debug_puts(" flags=");
+            printf(" flags=");
             puthex((unsigned long)mi.flags);
-            sel4_debug_puts(" code=");
+            printf(" code=");
             putd(p.code);
-            sel4_debug_puts(" value=");
+            printf(" value=");
             putd(p.value.sival_int);
-            sel4_debug_puts(" scoid=");
+            printf(" scoid=");
             putd(p.scoid);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         }
 
         void *st = 0;
@@ -331,25 +317,25 @@ int main(int argc, char **argv, char **envp)
         qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag, &mr0, &mr1, &mr2, &mr3);
         unsigned long after = (unsigned long)mr0;
 
-        sel4_debug_puts("[cap-leak] 100 Channel cycles: s_next_slot before=");
+        printf("[cap-leak] 100 Channel cycles: s_next_slot before=");
         putd((int)before);
-        sel4_debug_puts(" after=");
+        printf(" after=");
         putd((int)after);
-        sel4_debug_puts(" delta=");
+        printf(" delta=");
         putd((int)(after - before));
-        if (failed) sel4_debug_puts(" (LOOP FAILED)");
-        sel4_debug_putchar('\n');
+        if (failed) printf(" (LOOP FAILED)");
+        putchar('\n');
     }
 
     /* v0.8-rc1: slogf smoke test. */
     {
         #include <sys/slog.h>
         #include <sys/slogcodes.h>
-        sel4_debug_puts("[tester] slogf smoke: writing 3 events\n");
+        printf("[tester] slogf smoke: writing 3 events\n");
         slogf(_SLOGC_TEST, _SLOG_INFO,    "hello from tester pid %d", (int)qsoe_self_pid);
         slogf(_SLOGC_TEST, _SLOG_WARNING, "this is a warning at counter %d", 42);
         slogf(_SLOGC_TEST, _SLOG_DEBUG1,  "debug payload");
-        sel4_debug_puts("[tester]   3 events sent\n");
+        printf("[tester]   3 events sent\n");
     }
 
     /* v0.8-rc1: rsrcdb smoke test.  Boot seeded MEMORY entries from
@@ -357,47 +343,47 @@ int main(int argc, char **argv, char **envp)
      * range, attach a single IRQ, detach it, destroy the range. */
     {
         #include <sys/rsrcdbmgr.h>
-        sel4_debug_puts("[tester] rsrcdb smoke: query MEMORY\n");
+        printf("[tester] rsrcdb smoke: query MEMORY\n");
         rsrc_alloc_t got[4];
         int n = rsrcdbmgr_query(got, 4, 0, RSRCDBMGR_MEMORY);
-        sel4_debug_puts("[tester]   MEMORY entries: ");
+        printf("[tester]   MEMORY entries: ");
         putd(n);
-        sel4_debug_putchar('\n');
+        putchar('\n');
         for (int i = 0; i < n && i < 4; ++i) {
-            sel4_debug_puts("[tester]   [");
+            printf("[tester]   [");
             puthex(got[i].start);
-            sel4_debug_puts("..");
+            printf("..");
             puthex(got[i].end);
-            sel4_debug_puts("] flags=");
+            printf("] flags=");
             puthex(got[i].flags);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         }
-        sel4_debug_puts("[tester] rsrcdb smoke: create IRQ pool 64..71\n");
+        printf("[tester] rsrcdb smoke: create IRQ pool 64..71\n");
         rsrc_alloc_t mk = { 64, 71, RSRCDBMGR_IRQ, 0 };
         int rc = rsrcdbmgr_create(&mk, 1);
-        sel4_debug_puts("[tester]   create rc=");
+        printf("[tester]   create rc=");
         putd(rc);
-        sel4_debug_putchar('\n');
+        putchar('\n');
 
-        sel4_debug_puts("[tester] rsrcdb smoke: attach 1 IRQ\n");
+        printf("[tester] rsrcdb smoke: attach 1 IRQ\n");
         rsrc_request_t req = { 0 };
         req.length = 1;
         req.flags  = RSRCDBMGR_IRQ;
         rc = rsrcdbmgr_attach(&req, 1);
-        sel4_debug_puts("[tester]   attach rc=");
+        printf("[tester]   attach rc=");
         putd(rc);
         if (rc == 0) {
-            sel4_debug_puts(" granted=");
+            printf(" granted=");
             puthex(req.start);
         }
-        sel4_debug_putchar('\n');
+        putchar('\n');
 
         if (rc == 0) {
-            sel4_debug_puts("[tester] rsrcdb smoke: detach\n");
+            printf("[tester] rsrcdb smoke: detach\n");
             rc = rsrcdbmgr_detach(&req, 1);
-            sel4_debug_puts("[tester]   detach rc=");
+            printf("[tester]   detach rc=");
             putd(rc);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         }
     }
 
@@ -408,17 +394,17 @@ int main(int argc, char **argv, char **envp)
      * that the mmap succeeds; don't read the region (the underlying
      * bus has no device there, so a load could behave unpredictably). */
     {
-        sel4_debug_puts("[tester] MAP_PHYS smoke @ 0x04000000\n");
+        printf("[tester] MAP_PHYS smoke @ 0x04000000\n");
         void *p = qsoe_mmap(0, 0x1000, 0,
                             QSOE_MAP_PHYS, -1, 0x04000000UL);
         if (p == QSOE_MAP_FAILED) {
-            sel4_debug_puts("[tester]   FAIL: errno=");
+            printf("[tester]   FAIL: errno=");
             putd(qsoe_errno);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         } else {
-            sel4_debug_puts("[tester]   mapped at ");
+            printf("[tester]   mapped at ");
             puthex((unsigned long)p);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         }
     }
 
@@ -427,21 +413,21 @@ int main(int argc, char **argv, char **envp)
      * at /sbin/pci-server and is brought up by init.sh before us. */
     {
         #include <pci/pci.h>
-        sel4_debug_puts("[tester] pci_smoke: pci_bios_present\n");
+        printf("[tester] pci_smoke: pci_bios_present\n");
         uint32_t lastbus = 0, version = 0;
         if (pci_bios_present(&lastbus, &version) == 0) {
-            sel4_debug_puts("[tester]   lastbus=");
+            printf("[tester]   lastbus=");
             putd((int)lastbus);
-            sel4_debug_puts(" version=");
+            printf(" version=");
             putd((int)version);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         } else {
-            sel4_debug_puts("[tester]   FAIL: pci_bios_present errno=");
+            printf("[tester]   FAIL: pci_bios_present errno=");
             putd(qsoe_errno);
-            sel4_debug_putchar('\n');
+            putchar('\n');
         }
 
-        sel4_debug_puts("[tester] pci_smoke: enumerate (any vid)\n");
+        printf("[tester] pci_smoke: enumerate (any vid)\n");
         for (uint32_t idx = 0; idx < 16; ++idx) {
             pci_bdf_t bdf = pci_device_find(0xffff, 0xffff, 0, idx);
             if (bdf == PCI_BDF_NONE) break;
@@ -450,17 +436,17 @@ int main(int argc, char **argv, char **envp)
             pci_device_read_vid  (bdf, &vid);
             pci_device_read_did  (bdf, &did);
             pci_device_read_ccode(bdf, &ccode);
-            sel4_debug_puts("[tester]   [");
+            printf("[tester]   [");
             putd((int)idx);
-            sel4_debug_puts("] bdf=");
+            printf("] bdf=");
             puthex(bdf);
-            sel4_debug_puts(" vid:did=");
+            printf(" vid:did=");
             puthex(vid);
-            sel4_debug_putchar(':');
+            putchar(':');
             puthex(did);
-            sel4_debug_puts(" ccode=");
+            printf(" ccode=");
             puthex(ccode >> 8);
-            sel4_debug_putchar('\n');
+            putchar('\n');
 
             /* Attach + read BARs + IRQ + detach. */
             pci_devhdl_t hdl = 0;
@@ -470,30 +456,127 @@ int main(int argc, char **argv, char **envp)
                 pci_device_read_ba(hdl, &nba, ba);
                 uint32_t irq = 0;
                 (void)pci_device_read_irq(hdl, &irq);
-                sel4_debug_puts("[tester]       nba=");
+                printf("[tester]       nba=");
                 putd((int)nba);
-                sel4_debug_puts(" irq=");
+                printf(" irq=");
                 putd((int)irq);
-                sel4_debug_putchar('\n');
+                putchar('\n');
                 for (uint32_t i = 0; i < nba; ++i) {
-                    sel4_debug_puts("[tester]       BAR");
+                    printf("[tester]       BAR");
                     putd((int)ba[i].bar_num);
-                    sel4_debug_puts(" type=");
+                    printf(" type=");
                     putd((int)ba[i].type);
-                    sel4_debug_puts(" addr=");
+                    printf(" addr=");
                     puthex(ba[i].addr);
-                    sel4_debug_putchar('\n');
+                    putchar('\n');
                 }
                 pci_device_detach(hdl);
             } else {
-                sel4_debug_puts("[tester]       attach FAIL errno=");
+                printf("[tester]       attach FAIL errno=");
                 putd(qsoe_errno);
-                sel4_debug_putchar('\n');
+                putchar('\n');
             }
         }
     }
 
-    sel4_debug_puts("[tester] done, returning 0 (→ _exit via crt0)\n");
+    /* v0.8: Sync* primitives smoke test.
+     *   1. SyncMutex: lock / unlock from one thread; recursive
+     *      acquire by the same thread.
+     *   2. SyncSem: post / wait pair across two threads (background
+     *      worker waits, main posts).
+     *   3. SyncCondvar: worker blocks on cond, main signals.
+     */
+    {
+        /* --- mutex --- */
+        printf("[tester] sync_smoke: mutex\n");
+        sync_t mx = QRV_SYNC_INITIALIZER;
+        SyncTypeCreate(QRV_SYNC_MUTEX_FREE, &mx, 0);
+
+        int rc = SyncMutexLock(&mx);
+        printf("[tester]   lock rc=");
+        putd(rc);
+        printf(" owner=");
+        puthex(mx.owner);
+        putchar('\n');
+
+        /* Recursive re-acquire by the same thread. */
+        rc = SyncMutexLock(&mx);
+        printf("[tester]   lock(recursive) rc=");
+        putd(rc);
+        printf(" count=");
+        putd((int)mx.count);
+        putchar('\n');
+
+        rc = SyncMutexUnlock(&mx);
+        printf("[tester]   unlock(inner) rc=");
+        putd(rc);
+        printf(" count=");
+        putd((int)mx.count);
+        putchar('\n');
+
+        rc = SyncMutexUnlock(&mx);
+        printf("[tester]   unlock(final) rc=");
+        putd(rc);
+        printf(" owner=");
+        puthex(mx.owner);
+        putchar('\n');
+
+        /* --- semaphore: post-then-wait (no blocking expected). --- */
+        printf("[tester] sync_smoke: sem post-then-wait\n");
+        sync_t sm = QRV_SYNC_INITIALIZER;
+        SyncTypeCreate(QRV_SYNC_SEM, &sm, 0);
+
+        SyncSemPost(&sm);
+        printf("[tester]   post  count=");
+        putd((int)sm.count);
+        putchar('\n');
+
+        rc = SyncSemWait(&sm, 0);
+        printf("[tester]   wait  rc=");
+        putd(rc);
+        printf(" count=");
+        putd((int)sm.count);
+        putchar('\n');
+
+        /* --- semaphore: wait-then-post across two threads.  Worker
+         *     blocks on the sem; main delays a touch (yield), then
+         *     posts.  Worker should wake and print. */
+        printf("[tester] sync_smoke: sem cross-thread\n");
+        extern void *sync_sem_waiter_fn(void *);
+        int tid = ThreadCreate(0, sync_sem_waiter_fn, &sm, 0);
+        for (int i = 0; i < 4; ++i) qsoe_sys_yield();
+        printf("[tester]   posting after worker has parked\n");
+        SyncSemPost(&sm);
+        void *st = 0;
+        ThreadJoin(tid, &st);
+        printf("[tester]   joined worker status=");
+        puthex((unsigned long)st);
+        putchar('\n');
+
+        /* --- condvar: worker waits, main signals. --- */
+        printf("[tester] sync_smoke: condvar\n");
+        sync_t cmx = QRV_SYNC_INITIALIZER;
+        sync_t cnd = QRV_SYNC_INITIALIZER;
+        SyncTypeCreate(QRV_SYNC_MUTEX_FREE, &cmx, 0);
+        SyncTypeCreate(QRV_SYNC_COND,       &cnd, 0);
+
+        /* Worker takes the mutex, waits on cond.  Main yields a few
+         * times so the worker reliably parks, then signals. */
+        sync_t *pair[2] = { &cmx, &cnd };
+        extern void *sync_cond_waiter_fn(void *);
+        int ctid = ThreadCreate(0, sync_cond_waiter_fn, pair, 0);
+        for (int i = 0; i < 6; ++i) qsoe_sys_yield();
+        printf("[tester]   signaling cond\n");
+        SyncMutexLock(&cmx);
+        SyncCondvarSignal(&cnd, 0);
+        SyncMutexUnlock(&cmx);
+        ThreadJoin(ctid, &st);
+        printf("[tester]   joined cond-waiter status=");
+        puthex((unsigned long)st);
+        putchar('\n');
+    }
+
+    printf("[tester] done, returning 0 (→ _exit via crt0)\n");
     return 0;
 }
 
@@ -501,29 +584,29 @@ int main(int argc, char **argv, char **envp)
  * VSpace, so the trampoline transitions cleanly into here. */
 void *worker_fn(void *arg)
 {
-    sel4_debug_puts("[worker] alive, tid=");
+    printf("[worker] alive, tid=");
     putd(qsoe_curthr()->tid);
-    sel4_debug_puts(" arg=");
+    printf(" arg=");
     puthex((unsigned long)arg);
-    sel4_debug_putchar('\n');
+    putchar('\n');
     return (void *)0xC0FFEE01UL;
 }
 
 void *worker_detached_fn(void *arg)
 {
     (void)arg;
-    sel4_debug_puts("[detached worker] alive, tid=");
+    printf("[detached worker] alive, tid=");
     putd(qsoe_curthr()->tid);
-    sel4_debug_putchar('\n');
+    putchar('\n');
     return (void *)0xDEADBEEFUL;  /* nobody reads this */
 }
 
 void *worker_loop_fn(void *arg)
 {
     (void)arg;
-    sel4_debug_puts("[loop worker] starting MsgSend loop, tid=");
+    printf("[loop worker] starting MsgSend loop, tid=");
     putd(qsoe_curthr()->tid);
-    sel4_debug_putchar('\n');
+    putchar('\n');
     /* Many MsgSends — each hits the cancel point. Without cancel, we
      * spin here forever; with cancel, the next MsgSend self-destructs. */
     for (int i = 0; i < 1000; ++i) {
@@ -533,7 +616,7 @@ void *worker_loop_fn(void *arg)
                  &reply, sizeof reply);
         qsoe_sys_yield();
     }
-    sel4_debug_puts("[loop worker] finished without cancel?!\n");
+    printf("[loop worker] finished without cancel?!\n");
     return (void *)0xBADBADUL;
 }
 
@@ -549,13 +632,13 @@ void *worker_pulse_sender_fn(void *arg)
         for (volatile int spin = 0; spin < 200000; ++spin) ;
         int rc = MsgSendPulse(coid, /*prio=*/10,
                               /*code=*/i + 1, /*value=*/(i + 1) * 100);
-        sel4_debug_puts("[sender tid=");
+        printf("[sender tid=");
         putd(qsoe_curthr()->tid);
-        sel4_debug_puts("] MsgSendPulse code=");
+        printf("] MsgSendPulse code=");
         putd(i + 1);
-        sel4_debug_puts(" rc=");
+        printf(" rc=");
         putd(rc);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
     return (void *)0;
 }
@@ -572,13 +655,52 @@ void *worker_smp_fn(void *arg)
         unsigned long reply   = 0;
         MsgSend(SYSMGR_COID, &payload, sizeof payload,
                  &reply, sizeof reply);
-        sel4_debug_puts("[smp tid=");
+        printf("[smp tid=");
         putd(qsoe_curthr()->tid);
-        sel4_debug_puts(" cpu=");
+        printf(" cpu=");
         putd((int)cpu);
-        sel4_debug_puts("] reply=");
+        printf("] reply=");
         putd((int)reply);
-        sel4_debug_putchar('\n');
+        putchar('\n');
     }
     return (void *)(0xCAFE0000UL | cpu);
+}
+
+/* Sync* workers (referenced by extern in the smoke block in main). */
+void *sync_sem_waiter_fn(void *arg)
+{
+    sync_t *sem = (sync_t *)arg;
+    printf("[sem-waiter tid=");
+    putd(qsoe_curthr()->tid);
+    printf("] parking on sem (count=");
+    putd((int)sem->count);
+    printf(")\n");
+    int rc = SyncSemWait(sem, 0);
+    printf("[sem-waiter tid=");
+    putd(qsoe_curthr()->tid);
+    printf("] woke rc=");
+    putd(rc);
+    printf(" count=");
+    putd((int)sem->count);
+    putchar('\n');
+    return (void *)0x5E110001UL;
+}
+
+void *sync_cond_waiter_fn(void *arg)
+{
+    sync_t **pair = (sync_t **)arg;
+    sync_t *mx  = pair[0];
+    sync_t *cnd = pair[1];
+    SyncMutexLock(mx);
+    printf("[cond-waiter tid=");
+    putd(qsoe_curthr()->tid);
+    printf("] mutex held, calling SyncCondvarWait\n");
+    int rc = SyncCondvarWait(cnd, mx);
+    printf("[cond-waiter tid=");
+    putd(qsoe_curthr()->tid);
+    printf("] woke rc=");
+    putd(rc);
+    putchar('\n');
+    SyncMutexUnlock(mx);
+    return (void *)0xC0DEC0DEUL;
 }

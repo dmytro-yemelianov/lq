@@ -331,12 +331,19 @@ $(TASKMAN_ELF): | taskman
 # Tester — second user-space program, spawned by taskman.
 # ----------------------------------------------------------------------------
 
+TESTER_CFLAGS := $(TM_CFLAGS) \
+    -isystem $(MUSL_GEN)/include \
+    -isystem $(MUSL_DIR)/include \
+    -isystem $(MUSL_DIR)/arch/riscv64 \
+    -isystem $(MUSL_DIR)/arch/generic
+
 $(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
                      $(TASKMAN_DIR)/sel4_types.h \
                      $(LIBQSOE_DIR)/include/qsoe-system.h \
-                     $(LIBQSOE_DIR)/include/qsoe/slots.h
+                     $(LIBQSOE_DIR)/include/qsoe/slots.h \
+                     $(MUSL_GEN_HDRS) | $(LIBC_A)
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
+	$(CC) $(TESTER_CFLAGS) -c -o $@ $<
 
 # Tester links against $(LIBQSOE_A) (normal flavour: real-IPC path).
 # --whole-archive ensures start_main / syscall_dispatch / float128_stubs

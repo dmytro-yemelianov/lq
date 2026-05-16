@@ -542,9 +542,6 @@ projects/musllibc/patches/arch/riscv64/             userland/libc/patches/arch/r
 !userland/libc/src/signal/raise.c
 !userland/libc/src/stdio/funlockfile.c
 !userland/libc/src/stdio/ftrylockfile.c
-!userland/libc/src/stdio/__lockfile.c
-!userland/libc/src/stdio/getc.h
-!userland/libc/src/stdio/putc.h
 !userland/libc/src/stdio/flockfile.c
 !userland/libc/src/env/__stack_chk_fail.c
 !userland/libc/src/env/__reset_tls.c
@@ -641,14 +638,14 @@ projects/musllibc/patches/arch/riscv64/             userland/libc/patches/arch/r
 !userland/libc/src/unistd/ttyname.c
 !userland/libc/src/unistd/ttyname_r.c
 
-# putc.c / getc.c family — orphaned by excluding putc.h/getc.h
-# (those headers included pthread_impl.h for per-FILE locks).
-!userland/libc/src/stdio/putc.c
-!userland/libc/src/stdio/getc.c
-!userland/libc/src/stdio/getchar.c
-!userland/libc/src/stdio/fgetc.c
-!userland/libc/src/stdio/fputc.c
-!userland/libc/src/stdio/putchar.c
+# putc.c / getc.c family — keep them.  putc.h / getc.h pull in
+# pthread_impl.h for the per-FILE lock dance; v0.8 supplies an
+# OS-owned pthread_impl.h shim at userland/libc/include/, symlinked
+# into core/userland/libc/src/internal/ by the libc Makefile.  In
+# single-threaded mode (libc.threaded==0, no pthread_create stub
+# flipping it) the locked path is reachable at link time but never
+# at runtime — do_putc() short-circuits via `f->lock == -1`.
+# See userland/libc/include/pthread_impl.h for the lifetime story.
 
 # Network: no TCP/IP stack in QSOE yet; whole subsystem out.
 !userland/libc/src/network/

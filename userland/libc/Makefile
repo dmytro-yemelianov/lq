@@ -38,6 +38,19 @@ OSDEP_REAL   := $(TOP)/userland/libc/qsoe
 OSDEP_LINK   := $(MUSL_DIR)/src/os_dependent
 $(shell mkdir -p $(MUSL_DIR)/src && ln -snf $(OSDEP_REAL) $(OSDEP_LINK))
 
+# pthread_impl.h shim — QSOE-owned replacement for musl's
+# pthread_impl.h.  Same side-effect-at-parse-time symlink pattern as
+# os_dependent above: musl's internal headers expect to find
+# "pthread_impl.h" in src/internal/, so we plant a symlink there
+# pointing at our shim under userland/libc/include/.  placement.txt
+# already excludes the upstream pthread_impl.h, so this symlink is
+# what gets resolved by `#include "pthread_impl.h"` (in putc.h,
+# getc.h, __lockfile.c, ...).  Lifetime ~v0.8..v0.18; see the shim's
+# own header comment.
+PTH_SHIM     := $(TOP)/userland/libc/include/pthread_impl.h
+PTH_LINK     := $(MUSL_DIR)/src/internal/pthread_impl.h
+$(shell mkdir -p $(MUSL_DIR)/src/internal && ln -snf $(PTH_SHIM) $(PTH_LINK))
+
 # Match upstream RISC-V flags + our nostdinc / freestanding policy.
 ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mstrict-align
 

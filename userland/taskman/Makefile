@@ -60,6 +60,7 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/sel4_syscalls.h \
     $(TASKMAN_DIR)/sel4_types.h \
     $(TASKMAN_DIR)/qsoe_invoke.h \
+    $(TASKMAN_DIR)/tm_log.h \
     $(TASKMAN_DIR)/proc/proc.h \
     $(TASKMAN_DIR)/proc/spawn.h \
     $(TASKMAN_DIR)/mem/mem.h \
@@ -85,6 +86,11 @@ $(OBJDIR)/start.o: $(TASKMAN_DIR)/start.S
 $(OBJDIR)/main.o: $(TASKMAN_DIR)/main.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+
+# tm_log — the sole sel4_debug_* callsite in taskman.
+$(OBJDIR)/tm_log.o: $(TASKMAN_DIR)/tm_log.c $(TM_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
 # proc/ — process registry, channels, connections, threads, pulses, spawn.
 $(OBJDIR)/proc/%.o: $(TASKMAN_DIR)/proc/%.c $(TM_HEADERS)
@@ -131,6 +137,7 @@ $(OBJDIR)/userland_archive.o: $(OBJDIR)/userland_archive.S
 TASKMAN_OBJS := \
     $(OBJDIR)/start.o \
     $(OBJDIR)/main.o \
+    $(OBJDIR)/tm_log.o \
     $(OBJDIR)/proc/process.o \
     $(OBJDIR)/proc/channel.o \
     $(OBJDIR)/proc/connect.o \
@@ -148,6 +155,7 @@ TASKMAN_OBJS := \
     $(OBJDIR)/sys/fdt.o \
     $(OBJDIR)/sys/irq.o \
     $(OBJDIR)/sys/rsrcdb.o \
+    $(OBJDIR)/sys/sync.o \
     $(OBJDIR)/sys/syscfg.o \
     $(OBJDIR)/cpio.o \
     $(OBJDIR)/userland_archive.o

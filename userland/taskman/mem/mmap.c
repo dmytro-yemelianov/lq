@@ -26,9 +26,9 @@
 
 #include "mem.h"
 #include "../proc/proc.h"
-#include "../sel4_syscalls.h"
 #include "../sel4_types.h"
 #include "../qsoe_invoke.h"
+#include "../tm_log.h"
 
 static seL4_BootInfo *s_bi;
 
@@ -74,7 +74,7 @@ static int mmap_anonymous(tm_process_t *proc, unsigned long len,
     for (unsigned long i = 0; i < pages; ++i) {
         seL4_CPtr frame = taskman_alloc_and_retype(seL4_RISCV_Mega_Page, 0);
         if (!frame) {
-            sel4_debug_puts("tm_mmap_serve: Mega_Page alloc failed\n");
+            tm_err("tm_mmap_serve: Mega_Page alloc failed");
             return -ENOMEM;
         }
         seL4_Word err = qsoe_riscv_page_map(frame, proc->vspace,
@@ -82,7 +82,7 @@ static int mmap_anonymous(tm_process_t *proc, unsigned long len,
                                             QSOE_RIGHTS_ALL,
                                             QSOE_VM_ATTR_DEFAULT);
         if (err) {
-            sel4_debug_puts("tm_mmap_serve: Page_Map failed\n");
+            tm_err("tm_mmap_serve: Page_Map failed");
             return -ENOMEM;
         }
     }
@@ -116,13 +116,13 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
     seL4_CPtr ut = find_device_ut_containing(phys, len, &ut_sizebits,
                                               &ut_offset);
     if (!ut) {
-        sel4_debug_puts("tm_mmap_serve(PHYS): no matching device-UT\n");
+        tm_err("tm_mmap_serve(PHYS): no matching device-UT");
         return -ENODEV;
     }
 
     /* Require Mega_Page alignment for both base and length. */
     if (phys & (QSOE_MEGA_PAGE - 1)) {
-        sel4_debug_puts("tm_mmap_serve(PHYS): phys not Mega-aligned\n");
+        tm_err("tm_mmap_serve(PHYS): phys not Mega-aligned");
         return -EINVAL;
     }
     if (len & (QSOE_MEGA_PAGE - 1)) {
@@ -150,7 +150,7 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
                                              chunk_sb, s_cnode_root,
                                              0, 0, dummy, 1);
         if (err) {
-            sel4_debug_puts("tm_mmap_serve(PHYS): skip-retype failed\n");
+            tm_err("tm_mmap_serve(PHYS): skip-retype failed");
             return -ENOMEM;
         }
         advanced += 1UL << chunk_sb;
@@ -171,7 +171,7 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
         seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_Mega_Page, 0,
                                              s_cnode_root, 0, 0, page, 1);
         if (err) {
-            sel4_debug_puts("tm_mmap_serve(PHYS): Mega_Page retype failed\n");
+            tm_err("tm_mmap_serve(PHYS): Mega_Page retype failed");
             return -ENOMEM;
         }
         err = qsoe_riscv_page_map(page, proc->vspace,
@@ -179,7 +179,7 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
                                    QSOE_RIGHTS_ALL,
                                    QSOE_VM_ATTR_DEFAULT);
         if (err) {
-            sel4_debug_puts("tm_mmap_serve(PHYS): Mega_Page_Map failed\n");
+            tm_err("tm_mmap_serve(PHYS): Mega_Page_Map failed");
             return -ENOMEM;
         }
     }
