@@ -39,6 +39,12 @@ enum {
      * ClockTime / nanosleep / etc. read rdtime directly. */
     TM_REQ_CLOCK_FREQ           = 0x003,
 
+    /* v0.8: full syscfg blob (machine model, CPUs, memory, PCI windows,
+     * etc.) built from the FDT at boot.  MR0 = max bytes the caller can
+     * accept; reply MR0 = bytes copied into msg[4..].  Label = 0 / EINVAL
+     * (caller buffer too small) / ENOSYS (syscfg not built yet). */
+    TM_REQ_GET_SYSCFG           = 0x004,
+
     /* ---------- procmgr (0x100..0x1FF) ---------- */
     TM_REQ_CHANNEL_CREATE       = 0x100,
     TM_REQ_CHANNEL_DESTROY      = 0x101,

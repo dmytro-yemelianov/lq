@@ -24,6 +24,7 @@
 #include "path/cpiofs.h"
 #include "sys/console.h"
 #include "sys/platform.h"
+#include "sys/syscfg.h"
 
 #include <qsoe-system.h>
 #include "../libqsoe/include/qsoe/slots.h"
@@ -66,9 +67,35 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         reply_len = 1;
         break;
     case TM_REQ_CLOCK_FREQ: {
-        /* RISC-V `time` CSR frequency.  v0.7: hardcoded for qemu-virt;
-         * v0.8 reads /cpus/timebase-frequency from the FDT instead. */
-        *out_mr0 = (seL4_Word)TM_CLOCK_FREQ_HZ;
+        /* RISC-V `time` CSR frequency.  v0.8 reads it from the FDT
+         * via syscfg; falls back to the qemu-virt hardcode if the
+         * blob hasn't been built (i.e. FDT not available at boot —
+         * shouldn't happen on supported platforms, but the fallback
+         * keeps single-process tests booting). */
+        uint64_t hz = 0;
+        if (tm_syscfg_find_u64(TM_SYSCFG_TAG_TIMEBASE_HZ, &hz) != 0 ||
+            hz == 0) {
+            hz = TM_CLOCK_FREQ_HZ;
+        }
+        *out_mr0 = (seL4_Word)hz;
+        reply_len = 1;
+        break;
+    }
+    case TM_REQ_GET_SYSCFG: {
+        /* Hand back the whole syscfg blob in one shot.  Caller's mr0 is
+         * the max bytes it can accept; we copy min(blob_len, mr0) into
+         * msg[4..] and reply with mr0 = bytes copied. */
+        const void *blob; unsigned blob_len;
+        if (tm_syscfg_get(&blob, &blob_len) != 0) {
+            err = ENOSYS;
+            break;
+        }
+        unsigned want = (unsigned)mr0;
+        if (want > blob_len) want = blob_len;
+        unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+        const unsigned char *src = (const unsigned char *)blob;
+        for (unsigned i = 0; i < want; ++i) dst[i] = src[i];
+        *out_mr0 = (seL4_Word)want;
         reply_len = 1;
         break;
     }
@@ -607,13 +634,59 @@ static seL4_CPtr find_device_untyped_for_paddr(seL4_BootInfo *bi,
     return 0;
 }
 
+/* Find the FDT blob in the extra-BI region.  seL4's kernel/boot.c
+ * appends the DTB as a SEL4_BOOTINFO_HEADER_FDT chunk in the page
+ * immediately following the main BootInfo frame.  Each chunk is a
+ * 16-byte (id, len) header followed by `len - 16` payload bytes.
+ * Returns 0 / NULL if the kernel didn't provide a DTB. */
+#define SEL4_BOOTINFO_HEADER_FDT  6
+typedef struct { seL4_Word id; seL4_Word len; } tm_bi_header_t;
+
+static const void *find_fdt_in_extra_bi(seL4_BootInfo *bi,
+                                         unsigned *out_size)
+{
+    if (!bi || bi->extraLen == 0) return 0;
+    /* The kernel maps extra-BI at the page immediately after the
+     * BootInfo frame.  PAGE_SIZE is 4 KiB on RISC-V. */
+    const unsigned char *p = (const unsigned char *)bi + 4096;
+    seL4_Word off = 0;
+    while (off + sizeof(tm_bi_header_t) <= bi->extraLen) {
+        const tm_bi_header_t *h = (const tm_bi_header_t *)(p + off);
+        if (h->len < sizeof *h) return 0;
+        if (h->id == SEL4_BOOTINFO_HEADER_FDT) {
+            if (out_size) *out_size = (unsigned)(h->len - sizeof *h);
+            return (const void *)(h + 1);
+        }
+        off += h->len;
+    }
+    return 0;
+}
+
 int main(seL4_BootInfo *bi)
 {
     print_banner();
     qsoe_libqsoe_init(bi->ipcBuffer, QSOE_PID_TASKMAN);
-    /* taskman knows the platform timer frequency directly (it's what
-     * the TM_REQ_CLOCK_FREQ handler returns); no self-IPC. */
-    qsoe_time_freq_hz = TM_CLOCK_FREQ_HZ;
+
+    /* Parse FDT (if seL4 published one) and build the syscfg blob.
+     * If anything fails, syscfg-dependent handlers fall back to the
+     * compile-time hardcoded values — boot still completes. */
+    unsigned dtb_size = 0;
+    const void *dtb = find_fdt_in_extra_bi(bi, &dtb_size);
+    if (dtb && tm_syscfg_build(dtb) == 0) {
+        sel4_debug_puts("taskman: syscfg built from FDT\n");
+    } else {
+        sel4_debug_puts("taskman: no FDT in extra-BI; syscfg falls back\n");
+    }
+
+    /* Pick up timebase-Hz from syscfg if available, hardcode otherwise. */
+    {
+        uint64_t hz = 0;
+        if (tm_syscfg_find_u64(TM_SYSCFG_TAG_TIMEBASE_HZ, &hz) == 0 && hz) {
+            qsoe_time_freq_hz = hz;
+        } else {
+            qsoe_time_freq_hz = TM_CLOCK_FREQ_HZ;
+        }
+    }
 
     seL4_CPtr ut = find_largest_ram_untyped(bi);
     if (ut == 0) {
