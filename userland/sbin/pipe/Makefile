@@ -58,29 +58,27 @@ PIPE_HEADERS := \
     $(LIBQSOE_DIR)/include/qsoe/wire.h \
     $(GEN)/qsoe/sys_version.h
 
+# Shared userland crt0 — built once by libqsoe's Makefile.
+CRT0_O := $(BUILD)/crt0.o
+
 .PHONY: all clean
 all: $(PIPE_ELF)
-
-$(OBJDIR)/start.o: $(PIPE_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(PIPE_CFLAGS) -c -o $@ $<
 
 $(OBJDIR)/main.o: $(PIPE_DIR)/main.c $(PIPE_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(PIPE_CFLAGS) -c -o $@ $<
 
 PIPE_OBJS := \
-    $(OBJDIR)/start.o \
     $(OBJDIR)/main.o
 
 # Link: --whole-archive libqsoe.a so start_main / time / etc. land
 # even when only referenced through libqsoe-internal paths.
-$(PIPE_ELF): $(PIPE_OBJS) $(LIBQSOE_A) $(LIBC_A)
+$(PIPE_ELF): $(CRT0_O) $(PIPE_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(PIPE_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(PIPE_OBJS) \
+	    -o $@ $(CRT0_O) $(PIPE_OBJS) \
 	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
 	    $(LIBC_A)
 

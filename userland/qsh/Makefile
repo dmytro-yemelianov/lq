@@ -63,20 +63,19 @@ OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(SRCS))
 # Pre-built archives from sibling submakes.
 LIBQSOE_A := $(BUILD)/libqsoe.a
 
+# Shared userland crt0 — built once by libqsoe's Makefile.
+CRT0_O    := $(BUILD)/crt0.o
+
 all: $(QSH_ELF)
 
-# Standard QSOE crt0: clear gp/tp, stage argc/argv/envp, jump to
-# _qsoe_start_main.  Each userland program ships its own start.S.
-$(OBJDIR)/start.o: $(QSH_DIR)/start.S | $(OBJDIR)
-	$(CC) $(ARCH_CFLAGS) -c -o $@ $<
-
-# Link: same shape as the other userland ELFs.
-$(QSH_ELF): $(OBJDIR)/start.o $(OBJS) $(LIBQSOE_A) $(LIBC_A)
+# Link: same shape as the other userland ELFs.  crt0.o is supplied by
+# libqsoe's Makefile so the entry contract lives in one place.
+$(QSH_ELF): $(CRT0_O) $(OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(ARCH_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(OBJDIR)/start.o $(OBJS) \
+	    -o $@ $(CRT0_O) $(OBJS) \
 	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
 	    $(LIBC_A)
 

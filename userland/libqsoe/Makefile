@@ -42,6 +42,11 @@ TM_OBJ     := $(OBJDIR)/tm
 LIBQSOE_A    := $(BUILD)/libqsoe.a
 LIBQSOE_TM_A := $(BUILD)/libqsoe-tm.a
 
+# Shared userland crt0.  Linked first by every spawned program
+# (qsh, devc-ser8250, sbin/pipe, sbin/repath, tester, ...).
+# taskman has its own start.S — different entry contract.
+CRT0_O       := $(BUILD)/crt0.o
+
 # CFLAGS — mirror the top-level TM_CFLAGS for consistency.
 ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 \
                -mcmodel=medany -mstrict-align
@@ -108,7 +113,7 @@ TM_VAR_OBJS := $(patsubst %.c,$(TM_OBJ)/%.o,$(TM_VAR_SRCS))
 
 # Default + main targets.
 .PHONY: all clean
-all: $(LIBQSOE_A) $(LIBQSOE_TM_A)
+all: $(LIBQSOE_A) $(LIBQSOE_TM_A) $(CRT0_O)
 
 # Compile patterns.
 $(NORMAL_OBJ)/%.o: $(LIBQSOE_DIR)/src/%.c $(TM_HEADERS)
@@ -128,5 +133,10 @@ $(LIBQSOE_TM_A): $(TM_VAR_OBJS)
 	@echo "  AR  $@ ($(words $(TM_VAR_OBJS)) objects, IN_TASKMAN flavour)"
 	@$(AR) rcs $@ $(TM_VAR_OBJS)
 
+# crt0 — built once, consumed by every userland program's Makefile.
+$(CRT0_O): $(LIBQSOE_DIR)/src/crt0.S
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_CFLAGS) -c -o $@ $<
+
 clean:
-	rm -rf $(OBJDIR) $(LIBQSOE_A) $(LIBQSOE_TM_A)
+	rm -rf $(OBJDIR) $(LIBQSOE_A) $(LIBQSOE_TM_A) $(CRT0_O)

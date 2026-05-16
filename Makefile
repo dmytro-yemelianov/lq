@@ -309,7 +309,7 @@ LIBQSOE_TM_A := $(BUILD)/libqsoe-tm.a
 libqsoe:
 	+$(MAKE) -C $(TOP)/userland/libqsoe all
 
-$(LIBQSOE_A) $(LIBQSOE_TM_A): | libqsoe
+$(LIBQSOE_A) $(LIBQSOE_TM_A) $(BUILD)/crt0.o: | libqsoe
 	@true
 
 # taskman — build delegated to userland/taskman/Makefile.  Embeds the
@@ -326,10 +326,6 @@ $(TASKMAN_ELF): | taskman
 # Tester — second user-space program, spawned by taskman.
 # ----------------------------------------------------------------------------
 
-$(TESTBUILD)/start.o: $(TESTER_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
-
 $(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
                      $(TASKMAN_DIR)/sel4_types.h \
                      $(LIBQSOE_DIR)/include/qsoe-system.h \
@@ -340,17 +336,17 @@ $(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
 # Tester links against $(LIBQSOE_A) (normal flavour: real-IPC path).
 # --whole-archive ensures start_main / syscall_dispatch / float128_stubs
 # are pulled in even when tester's own code doesn't reference them
-# directly (start.S calls _qsoe_start_main; musl needs __sysinfo; etc.).
+# directly (crt0 calls _qsoe_start_main; musl needs __sysinfo; etc.).
+# crt0.o comes from libqsoe's Makefile — shared by every userland prog.
 TESTER_OBJS := \
-    $(TESTBUILD)/start.o \
     $(TESTBUILD)/main.o
 
-$(TESTER_ELF): $(TESTER_OBJS) $(LIBQSOE_A) $(LIBC_A)
+$(TESTER_ELF): $(BUILD)/crt0.o $(TESTER_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(TESTER_OBJS) \
+	    -o $@ $(BUILD)/crt0.o $(TESTER_OBJS) \
 	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
 	    $(LIBC_A)
 

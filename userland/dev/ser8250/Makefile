@@ -62,12 +62,11 @@ DSER_HEADERS := \
     $(LIBQSOE_DIR)/include/qsoe/wire.h \
     $(GEN)/qsoe/sys_version.h
 
+# Shared userland crt0 — built once by libqsoe's Makefile.
+CRT0_O := $(BUILD)/crt0.o
+
 .PHONY: all clean
 all: $(DSER_ELF)
-
-$(OBJDIR)/start.o: $(DSER_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
 $(OBJDIR)/main.o: $(DSER_DIR)/main.c $(DSER_HEADERS) \
                   $(DSER_DIR)/uart.h $(DSER_DIR)/ring.h
@@ -83,20 +82,19 @@ $(OBJDIR)/ring.o: $(DSER_DIR)/ring.c $(DSER_DIR)/ring.h
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
 DSER_OBJS := \
-    $(OBJDIR)/start.o \
     $(OBJDIR)/main.o \
     $(OBJDIR)/uart.o \
     $(OBJDIR)/ring.o
 
 # Link.  --whole-archive on libqsoe.a so start_main / syscall_dispatch /
-# float128_stubs land in even though they're referenced only via start.S
+# float128_stubs land in even though they're referenced only via crt0
 # / musl indirection / libgcc weak aliases.
-$(DSER_ELF): $(DSER_OBJS) $(LIBQSOE_A) $(LIBC_A)
+$(DSER_ELF): $(CRT0_O) $(DSER_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(DSER_OBJS) \
+	    -o $@ $(CRT0_O) $(DSER_OBJS) \
 	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
 	    $(LIBC_A)
 

@@ -46,27 +46,25 @@ REPATH_CFLAGS := $(ARCH_CFLAGS) \
     -isystem $(MUSL_DIR)/arch/riscv64 \
     -isystem $(MUSL_DIR)/arch/generic
 
+# Shared userland crt0 — built once by libqsoe's Makefile.
+CRT0_O := $(BUILD)/crt0.o
+
 .PHONY: all clean
 all: $(REPATH_ELF)
-
-$(OBJDIR)/start.o: $(REPATH_DIR)/start.S
-	@mkdir -p $(@D)
-	$(CC) $(REPATH_CFLAGS) -c -o $@ $<
 
 $(OBJDIR)/main.o: $(REPATH_DIR)/main.c
 	@mkdir -p $(@D)
 	$(CC) $(REPATH_CFLAGS) -c -o $@ $<
 
 REPATH_OBJS := \
-    $(OBJDIR)/start.o \
     $(OBJDIR)/main.o
 
-$(REPATH_ELF): $(REPATH_OBJS) $(LIBQSOE_A) $(LIBC_A)
+$(REPATH_ELF): $(CRT0_O) $(REPATH_OBJS) $(LIBQSOE_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(REPATH_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(REPATH_OBJS) \
+	    -o $@ $(CRT0_O) $(REPATH_OBJS) \
 	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
 	    $(LIBC_A)
 
