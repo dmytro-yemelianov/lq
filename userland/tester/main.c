@@ -341,6 +341,27 @@ int main(int argc, char **argv, char **envp)
         sel4_debug_putchar('\n');
     }
 
+    /* v0.8: MAP_PHYS smoke test.  Use the unused device-UT at
+     * 0x04000000 (sb=26, 64 MiB; sits between CLINT and PLIC on
+     * qemu-virt and isn't bound to any actual device — perfect for
+     * a non-destructive smoke of the mapping path).  We only check
+     * that the mmap succeeds; don't read the region (the underlying
+     * bus has no device there, so a load could behave unpredictably). */
+    {
+        sel4_debug_puts("[tester] MAP_PHYS smoke @ 0x04000000\n");
+        void *p = qsoe_mmap(0, 0x1000, 0,
+                            QSOE_MAP_PHYS, -1, 0x04000000UL);
+        if (p == QSOE_MAP_FAILED) {
+            sel4_debug_puts("[tester]   FAIL: errno=");
+            putd(qsoe_errno);
+            sel4_debug_putchar('\n');
+        } else {
+            sel4_debug_puts("[tester]   mapped at ");
+            puthex((unsigned long)p);
+            sel4_debug_putchar('\n');
+        }
+    }
+
     sel4_debug_puts("[tester] done, returning 0 (→ _exit via crt0)\n");
     return 0;
 }

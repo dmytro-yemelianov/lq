@@ -15,7 +15,21 @@
 /* mmap region origin + page size used to bump tm_process_t.mmap_top. */
 #define QSOE_MMAP_BASE  0x2000000UL    /* 32 MiB */
 #define QSOE_MEGA_PAGE  0x200000UL     /* 2 MiB  */
+#define QSOE_PAGE_4K    0x1000UL       /* 4 KiB  */
 
-int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long *out_vaddr);
+/* flags bits passed to tm_mmap_serve.  Maps to libqsoe's QSOE_MAP_*. */
+#define TM_MMAP_FLAG_PHYS   0x1u       /* phys arg names a physical addr */
+
+/* mmap allocator.  `flags` distinguishes anonymous (default) from
+ * MAP_PHYS (physical-memory window for MMIO).  Anonymous uses
+ * 2 MiB Mega_Pages from RAM untyped; MAP_PHYS retypes the
+ * device-untyped covering `phys` into 4 KiB Pages.  In both cases
+ * the caller gets a bump-allocated VA range back in *out_vaddr.  */
+int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long flags,
+                  unsigned long phys, unsigned long *out_vaddr);
+
+/* Bootinfo handle (set once at startup by main.c) — used by
+ * MAP_PHYS to walk the device-untyped list. */
+void tm_mem_set_bootinfo(seL4_BootInfo *bi);
 
 #endif /* QSOE_TASKMAN_MEM_H */

@@ -120,6 +120,18 @@ typedef struct {
 #define TM_S_IFCHR  0020000
 #define TM_S_IFDIR  0040000
 
+/* mmap flags (subset).  QSOE_MAP_PHYS: `off` argument names a
+ * physical address to map (device MMIO).  Behaves like QRV's
+ * MAP_PHYS — required by drivers / resmgrs that need direct
+ * register access.  Other POSIX flags (MAP_SHARED / MAP_ANON /
+ * MAP_FIXED) are ignored in v0.8; the mmap behaviour is always
+ * shared/anonymous-or-physical, and the caller doesn't pick the VA. */
+#define QSOE_MAP_PHYS    0x10000
+#define QSOE_MAP_FAILED  ((void *)-1)
+
+void *qsoe_mmap(void *addr, unsigned long length, int prot, int flags,
+                int fd, long off);
+
 int ChannelCreate(unsigned flags);
 int ChannelDestroy(int chid);
 int ConnectAttach(uint32_t nd, pid_t pid, int chid, unsigned index, int flags);

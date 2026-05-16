@@ -414,8 +414,11 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
 
     /* ---------- memmgr ---------- */
     case TM_REQ_MMAP: {
+        /* mr0 = length, mr1 = flags, mr2 = phys (if flags & PHYS). */
         unsigned long base = 0;
-        int rc = tm_mmap_serve(caller, (unsigned long)mr0, &base);
+        int rc = tm_mmap_serve(caller, (unsigned long)mr0,
+                                (unsigned long)mr1, (unsigned long)mr2,
+                                &base);
         if (rc) { err = (seL4_Word)(-rc); break; }
         *out_mr0 = (seL4_Word)base;
         reply_len = 1;
@@ -696,6 +699,7 @@ int main(seL4_BootInfo *bi)
 
     seL4_CPtr uart_ut = find_device_untyped_for_paddr(bi, 0x10000000UL);
     tm_set_uart_untyped(uart_ut);
+    tm_mem_set_bootinfo(bi);  /* needed by MAP_PHYS to walk device-UTs */
     if (uart_ut == 0) {
         sel4_debug_puts("warn: no device-untyped at 0x10000000\n");
     }
