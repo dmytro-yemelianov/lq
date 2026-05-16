@@ -63,9 +63,12 @@ int main(int argc, char **argv, char **envp)
         }
         unsigned major = _SLOG_GETMAJOR(h->code);
         unsigned minor = _SLOG_GETMINOR(h->code);
-        printf("[%12lu us]  %s  %u.%u  pid=%u  ",
-               (unsigned long)h->time_us, sev_str(h->severity),
-               major, minor, (unsigned)h->pid);
+        /* Build the prefix in pieces — single printf with 5 args was
+         * dropping output through stdout's buffer on /dev/ser1. */
+        printf("[%lu us]  ", (unsigned long)h->time_us);
+        printf("%s  ", sev_str(h->severity));
+        printf("%u.%u  ", major, minor);
+        printf("pid=%u  ", (unsigned)h->pid);
         fflush(stdout);
         if ((h->flags & QSOE_SLOG_FLAG_TEXT) && h->paylen > 0) {
             char *text = (char *)(h + 1);
