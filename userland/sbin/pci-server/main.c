@@ -559,11 +559,13 @@ static void serve(int chid)
             tm_stat_t *st = (tm_stat_t *)&rbuf[32];
             for (unsigned i = 0; i < sizeof *st; ++i)
                 ((unsigned char *)st)[i] = 0;
-            st->st_dev     = 9;
+            st->st_dev     = 10;
             st->st_ino     = 1;
             st->st_mode    = TM_S_IFCHR | 0666;
             st->st_nlink   = 1;
-            st->st_rdev    = (9UL << 8) | 1;
+            /* Linux misc-class char device (MISC_MAJOR=10).
+             * Minor 200 is unused in mainline; reserved for QSOE pci. */
+            st->st_rdev    = (10UL << 8) | 200;
             st->st_blksize = 256;
             unsigned want  = (unsigned)sizeof *st;
             for (int i = 0; i < 32; ++i) rbuf[i] = 0;

@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <time.h>
 #include <pwd.h>
@@ -78,16 +79,28 @@ static void print_entry(const char *name, const char *path, struct stat *st)
     char mode[12];
     format_mode(st->st_mode, mode);
 
+    /* For character / block devices, GNU ls(1) replaces the size
+     * column with "<major>, <minor>" — same total width.  Anything
+     * else falls back to the byte size. */
+    char size_col[16];
+    if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode)) {
+        snprintf(size_col, sizeof size_col, "%3u, %3u",
+                 (unsigned)major(st->st_rdev),
+                 (unsigned)minor(st->st_rdev));
+    } else {
+        snprintf(size_col, sizeof size_col, "%8ld", (long)st->st_size);
+    }
+
     if (tlen >= 0)
-        printf("%s %2d %5d %5d %8ld %s -> %s\n",
+        printf("%s %2d %5d %5d %s %s -> %s\n",
                mode, (int)st->st_nlink,
                (int)st->st_uid, (int)st->st_gid,
-               (long)st->st_size, name, target);
+               size_col, name, target);
     else
-        printf("%s %2d %5d %5d %8ld %s\n",
+        printf("%s %2d %5d %5d %s %s\n",
                mode, (int)st->st_nlink,
                (int)st->st_uid, (int)st->st_gid,
-               (long)st->st_size, name);
+               size_col, name);
 }
 
 /*

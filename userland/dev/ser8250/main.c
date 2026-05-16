@@ -218,11 +218,12 @@ int main(int argc, char **argv, char **envp)
             tm_stat_t *st = (tm_stat_t *)&s_reply_buf[32];
             unsigned char *zero = (unsigned char *)st;
             for (unsigned i = 0; i < sizeof *st; ++i) zero[i] = 0;
-            st->st_dev     = 5;             /* synthetic — matches console */
+            st->st_dev     = 4;             /* Linux TTY_MAJOR */
             st->st_ino     = 2;
             st->st_mode    = TM_S_IFCHR | 0666;
             st->st_nlink   = 1;
-            st->st_rdev    = (5UL << 8) | 2;
+            /* Linux ttyS<N> = (4, 64+N); /dev/ser1 maps to ttyS1. */
+            st->st_rdev    = (4UL << 8) | 65;
             st->st_blksize = 256;
             unsigned want = (unsigned)sizeof *st;
             for (unsigned i = 0; i < 32; ++i) s_reply_buf[i] = 0;

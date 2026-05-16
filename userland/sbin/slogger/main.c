@@ -124,7 +124,10 @@ static int slog_send_stat_reply(int rcvid)
     st->st_ino     = 1;
     st->st_mode    = TM_S_IFCHR | 0666;
     st->st_nlink   = 1;
-    st->st_rdev    = (7UL << 8) | 1;
+    /* Linux misc-class char device, like /dev/log used to be on
+     * older systems; major=10 is MISC_MAJOR.  Minor 100 is unused
+     * in mainline Linux and reserved here for QSOE slogger. */
+    st->st_rdev    = (10UL << 8) | 100;
     st->st_blksize = 256;
     unsigned want  = (unsigned)sizeof *st;
     for (unsigned i = 0; i < 32; ++i) s_reply_buf[i] = 0;
