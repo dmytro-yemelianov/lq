@@ -78,6 +78,7 @@ typedef unsigned int  gid_t;
 #define EMFILE         24
 #define ENOTTY         25
 #define EFBIG          27
+#define ENOSPC         28
 #define ESPIPE         29
 #define EPIPE          32
 #define EROFS          30

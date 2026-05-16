@@ -102,7 +102,7 @@ $(GEN)/qsoe/sys_version.h: $(wildcard $(TOP)/.git/HEAD $(TOP)/.git/index)
 NORMAL_SRCS := state.c msg.c process.c thread.c channel.c connect.c \
                start_main.c io.c mmap.c proc_info.c time.c \
                float128_stubs.c signal.c malloc.c ldisc.c irq.c \
-               interrupt.c
+               interrupt.c rsrcdb.c
 
 # In-taskman flavour: subset — taskman doesn't need its own start_main,
 # its own syscall dispatcher, or the float128 stubs.

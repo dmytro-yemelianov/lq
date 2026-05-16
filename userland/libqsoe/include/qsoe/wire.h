@@ -57,6 +57,16 @@ enum {
      * caller's empty pool. */
     TM_REQ_IRQ_DETACH           = 0x006,
 
+    /* v0.8-rc1: resource-database surface.  Payload (rsrc_alloc_t or
+     * rsrc_request_t depending on op) lives in msg[4..].  MR0 = entry
+     * count for the batch.  Reply: MR0 = entries written, payload
+     * echoed back into msg[4..] (granted ranges, query results).      */
+    TM_REQ_RSRC_CREATE          = 0x007,
+    TM_REQ_RSRC_DESTROY         = 0x008,
+    TM_REQ_RSRC_ATTACH          = 0x009,
+    TM_REQ_RSRC_DETACH          = 0x00a,
+    TM_REQ_RSRC_QUERY           = 0x00b,
+
     /* ---------- procmgr (0x100..0x1FF) ---------- */
     TM_REQ_CHANNEL_CREATE       = 0x100,
     TM_REQ_CHANNEL_DESTROY      = 0x101,

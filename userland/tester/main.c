@@ -341,6 +341,55 @@ int main(int argc, char **argv, char **envp)
         sel4_debug_putchar('\n');
     }
 
+    /* v0.8-rc1: rsrcdb smoke test.  Boot seeded MEMORY entries from
+     * the FDT (via syscfg); query a few back, then create an IRQ
+     * range, attach a single IRQ, detach it, destroy the range. */
+    {
+        #include <sys/rsrcdbmgr.h>
+        sel4_debug_puts("[tester] rsrcdb smoke: query MEMORY\n");
+        rsrc_alloc_t got[4];
+        int n = rsrcdbmgr_query(got, 4, 0, RSRCDBMGR_MEMORY);
+        sel4_debug_puts("[tester]   MEMORY entries: ");
+        putd(n);
+        sel4_debug_putchar('\n');
+        for (int i = 0; i < n && i < 4; ++i) {
+            sel4_debug_puts("[tester]   [");
+            puthex(got[i].start);
+            sel4_debug_puts("..");
+            puthex(got[i].end);
+            sel4_debug_puts("] flags=");
+            puthex(got[i].flags);
+            sel4_debug_putchar('\n');
+        }
+        sel4_debug_puts("[tester] rsrcdb smoke: create IRQ pool 64..71\n");
+        rsrc_alloc_t mk = { 64, 71, RSRCDBMGR_IRQ, 0 };
+        int rc = rsrcdbmgr_create(&mk, 1);
+        sel4_debug_puts("[tester]   create rc=");
+        putd(rc);
+        sel4_debug_putchar('\n');
+
+        sel4_debug_puts("[tester] rsrcdb smoke: attach 1 IRQ\n");
+        rsrc_request_t req = { 0 };
+        req.length = 1;
+        req.flags  = RSRCDBMGR_IRQ;
+        rc = rsrcdbmgr_attach(&req, 1);
+        sel4_debug_puts("[tester]   attach rc=");
+        putd(rc);
+        if (rc == 0) {
+            sel4_debug_puts(" granted=");
+            puthex(req.start);
+        }
+        sel4_debug_putchar('\n');
+
+        if (rc == 0) {
+            sel4_debug_puts("[tester] rsrcdb smoke: detach\n");
+            rc = rsrcdbmgr_detach(&req, 1);
+            sel4_debug_puts("[tester]   detach rc=");
+            putd(rc);
+            sel4_debug_putchar('\n');
+        }
+    }
+
     /* v0.8: MAP_PHYS smoke test.  Use the unused device-UT at
      * 0x04000000 (sb=26, 64 MiB; sits between CLINT and PLIC on
      * qemu-virt and isn't bound to any actual device — perfect for

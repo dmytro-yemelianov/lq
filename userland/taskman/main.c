@@ -25,6 +25,7 @@
 #include "sys/console.h"
 #include "sys/irq.h"
 #include "sys/platform.h"
+#include "sys/rsrcdb.h"
 #include "sys/syscfg.h"
 
 #include <qsoe-system.h>
@@ -97,6 +98,42 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     case TM_REQ_IRQ_DETACH: {
         int rc = tm_irq_detach(caller, (seL4_CPtr)mr0, (seL4_CPtr)mr1);
         if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_RSRC_CREATE: {
+        int rc = tm_rsrc_create(caller, (unsigned)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_RSRC_DESTROY: {
+        int rc = tm_rsrc_destroy(caller, (unsigned)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_RSRC_ATTACH: {
+        int rc = tm_rsrc_attach(caller, (unsigned)mr0);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        /* Echo granted ranges back: tm_rsrc_attach mutated msg[4..]
+         * in place; reply length covers the MR0..3 quad plus the
+         * payload (one rsrc_request_t = 48 bytes per entry). */
+        *out_mr0 = mr0;
+        unsigned bytes = (unsigned)mr0 * 48u;  /* sizeof rsrc_request_t */
+        reply_len = 4 + (bytes + 7) / 8;
+        break;
+    }
+    case TM_REQ_RSRC_DETACH: {
+        int rc = tm_rsrc_detach(caller, (unsigned)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_RSRC_QUERY: {
+        unsigned written = 0;
+        int rc = tm_rsrc_query(caller, (unsigned)mr0, (unsigned)mr1,
+                                (uint32_t)mr2, &written);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)written;
+        unsigned bytes = written * 32u;  /* sizeof rsrc_alloc_t */
+        reply_len = 4 + (bytes + 7) / 8;
         break;
     }
     case TM_REQ_GET_SYSCFG: {
@@ -698,6 +735,11 @@ int main(seL4_BootInfo *bi)
     } else {
         sel4_debug_puts("taskman: no FDT in extra-BI; syscfg falls back\n");
     }
+
+    /* Resource database — empty pool + per-class lists, then seed
+     * MEMORY entries from the syscfg blob. */
+    tm_rsrc_init();
+    tm_rsrc_seed_from_syscfg();
 
     /* Pick up timebase-Hz from syscfg if available, hardcode otherwise. */
     {
