@@ -57,25 +57,15 @@ struct elf64_phdr {
 /* Scratch vaddr in taskman's VSpace, used to memcpy ELF bytes into a
  * frame before we Page_Map that frame into the child's VSpace.
  *
- * Constraints — the value MUST be:
- *   1. above taskman.elf's image range AND above the IPC buffer
- *      / BootInfo / extra-BI (DTB) frames the kernel places
- *      immediately after the image (otherwise "vaddr already mapped"),
- *   2. below CHILD_STACK_BASE (0x1FC000),
- *   3. inside the kernel-prepared [0, 0x200000) L0 region (otherwise
- *      FrameMap fails with "missing PT").
- *
- * Growth history:
- *   v0.7  image ≈ 1.4 MB, extras at ~0x180000 → scratch at 0x180000
- *   v0.8  image ≈ 1.5 MB, extras span to ~0x190000 → scratch at 0x1F8000
- *   rc3   image ≈ 1.9 MB (tm_log + sync.c bulk), DTB extras reach
- *         past 0x1F8000 → scratch bumped to 0x1FE000 (the last 4-K
- *         page below the 2-MiB L0 region's top).
- *
- * If taskman ever exceeds ~2 MiB total image+extras, scratch needs a
- * fresh L0 PT mapped at a higher VA (e.g. 0x40000000) — this is the
- * cleanup-when-painful path. */
-#define TM_SCRATCH_VADDR 0x1FE000UL
+ * Placed at 0x40000000 (L2[1], second 1-GiB slot).  The kernel-
+ * prepared L1 + L0 PTs only cover the low 2 MiB [0, 0x200000) where
+ * taskman's image, BSS, stack, IPC buffer and extra-BI frames live.
+ * Putting scratch in L2[1] gives it its own L1 + L0 PT pair that we
+ * allocate once at first use (ensure_scratch_pt below), out of
+ * reach of any future taskman.elf size growth.  As long as taskman
+ * fits in its 1 GiB image cap (see [[project_image_size_cap]]),
+ * scratch never has to move again. */
+#define TM_SCRATCH_VADDR 0x40000000UL
 
 /* Child VSpace layout. Image, stack, and IPC buffer share the first
  * 2 MiB region [0, 0x200000) and use one L1 + one L0 PT. The heap
@@ -113,9 +103,61 @@ static void qmemset(void *dst, int v, unsigned long n)
     while (n--) *d++ = (unsigned char)v;
 }
 
+/* Forward decl of the shared spawn-state untyped/cnode-root helpers
+ * defined in proc/process.c (and used below to retype PT objects).
+ * `alloc_object` is defined further down in this file. */
+static seL4_CPtr alloc_object(seL4_Word type, seL4_Word size_bits);
+
+/* Allocate + install the L1 and L0 page tables that back the 2-MiB
+ * region containing TM_SCRATCH_VADDR.  The kernel-prepared mappings
+ * only cover the low 2 MiB of taskman's vspace; once taskman's
+ * image+extras approach that boundary, scratch needs its own PT
+ * pair somewhere out of the way.  Idempotent — runs once at first
+ * scratch_map() and stays installed for taskman's lifetime. */
+static int s_scratch_pt_ready;
+
+static int ensure_scratch_pt(void)
+{
+    if (s_scratch_pt_ready) return 0;
+
+    /* L1 PT (covers 1 GiB, here the slice containing TM_SCRATCH_VADDR
+     * — entry 1 of the SV39 L2 root).  The first Riscv_PageTable_Map
+     * at a VA whose L2 entry is empty installs at L1; the second
+     * installs at L0 underneath it. */
+    seL4_CPtr l1 = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!l1) { tm_err("spawn: ensure_scratch_pt: L1 retype failed"); return -ENOMEM; }
+    seL4_Word err = qsoe_riscv_pagetable_map(l1, seL4_CapInitThreadVSpace,
+                                              TM_SCRATCH_VADDR,
+                                              QSOE_VM_ATTR_DEFAULT);
+    if (err) {
+        tm_err("spawn: ensure_scratch_pt: L1 PageTable_Map failed err=%u",
+               (unsigned long)err);
+        return -ENOMEM;
+    }
+
+    /* L0 PT (covers 2 MiB; the leaf level under which 4 KiB Pages are
+     * mapped).  After this, qsoe_riscv_page_map() at TM_SCRATCH_VADDR
+     * will succeed for any frame the spawner hands it. */
+    seL4_CPtr l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!l0) { tm_err("spawn: ensure_scratch_pt: L0 retype failed"); return -ENOMEM; }
+    err = qsoe_riscv_pagetable_map(l0, seL4_CapInitThreadVSpace,
+                                    TM_SCRATCH_VADDR,
+                                    QSOE_VM_ATTR_DEFAULT);
+    if (err) {
+        tm_err("spawn: ensure_scratch_pt: L0 PageTable_Map failed err=%u",
+               (unsigned long)err);
+        return -ENOMEM;
+    }
+
+    s_scratch_pt_ready = 1;
+    return 0;
+}
+
 /* Map a frame temporarily into taskman's vspace at TM_SCRATCH_VADDR. */
 static int scratch_map(seL4_CPtr frame)
 {
+    if (ensure_scratch_pt() != 0) return -ENOMEM;
+
     int rc = (int)qsoe_riscv_page_map(frame, seL4_CapInitThreadVSpace,
                                        TM_SCRATCH_VADDR,
                                        QSOE_RIGHTS_ALL,
