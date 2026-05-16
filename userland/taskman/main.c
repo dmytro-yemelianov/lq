@@ -681,6 +681,16 @@ int main(seL4_BootInfo *bi)
         }
     }
 
+    /* /dev/tty — POSIX controlling-terminal alias.  Symlink to
+     * /dev/console so repath()s on the latter (e.g. devc-ser8250
+     * coming up at boot) carry over.  isatty(open("/dev/tty")) is
+     * how qsh detects its tty — once this resolves, qsh's edit.c
+     * editor (with arrow-key history) takes over. */
+    if (tm_pathmgr_symlink("/dev/tty", "/dev/console") != 0) {
+        sel4_debug_puts("FATAL: pathmgr symlink /dev/tty failed\n");
+        for (;;) __asm__ volatile("nop");
+    }
+
     unsigned long cpio_len = (unsigned long)
         (_userland_cpio_end - _userland_cpio_start);
     tm_set_userland_cpio(_userland_cpio_start, cpio_len);

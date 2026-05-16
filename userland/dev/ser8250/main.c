@@ -214,6 +214,30 @@ int main(int argc, char **argv, char **envp)
             break;
         }
 
+        case TM_REQ_FSTAT: {
+            /* Report ourselves as a character device so isatty()
+             * returns 1 in the client.  Without this, qsh's main()
+             * skips the SF_TTY path and the in-house line editor
+             * (with arrow-key history) never engages on /dev/ser1. */
+            tm_stat_t *st = (tm_stat_t *)&s_reply_buf[32];
+            unsigned char *zero = (unsigned char *)st;
+            for (unsigned i = 0; i < sizeof *st; ++i) zero[i] = 0;
+            st->st_dev     = 5;             /* synthetic — matches console */
+            st->st_ino     = 2;
+            st->st_mode    = TM_S_IFCHR | 0666;
+            st->st_nlink   = 1;
+            st->st_rdev    = (5UL << 8) | 2;
+            st->st_blksize = 256;
+            unsigned want = (unsigned)sizeof *st;
+            for (unsigned i = 0; i < 32; ++i) s_reply_buf[i] = 0;
+            s_reply_buf[0] = (unsigned char)( want       & 0xff);
+            s_reply_buf[1] = (unsigned char)((want >> 8) & 0xff);
+            s_reply_buf[2] = (unsigned char)((want >>16) & 0xff);
+            s_reply_buf[3] = (unsigned char)((want >>24) & 0xff);
+            MsgReply(rcvid, 0, s_reply_buf, 32 + sizeof *st);
+            break;
+        }
+
         case TM_REQ_IO_READ: {
             unsigned want = mr0;
             if (want == 0) want = 1;

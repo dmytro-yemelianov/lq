@@ -21,6 +21,7 @@
 
 #define PATHMGR_NODES     64
 #define PATHMGR_NAME_MAX  30
+#define PATHMGR_TARGET_MAX 128   /* longest symlink target path */
 
 typedef struct pm_node {
     struct pm_node *parent;
@@ -28,8 +29,14 @@ typedef struct pm_node {
     struct pm_node *child;
     tm_pathmgr_obj_t obj;
     unsigned char has_obj;
+    unsigned char is_symlink;
     unsigned char name_len;
+    unsigned char target_len;
     char          name[PATHMGR_NAME_MAX];
+    /* Symlink target (absolute path).  Only valid when is_symlink == 1.
+     * Resolved at lookup time, not at register time, so the symlink
+     * follows repath()s of the target. */
+    char          target[PATHMGR_TARGET_MAX];
 } pm_node_t;
 
 static pm_node_t g_pool[PATHMGR_NODES];
@@ -45,7 +52,9 @@ static pm_node_t *pm_alloc(const char *name, unsigned name_len, pm_node_t *paren
     n->sibling = 0;
     n->child = 0;
     n->has_obj = 0;
+    n->is_symlink = 0;
     n->name_len = (unsigned char)name_len;
+    n->target_len = 0;
     for (unsigned i = 0; i < name_len; ++i) n->name[i] = name[i];
     return n;
 }
@@ -115,12 +124,13 @@ int tm_pathmgr_register(const char *path, const tm_pathmgr_obj_t *obj)
     return 0;
 }
 
-int tm_pathmgr_resolve(const char *path,
-                       tm_pathmgr_obj_t *out,
-                       unsigned *out_consumed_bytes)
+/* Inner walk: longest-prefix lookup, possibly stopping early at a
+ * symlink node.  Returns the deepest matching node or 0.  When a
+ * symlink stops the walk, *out_is_symlink is set to 1. */
+static pm_node_t *pm_walk(const char *path,
+                          const char **out_deepest_p,
+                          int *out_is_symlink)
 {
-    if (!path || path[0] != '/' || !out || !g_root) return -EINVAL;
-
     pm_node_t *node = g_root;
     pm_node_t *deepest = 0;
     const char *deepest_p = path;
@@ -128,13 +138,10 @@ int tm_pathmgr_resolve(const char *path,
     const char *comp;
     unsigned len;
 
-    /* Root itself may carry an object (cpiofs mounted at "/"). If it
-     * does, that's our initial deepest match; later components only
-     * override if they find something more specific. */
+    *out_is_symlink = 0;
+
     if (g_root->has_obj) {
         deepest = g_root;
-        /* "consumed" for a root match: 1 if path starts with '/', 0
-         * for empty path (already rejected above). */
         deepest_p = path + 1;
     }
 
@@ -142,13 +149,57 @@ int tm_pathmgr_resolve(const char *path,
         pm_node_t *child = pm_find_child(node, comp, len);
         if (!child) break;
         node = child;
+        /* Symlinks short-circuit: hand the node back so the caller
+         * can re-resolve via the target.  Symlinks are leaf entries
+         * (no children); a longer path under a symlink isn't valid
+         * for v0.8 — would need POSIX-style realpath. */
+        if (node->is_symlink) {
+            deepest = node;
+            deepest_p = p;
+            *out_is_symlink = 1;
+            break;
+        }
         if (node->has_obj) {
             deepest = node;
-            deepest_p = p;  /* points just past this component's tail */
+            deepest_p = p;
         }
     }
 
+    *out_deepest_p = deepest_p;
+    return deepest;
+}
+
+int tm_pathmgr_resolve(const char *path,
+                       tm_pathmgr_obj_t *out,
+                       unsigned *out_consumed_bytes)
+{
+    if (!path || path[0] != '/' || !out || !g_root) return -EINVAL;
+
+    const char *deepest_p = path;
+    int is_symlink = 0;
+    pm_node_t *deepest = pm_walk(path, &deepest_p, &is_symlink);
     if (!deepest) return -ENOENT;
+
+    /* Symlink: re-walk via the target path.  One level only — chains
+     * are not supported in v0.8 and would just reject as ENOENT. */
+    if (is_symlink) {
+        const char *target_p = deepest_p;        /* unused for second walk */
+        int target_is_symlink = 0;
+        pm_node_t *target = pm_walk(deepest->target, &target_p,
+                                    &target_is_symlink);
+        if (!target || target_is_symlink || !target->has_obj) {
+            return -ENOENT;
+        }
+        *out = target->obj;
+        /* For symlinks we report the link's own consumed length,
+         * not the target's — the open path that the caller passed
+         * was the LINK, and any sub-path under the link is on it. */
+        if (out_consumed_bytes) {
+            *out_consumed_bytes = (unsigned)(deepest_p - path);
+        }
+        return 0;
+    }
+
     *out = deepest->obj;
     if (out_consumed_bytes) *out_consumed_bytes = (unsigned)(deepest_p - path);
     return 0;
@@ -171,5 +222,35 @@ int tm_pathmgr_repath(const char *path, const tm_pathmgr_obj_t *new_obj)
     }
     if (!node->has_obj) return -ENOENT;
     node->obj = *new_obj;
+    return 0;
+}
+
+int tm_pathmgr_symlink(const char *link_path, const char *target_path)
+{
+    if (!link_path || link_path[0] != '/' || !g_root) return -EINVAL;
+    if (!target_path || target_path[0] != '/')        return -EINVAL;
+    unsigned tlen = 0;
+    while (target_path[tlen]) ++tlen;
+    if (tlen == 0 || tlen >= PATHMGR_TARGET_MAX)      return -EINVAL;
+
+    /* Grow the tree to the link path (same pattern as register). */
+    pm_node_t *node = g_root;
+    const char *p = link_path;
+    const char *comp;
+    unsigned len;
+    while (pm_next_component(&p, &comp, &len)) {
+        pm_node_t *child = pm_find_child(node, comp, len);
+        if (!child) {
+            child = pm_add_child(node, comp, len);
+            if (!child) return -ENOMEM;
+        }
+        node = child;
+    }
+    if (node->has_obj || node->is_symlink) return -EEXIST;
+
+    node->is_symlink = 1;
+    node->target_len = (unsigned char)tlen;
+    for (unsigned i = 0; i < tlen; ++i) node->target[i] = target_path[i];
+    node->target[tlen] = 0;
     return 0;
 }

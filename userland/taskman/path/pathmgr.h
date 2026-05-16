@@ -65,4 +65,13 @@ int tm_pathmgr_resolve(const char *path,
  * already be registered; this isn't a create-or-update. */
 int tm_pathmgr_repath(const char *path, const tm_pathmgr_obj_t *new_obj);
 
+/* v0.8: create a pathmgr symlink.  After this call, resolving
+ * `link_path` walks the registered target_path and returns whatever
+ * IT resolves to — i.e. a symlink to /dev/console follows the
+ * console wherever it's repath'd.  Maximum one redirection per
+ * resolve (no chained symlinks for v0.8).  Returns 0 on success,
+ * -EINVAL on bad input, -ENOMEM if the pool is full, -EEXIST if
+ * link_path is already registered with a different attachment. */
+int tm_pathmgr_symlink(const char *link_path, const char *target_path);
+
 #endif /* QSOE_TASKMAN_PATHMGR_H */

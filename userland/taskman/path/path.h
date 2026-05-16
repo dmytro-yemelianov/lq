@@ -16,38 +16,9 @@
 #include "../sel4_types.h"
 #include <qsoe-system.h>
 
-/* POSIX `struct stat` byte-for-byte for RISC-V64 musl.  Built into the
- * fstat reply payload at msg[4..]; libc/qsoe's fstat.c copies the
- * bytes into the user-supplied struct stat.  Field types are spelled
- * out with concrete widths because taskman compiles -nostdinc and so
- * can't pull in musl's sys/types.h. */
-typedef struct {
-    unsigned long      st_dev;
-    unsigned long      st_ino;
-    unsigned int       st_mode;
-    unsigned int       st_nlink;
-    unsigned int       st_uid;
-    unsigned int       st_gid;
-    unsigned long      st_rdev;
-    unsigned long      __pad;
-    long               st_size;
-    int                st_blksize;
-    int                __pad2;
-    long               st_blocks;
-    long               st_atim_sec;
-    long               st_atim_nsec;
-    long               st_mtim_sec;
-    long               st_mtim_nsec;
-    long               st_ctim_sec;
-    long               st_ctim_nsec;
-    unsigned int       __unused[2];
-} tm_stat_t;
-
-/* Mode bits we need; matches POSIX / sys/stat.h. */
-#define TM_S_IFMT   0170000
-#define TM_S_IFREG  0100000
-#define TM_S_IFCHR  0020000
-#define TM_S_IFDIR  0040000
+/* `tm_stat_t` + TM_S_IF* now live in <qsoe-system.h> so external
+ * resmgrs (devc-ser8250 etc.) can answer TM_REQ_FSTAT without
+ * pulling in taskman-internal headers. */
 
 /* OPEN: open a path on behalf of `caller`.  path bytes start at
  * the IPC buffer's msg[4]; path_len in mr0.  Returns 0 + writes

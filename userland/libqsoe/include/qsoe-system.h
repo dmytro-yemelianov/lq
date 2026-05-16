@@ -70,6 +70,7 @@ typedef unsigned int  gid_t;
 #define ENOMEM         12
 #define EFAULT         14
 #define EBUSY          16
+#define EEXIST         17
 #define ENODEV         19
 #define ENOTDIR        20
 #define EISDIR         21
@@ -84,6 +85,40 @@ typedef unsigned int  gid_t;
 #define ENAMETOOLONG   36
 #define ENOSYS         89
 #define EHOSTUNREACH  113
+
+/* POSIX `struct stat` byte-for-byte for RISC-V64 musl.  Built into
+ * the FSTAT reply payload at msg[4..]; libc/qsoe's fstat.c copies
+ * these bytes into the user-supplied struct stat.  Field widths are
+ * spelled with concrete unsigned long / unsigned int so the wire
+ * shape is independent of any libc header.  Lives here (in libqsoe)
+ * because resmgrs hand-build it without taskman includes. */
+typedef struct {
+    unsigned long      st_dev;
+    unsigned long      st_ino;
+    unsigned int       st_mode;
+    unsigned int       st_nlink;
+    unsigned int       st_uid;
+    unsigned int       st_gid;
+    unsigned long      st_rdev;
+    unsigned long      __pad;
+    long               st_size;
+    int                st_blksize;
+    int                __pad2;
+    long               st_blocks;
+    long               st_atim_sec;
+    long               st_atim_nsec;
+    long               st_mtim_sec;
+    long               st_mtim_nsec;
+    long               st_ctim_sec;
+    long               st_ctim_nsec;
+    unsigned int       __unused[2];
+} tm_stat_t;
+
+/* Mode bits matching POSIX <sys/stat.h>. */
+#define TM_S_IFMT   0170000
+#define TM_S_IFREG  0100000
+#define TM_S_IFCHR  0020000
+#define TM_S_IFDIR  0040000
 
 int ChannelCreate(unsigned flags);
 int ChannelDestroy(int chid);
