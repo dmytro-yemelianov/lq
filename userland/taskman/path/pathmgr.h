@@ -25,15 +25,18 @@
 #define PATHMGR_HANDLER_EXTERNAL        0
 #define PATHMGR_HANDLER_TASKMAN_CONSOLE 1
 #define PATHMGR_HANDLER_TASKMAN_CPIOFS  2  /* v0.6.0 */
+#define PATHMGR_HANDLER_TASKMAN_NULL    3  /* v0.8.0 */
+#define PATHMGR_HANDLER_TASKMAN_ZERO    4  /* v0.8.0 */
 
-/* Internal taskman channel ids beyond the primary (1). The console
- * and cpiofs channels both share the primary endpoint;
- * (TASKMAN_PID, *_CHID) is registered in the channel table so
- * ConnectAttach can mint badged Send caps onto them, and the
- * dispatch loop routes IO_WRITE/IO_READ by checking which channel
- * each badge points at. */
+/* Internal taskman channel ids beyond the primary (1). All share the
+ * primary endpoint; (TASKMAN_PID, *_CHID) is registered in the
+ * channel table so ConnectAttach can mint badged Send caps onto
+ * them, and the dispatch loop routes IO_WRITE/IO_READ by checking
+ * which channel each badge points at. */
 #define TM_CONSOLE_CHID  2
 #define TM_CPIOFS_CHID   3
+#define TM_DEVNULL_CHID  4
+#define TM_DEVZERO_CHID  5
 
 typedef struct tm_pathmgr_obj {
     pid_t    server_pid;

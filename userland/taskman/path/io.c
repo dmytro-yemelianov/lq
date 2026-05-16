@@ -11,6 +11,8 @@
 #include "pathmgr.h"
 #include "cpiofs.h"
 #include "../sys/console.h"
+#include "../sys/devnull.h"
+#include "../sys/devzero.h"
 #include "../proc/proc.h"
 #include "../qsoe_invoke.h"
 #include "../../libqsoe/include/qsoe/wire.h"
@@ -69,6 +71,10 @@ int tm_io_close(pid_t caller, seL4_Word badge)
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
         return 0;   /* console has no per-fd state */
     }
+    if (srv_pid == QSOE_PID_TASKMAN &&
+        (srv_chid == TM_DEVNULL_CHID || srv_chid == TM_DEVZERO_CHID)) {
+        return 0;   /* /dev/null and /dev/zero are stateless too */
+    }
     /* External resmgrs (e.g. /sbin/pipe): they receive TM_REQ_CLOSE
      * directly on their own channel (the fd's cap points at them);
      * taskman never sees those.  Reply cleanly. */
@@ -88,6 +94,14 @@ int tm_io_write(pid_t caller, seL4_Word badge, unsigned bytes,
         *out_written = tm_console_write(bytes);
         return 0;
     }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_DEVNULL_CHID) {
+        *out_written = tm_devnull_write(bytes);
+        return 0;
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_DEVZERO_CHID) {
+        *out_written = tm_devzero_write(bytes);
+        return 0;
+    }
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
         return -EROFS;  /* cpiofs is read-only */
     }
@@ -104,6 +118,12 @@ int tm_io_read(pid_t caller, seL4_Word badge, unsigned want,
 
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
         return tm_console_read(want, out_got);
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_DEVNULL_CHID) {
+        return tm_devnull_read(want, out_got);
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_DEVZERO_CHID) {
+        return tm_devzero_read(want, out_got);
     }
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
         return tm_cpiofs_read(badge, want, out_got);
@@ -141,9 +161,11 @@ int tm_unlink(pid_t caller, unsigned path_len)
         if (tm_cpiofs_probe(name) != 0) return -ENOENT;
         return -EROFS;
     }
-    if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CONSOLE) {
-        /* /dev/console exists, but it's a device node — unlinking
-         * it has no meaning under QSOE.  POSIX-y reply: EPERM. */
+    if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CONSOLE ||
+        obj.handler_kind == PATHMGR_HANDLER_TASKMAN_NULL ||
+        obj.handler_kind == PATHMGR_HANDLER_TASKMAN_ZERO) {
+        /* Device nodes — unlinking them has no meaning under QSOE.
+         * POSIX-y reply: EPERM. */
         return -EPERM;
     }
     /* External resmgrs forward unlink through their own protocol;
@@ -164,6 +186,18 @@ int tm_fstat(pid_t caller, seL4_Word badge, unsigned *out_bytes)
 
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
         int rc = tm_console_stat(out);
+        if (rc) return rc;
+        *out_bytes = (unsigned)sizeof *out;
+        return 0;
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_DEVNULL_CHID) {
+        int rc = tm_devnull_stat(out);
+        if (rc) return rc;
+        *out_bytes = (unsigned)sizeof *out;
+        return 0;
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_DEVZERO_CHID) {
+        int rc = tm_devzero_stat(out);
         if (rc) return rc;
         *out_bytes = (unsigned)sizeof *out;
         return 0;
@@ -207,8 +241,10 @@ int tm_readlink(pid_t caller, unsigned path_len, unsigned *out_bytes)
         if (tm_cpiofs_probe(name) != 0) return -ENOENT;
         return -EINVAL;                    /* exists but not a symlink */
     }
-    if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CONSOLE) {
-        return -EINVAL;                    /* /dev/console isn't a symlink */
+    if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CONSOLE ||
+        obj.handler_kind == PATHMGR_HANDLER_TASKMAN_NULL ||
+        obj.handler_kind == PATHMGR_HANDLER_TASKMAN_ZERO) {
+        return -EINVAL;                    /* device nodes aren't symlinks */
     }
     return -EINVAL;
 }

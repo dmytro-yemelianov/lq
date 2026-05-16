@@ -654,6 +654,16 @@ int main(seL4_BootInfo *bi)
         sel4_debug_puts("FATAL: failed to register cpiofs channel\n");
         for (;;) __asm__ volatile("nop");
     }
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_DEVNULL_CHID,
+                                      primary_ep, primary_ep) != 0) {
+        sel4_debug_puts("FATAL: failed to register /dev/null channel\n");
+        for (;;) __asm__ volatile("nop");
+    }
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_DEVZERO_CHID,
+                                      primary_ep, primary_ep) != 0) {
+        sel4_debug_puts("FATAL: failed to register /dev/zero channel\n");
+        for (;;) __asm__ volatile("nop");
+    }
 
     tm_pathmgr_init();
     {
@@ -689,6 +699,34 @@ int main(seL4_BootInfo *bi)
     if (tm_pathmgr_symlink("/dev/tty", "/dev/console") != 0) {
         sel4_debug_puts("FATAL: pathmgr symlink /dev/tty failed\n");
         for (;;) __asm__ volatile("nop");
+    }
+    /* /dev/null and /dev/zero — POSIX-essential pseudo-devices,
+     * each backed by a trivial taskman-internal resmgr (sys/devnull.c
+     * and sys/devzero.c).  Different chids so path/io.c dispatch
+     * can pick the right handler. */
+    {
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = QSOE_PID_TASKMAN,
+            .server_chid  = TM_DEVNULL_CHID,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_TASKMAN_NULL,
+        };
+        if (tm_pathmgr_register("/dev/null", &obj) != 0) {
+            sel4_debug_puts("FATAL: pathmgr register /dev/null failed\n");
+            for (;;) __asm__ volatile("nop");
+        }
+    }
+    {
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = QSOE_PID_TASKMAN,
+            .server_chid  = TM_DEVZERO_CHID,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_TASKMAN_ZERO,
+        };
+        if (tm_pathmgr_register("/dev/zero", &obj) != 0) {
+            sel4_debug_puts("FATAL: pathmgr register /dev/zero failed\n");
+            for (;;) __asm__ volatile("nop");
+        }
     }
 
     unsigned long cpio_len = (unsigned long)

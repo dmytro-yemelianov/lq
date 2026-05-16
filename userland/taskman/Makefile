@@ -143,6 +143,8 @@ TASKMAN_OBJS := \
     $(OBJDIR)/path/cpiofs.o \
     $(OBJDIR)/path/io.o \
     $(OBJDIR)/sys/console.o \
+    $(OBJDIR)/sys/devnull.o \
+    $(OBJDIR)/sys/devzero.o \
     $(OBJDIR)/cpio.o \
     $(OBJDIR)/userland_archive.o
 
