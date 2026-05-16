@@ -137,13 +137,26 @@ const void *tm_cpio_lookup(const char *name, unsigned long *out_size)
  * matching close (well, leaked for v0.7 since we don't yet plumb a
  * cpiofs-side close hook; the table is bounded so this self-throttles
  * to TM_CPIOFS_MAX_DIRS open directories simultaneously). */
-#define TM_CPIOFS_MAX_DIRS 16
+#define TM_CPIOFS_MAX_DIRS         16
+#define TM_CPIOFS_MAX_SUBDIRS_SEEN 16   /* per-open subdir-dedup cap */
+#define TM_CPIOFS_SUBDIR_NAMELEN   24   /* per-name byte budget (incl. NUL) */
 static struct {
     seL4_Word badge;       /* 0 = unused */
     char      prefix[64];  /* e.g. "" (root) or "bin/" — incl. trailing '/' */
     unsigned  prefix_len;
     unsigned  next_idx;    /* next CPIO entry index to inspect */
-    char      last_subdir[64];   /* last subdir name returned (dedup) */
+
+    /* Subdir dedup: the CPIO archive can interleave entries from
+     * different subdirs (e.g. sbin/init, bin/tester, sbin/pipe), so
+     * a single-slot "last returned" dedup yields duplicates.  We
+     * track every subdir name returned so far in this opendir
+     * session; readdir skips a candidate that matches any prior
+     * entry.  The cap is `MAX_SUBDIRS_SEEN`; if the directory has
+     * more subdirs than that, the overflow ones get listed multiple
+     * times — bump the constant if it ever bites. */
+    unsigned  subdirs_seen_n;
+    char      subdirs_seen[TM_CPIOFS_MAX_SUBDIRS_SEEN]
+                          [TM_CPIOFS_SUBDIR_NAMELEN];
 } g_cpiofs_dirs[TM_CPIOFS_MAX_DIRS];
 
 static unsigned q_strlen(const char *s)
@@ -160,10 +173,10 @@ static int dir_slot_alloc(seL4_Word badge, const char *prefix)
             for (unsigned k = 0; k <= len; ++k) {
                 g_cpiofs_dirs[i].prefix[k] = prefix[k];
             }
-            g_cpiofs_dirs[i].prefix_len     = len;
-            g_cpiofs_dirs[i].next_idx       = 0;
-            g_cpiofs_dirs[i].last_subdir[0] = 0;
-            g_cpiofs_dirs[i].badge          = badge;
+            g_cpiofs_dirs[i].prefix_len      = len;
+            g_cpiofs_dirs[i].next_idx        = 0;
+            g_cpiofs_dirs[i].subdirs_seen_n  = 0;
+            g_cpiofs_dirs[i].badge           = badge;
             return i;
         }
     }
@@ -421,25 +434,37 @@ int tm_cpiofs_readdir(seL4_Word badge, char *name_out,
         while (rel[sep] && rel[sep] != '/') ++sep;
 
         if (rel[sep] == '/') {
-            /* Subdirectory entry — dedup against last_subdir. */
-            int same = 1;
-            for (unsigned k = 0; k < sep; ++k) {
-                if (g_cpiofs_dirs[slot_idx].last_subdir[k] != rel[k]) {
-                    same = 0; break;
-                }
-            }
-            if (same && g_cpiofs_dirs[slot_idx].last_subdir[sep] == 0) {
-                /* Already returned this subdir — skip. */
-                continue;
-            }
-            if (sep >= sizeof g_cpiofs_dirs[slot_idx].last_subdir) {
+            /* Subdirectory entry — skip if we already returned this
+             * name during the current opendir() session. */
+            if (sep + 1 > TM_CPIOFS_SUBDIR_NAMELEN) {
                 continue;  /* name too long; skip rather than truncate */
             }
-            for (unsigned k = 0; k < sep; ++k) {
-                g_cpiofs_dirs[slot_idx].last_subdir[k] = rel[k];
-                name_out[k] = rel[k];
+            int seen = 0;
+            for (unsigned s = 0;
+                 s < g_cpiofs_dirs[slot_idx].subdirs_seen_n; ++s) {
+                int match = 1;
+                for (unsigned k = 0; k < sep; ++k) {
+                    if (g_cpiofs_dirs[slot_idx].subdirs_seen[s][k]
+                        != rel[k]) { match = 0; break; }
+                }
+                if (match &&
+                    g_cpiofs_dirs[slot_idx].subdirs_seen[s][sep] == 0) {
+                    seen = 1;
+                    break;
+                }
             }
-            g_cpiofs_dirs[slot_idx].last_subdir[sep] = 0;
+            if (seen) continue;
+
+            /* Record (if there's room) and return. */
+            if (g_cpiofs_dirs[slot_idx].subdirs_seen_n
+                < TM_CPIOFS_MAX_SUBDIRS_SEEN) {
+                unsigned s = g_cpiofs_dirs[slot_idx].subdirs_seen_n++;
+                for (unsigned k = 0; k < sep; ++k) {
+                    g_cpiofs_dirs[slot_idx].subdirs_seen[s][k] = rel[k];
+                }
+                g_cpiofs_dirs[slot_idx].subdirs_seen[s][sep] = 0;
+            }
+            for (unsigned k = 0; k < sep; ++k) name_out[k] = rel[k];
             name_out[sep] = 0;
             *namelen_out = sep;
             *d_type_out  = 4;  /* DT_DIR */
