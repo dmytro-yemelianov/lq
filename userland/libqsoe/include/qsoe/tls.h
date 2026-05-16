@@ -46,6 +46,12 @@ typedef struct qsoe_tcb {
      * the signal thread evolves to consult it (v0.7 delivery is
      * mask-unaware; the storage works regardless). */
     unsigned char sig_mask[128];
+
+    /* v0.8 interrupt-attach state.  InterruptAttachThread sets this
+     * to the iid (1-based; 0 means "no attach") so InterruptWait
+     * can find its bound notification.  One attach per thread for
+     * now — multi-IRQ-per-thread is a later refinement. */
+    int           irq_iid;
 } qsoe_tcb_t;
 
 /* The main thread of every process has static storage so the crt0 can

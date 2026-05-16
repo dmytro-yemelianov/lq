@@ -55,14 +55,21 @@ struct elf64_phdr {
 #define PF_R    4
 
 /* Scratch vaddr in taskman's VSpace, used to memcpy ELF bytes into a
- * frame before we Page_Map that frame into the child's VSpace. The
- * value MUST be above taskman.elf's own image range (otherwise spawn
- * fails with "vaddr already mapped") AND within the [0..2MB] Sv39
- * L2-leaf region that the kernel already created intermediate page
- * tables for (otherwise FrameMap fails with "missing PT").
- * 0x180000 = 1.5 MB sits comfortably above the image (~1.4 MB) and
- * still inside the kernel-prepared 2 MB region. */
-#define TM_SCRATCH_VADDR 0x180000UL
+ * frame before we Page_Map that frame into the child's VSpace.
+ *
+ * Constraints — the value MUST be:
+ *   1. above taskman.elf's image range AND above the IPC buffer
+ *      / BootInfo / extra-BI (DTB) frames the kernel places
+ *      immediately after the image (otherwise "vaddr already mapped"),
+ *   2. below CHILD_STACK_BASE (0x1FC000),
+ *   3. inside the kernel-prepared [0, 0x200000) L0 region (otherwise
+ *      FrameMap fails with "missing PT").
+ *
+ * v0.7: image was ~1.4 MB, extras at ~0x180000, 0x180000 worked.
+ * v0.8: image is ~1.5 MB, extras (with the FDT chunk) span up to
+ * ~0x190000, so we land scratch at 0x1F8000 — the page just below
+ * the 2-page stack at 0x1FC000.  Always safe up to image ≈ 1.95 MB. */
+#define TM_SCRATCH_VADDR 0x1F8000UL
 
 /* Child VSpace layout. Image, stack, and IPC buffer share the first
  * 2 MiB region [0, 0x200000) and use one L1 + one L0 PT. The heap

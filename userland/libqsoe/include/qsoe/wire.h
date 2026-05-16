@@ -45,6 +45,18 @@ enum {
      * (caller buffer too small) / ENOSYS (syscfg not built yet). */
     TM_REQ_GET_SYSCFG           = 0x004,
 
+    /* v0.8: thread-bound IRQ attach for the QNX/QRV-style Interrupt*
+     * API.  MR0 = PLIC IRQ number, MR1 = trigger (0 = level, 1 = edge).
+     * Reply MR0 = handler-cap slot, MR1 = notification-cap slot, both
+     * minted into the caller's CSpace.  Library binds the two via
+     * qsoe_irq_set_notification and tracks the pair in a per-process
+     * attach table indexed by iid. */
+    TM_REQ_IRQ_ATTACH           = 0x005,
+    /* Symmetric tear-down: MR0 = handler-cap slot, MR1 = ntfn-cap slot.
+     * Taskman revokes the IRQ binding and returns the slots to the
+     * caller's empty pool. */
+    TM_REQ_IRQ_DETACH           = 0x006,
+
     /* ---------- procmgr (0x100..0x1FF) ---------- */
     TM_REQ_CHANNEL_CREATE       = 0x100,
     TM_REQ_CHANNEL_DESTROY      = 0x101,

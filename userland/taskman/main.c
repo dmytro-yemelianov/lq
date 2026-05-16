@@ -23,6 +23,7 @@
 #include "path/pathmgr.h"
 #include "path/cpiofs.h"
 #include "sys/console.h"
+#include "sys/irq.h"
 #include "sys/platform.h"
 #include "sys/syscfg.h"
 
@@ -79,6 +80,23 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         }
         *out_mr0 = (seL4_Word)hz;
         reply_len = 1;
+        break;
+    }
+    case TM_REQ_IRQ_ATTACH: {
+        /* mr0 = PLIC IRQ number, mr1 = trigger.  Reply mr0 = handler
+         * slot, mr1 = ntfn slot — both in the caller's CSpace. */
+        seL4_CPtr h = 0, n = 0;
+        int rc = tm_irq_attach(caller, (unsigned)mr0, (unsigned)mr1,
+                                &h, &n);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)h;
+        *out_mr1 = (seL4_Word)n;
+        reply_len = 2;
+        break;
+    }
+    case TM_REQ_IRQ_DETACH: {
+        int rc = tm_irq_detach(caller, (seL4_CPtr)mr0, (seL4_CPtr)mr1);
+        if (rc) err = (seL4_Word)(-rc);
         break;
     }
     case TM_REQ_GET_SYSCFG: {

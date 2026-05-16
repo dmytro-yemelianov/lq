@@ -146,6 +146,7 @@ TASKMAN_OBJS := \
     $(OBJDIR)/sys/devnull.o \
     $(OBJDIR)/sys/devzero.o \
     $(OBJDIR)/sys/fdt.o \
+    $(OBJDIR)/sys/irq.o \
     $(OBJDIR)/sys/syscfg.o \
     $(OBJDIR)/cpio.o \
     $(OBJDIR)/userland_archive.o

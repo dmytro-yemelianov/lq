@@ -563,4 +563,43 @@ long qsoe_ldisc_readbyte(qsoe_ldisc_t *ld, unsigned char *c);
  * is expanded to "\r\n" before transmission. */
 long qsoe_ldisc_write(qsoe_ldisc_t *ld, const void *buf, unsigned long n);
 
+/* ------------------------------------------------------------------
+ * QNX/QRV-compatible thread-bound interrupt API.
+ *
+ * Layers over libqsoe's low-level qsoe_irq_set_notification / _wait /
+ * _ack primitives.  v0.8 supports at most one attach per thread:
+ *   tid = InterruptAttachThread(vector, flags);
+ *   for (;;) {
+ *       InterruptWait(0, NULL);
+ *       ...handle...
+ *       InterruptUnmask(vector, tid);
+ *   }
+ *
+ * vector is the kernel-side IRQ vector number.  On RISC-V QSOE uses
+ * QSOE_PLIC_VECTOR_BASE (32) + plic_irq_num, mirroring the QRV layout
+ * (so QRV code that computes the vector the same way ports unchanged).
+ * ------------------------------------------------------------------ */
+#define QSOE_PLIC_VECTOR_BASE   32
+
+/* Flag bits for InterruptAttachThread (QRV-compatible names). */
+#define QSOE_INTR_FLAGS_END         0x01
+#define QSOE_INTR_FLAGS_NO_UNMASK   0x02
+#define QSOE_INTR_FLAGS_PROCESS     0x04
+#define QSOE_INTR_FLAGS_TRK_MSK     0x08
+#define QSOE_INTR_FLAGS_EXCLUSIVE   0x10
+
+/* Flag bits for InterruptWait. */
+#define QSOE_INTR_WAIT_FLAGS_UNMASK 0x01
+#define QSOE_INTR_WAIT_FLAGS_FAST   0x02
+
+/* QSOE_TCTL_IO — QNX-compat thread-control command for I/O privilege
+ * escalation.  Honored by the existing ThreadCtl() (thread.c) as a
+ * no-op on RISC-V since MMIO is gated by VSpace mappings instead. */
+#define QSOE_TCTL_IO                1
+
+int InterruptAttachThread(int vector, unsigned flags);
+int InterruptDetach(int iid);
+int InterruptWait(int flags, const uint64_t *timeout);
+int InterruptUnmask(int vector, int iid);
+
 #endif /* QSOE_SYSTEM_H */

@@ -256,6 +256,12 @@ int ThreadCtl(int cmd, void *data)
         t->runmask = *(unsigned *)data;
         return 0;
     }
+    case QSOE_TCTL_IO:
+        /* QNX/QRV compat: x86 I/O-port privilege escalation.  On
+         * RISC-V there's no privileged-port concept, and MMIO is
+         * gated by VSpace mappings (which mmap(MAP_PHYS) handles).
+         * So this is a no-op success. */
+        return 0;
     default:
         qsoe_errno = ENOSYS;
         return -1;
