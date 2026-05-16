@@ -22,8 +22,8 @@
 #include "../qsoe_invoke.h"
 #include "../tm_log.h"
 
-#define TM_SYNC_MAX_ENTRIES   64    /* (pid, addr) tuples in flight  */
-#define TM_SYNC_MAX_WAITERS    8    /* per-entry parked thread cap   */
+#define TM_SYNC_MAX_ENTRIES   16    /* (pid, addr) tuples in flight  */
+#define TM_SYNC_MAX_WAITERS    4    /* per-entry parked thread cap   */
 
 typedef struct {
     pid_t         pid;

@@ -438,6 +438,14 @@ sbin-pci-server: $(LIBQSOE_A) $(LIBC_A)
 $(SBIN_PCI_ELF): | sbin-pci-server
 	@true
 
+# userland/utils — single-file utilities (ls / cat / future echo /
+# pwd / etc.).  One .c per binary; the subdir's Makefile globs and
+# builds each into $(BUILD)/utils/<name>.elf.  The CPIO step below
+# scoops up every .elf via $(wildcard) and copies it to /bin/<name>.
+.PHONY: utils
+utils: $(LIBQSOE_A) $(LIBC_A)
+	+$(MAKE) -C $(TOP)/userland/utils all
+
 # ----------------------------------------------------------------------------
 # Userland CPIO — packs all spawnable binaries (init + tester + qsh +
 # devc-ser8250 + pipe) and gets embedded in taskman.elf via .incbin so
@@ -457,7 +465,8 @@ $(QSH_ELF): | qsh.elf-build
 
 $(USERLAND_CPIO): $(INIT_SH) $(TESTER_ELF) $(DSER_ELF) \
                   $(QSH_ELF) $(SBIN_PIPE_ELF) $(SBIN_REPATH_ELF) \
-                  $(SBIN_SLOGGER_ELF) $(SBIN_PCI_ELF) $(SLOGINFO_ELF)
+                  $(SBIN_SLOGGER_ELF) $(SBIN_PCI_ELF) $(SLOGINFO_ELF) \
+                  | utils
 	@rm -rf $(BUILD)/cpio-root
 	@mkdir -p $(BUILD)/cpio-root/bin $(BUILD)/cpio-root/sbin
 	@install -m 0755 $(INIT_SH) $(BUILD)/cpio-root/sbin/init
@@ -470,10 +479,21 @@ $(USERLAND_CPIO): $(INIT_SH) $(TESTER_ELF) $(DSER_ELF) \
 	@cp $(SBIN_PCI_ELF)      $(BUILD)/cpio-root/sbin/pci-server
 	@cp $(SLOGINFO_ELF)      $(BUILD)/cpio-root/bin/sloginfo
 	@ln -sf qsh $(BUILD)/cpio-root/bin/sh
+	@# userland/utils — copy every $(BUILD)/utils/<name>.elf to
+	@# $(BUILD)/cpio-root/bin/<name>, then add bin/<name> to the
+	@# filelist below.
+	@for f in $(wildcard $(BUILD)/utils/*.elf); do \
+	     base=$$(basename $$f .elf); \
+	     cp "$$f" $(BUILD)/cpio-root/bin/$$base; \
+	 done
 	@cd $(BUILD)/cpio-root && \
-	    printf '%s\n' sbin/init bin/tester bin/qsh bin/sh \
-	                  sbin/devc-ser8250 sbin/pipe sbin/repath \
-	                  sbin/slogger sbin/pci-server bin/sloginfo | \
+	    { printf '%s\n' sbin/init bin/tester bin/qsh bin/sh \
+	                    sbin/devc-ser8250 sbin/pipe sbin/repath \
+	                    sbin/slogger sbin/pci-server bin/sloginfo; \
+	      for f in $(notdir $(basename $(wildcard $(BUILD)/utils/*.elf))); do \
+	          echo bin/$$f; \
+	      done; \
+	    } | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)

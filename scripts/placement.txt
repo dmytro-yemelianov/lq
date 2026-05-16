@@ -649,3 +649,19 @@ projects/musllibc/patches/arch/riscv64/             userland/libc/patches/arch/r
 
 # Network: no TCP/IP stack in QSOE yet; whole subsystem out.
 !userland/libc/src/network/
+
+# === musllibc: passwd/group/shadow parsers replaced by QRV-derived
+# QSOE-native versions ===
+# musl's src/passwd/getpwent.c / getgrent.c / getspent.c / getspnam.c /
+# getspnam_r.c implement the same public surface QRV already has under
+# Apache-2.0 (in lib/libc/qrv/, written for QRV).  We carry the QRV
+# versions in userland/libc/qsoe/ so they survive the eventual musl
+# replacement (~v0.10-v0.15) without re-porting.  The musl `_a` /
+# nscd_query helpers are unreferenced by our versions and stay in the
+# tree harmlessly (the linker drops unreferenced .o files when the
+# archive is consumed).
+!userland/libc/src/passwd/getpwent.c
+!userland/libc/src/passwd/getgrent.c
+!userland/libc/src/passwd/getspent.c
+!userland/libc/src/passwd/getspnam.c
+!userland/libc/src/passwd/getspnam_r.c

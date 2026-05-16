@@ -1,8 +1,11 @@
 /*
  * devc-ser8250 — 16550 UART resource manager.
  *
- * QSOE's first userland-process resmgr.  Spawned by /sbin/init,
- * driven by PLIC interrupts via a dedicated higher-priority thread.
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Serial port resource manager.
+ * Driven by PLIC interrupts via a dedicated higher-priority thread.
  *
  * Architecture (matches QRV's pattern, in clean-room re-implementation):
  *
@@ -23,13 +26,6 @@
  * ring and the main thread pops from the ring on IO_READ.  If the
  * ring is empty, the read is parked via MsgSavereply and woken when
  * the next IRQ-thread pulse arrives.
- *
- * v0.7-rc3: rewritten to use ONLY libqsoe + libc per the "no seL4
- * surface in resmgrs" rule (CLAUDE.md).  All inter-thread plumbing
- * goes through <qsoe-system.h> primitives.
- *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
- * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdio.h>

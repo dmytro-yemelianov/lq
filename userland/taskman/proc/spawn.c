@@ -65,11 +65,17 @@ struct elf64_phdr {
  *   3. inside the kernel-prepared [0, 0x200000) L0 region (otherwise
  *      FrameMap fails with "missing PT").
  *
- * v0.7: image was ~1.4 MB, extras at ~0x180000, 0x180000 worked.
- * v0.8: image is ~1.5 MB, extras (with the FDT chunk) span up to
- * ~0x190000, so we land scratch at 0x1F8000 — the page just below
- * the 2-page stack at 0x1FC000.  Always safe up to image ≈ 1.95 MB. */
-#define TM_SCRATCH_VADDR 0x1F8000UL
+ * Growth history:
+ *   v0.7  image ≈ 1.4 MB, extras at ~0x180000 → scratch at 0x180000
+ *   v0.8  image ≈ 1.5 MB, extras span to ~0x190000 → scratch at 0x1F8000
+ *   rc3   image ≈ 1.9 MB (tm_log + sync.c bulk), DTB extras reach
+ *         past 0x1F8000 → scratch bumped to 0x1FE000 (the last 4-K
+ *         page below the 2-MiB L0 region's top).
+ *
+ * If taskman ever exceeds ~2 MiB total image+extras, scratch needs a
+ * fresh L0 PT mapped at a higher VA (e.g. 0x40000000) — this is the
+ * cleanup-when-painful path. */
+#define TM_SCRATCH_VADDR 0x1FE000UL
 
 /* Child VSpace layout. Image, stack, and IPC buffer share the first
  * 2 MiB region [0, 0x200000) and use one L1 + one L0 PT. The heap
