@@ -11,6 +11,9 @@
 echo "[init] starting slogger..."
 /sbin/slogger
 
+echo "[init] starting pci-server..."
+/sbin/pci-server
+
 echo "[init] starting devc-ser8250..."
 /sbin/devc-ser8250
 

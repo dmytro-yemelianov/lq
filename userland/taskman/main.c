@@ -151,7 +151,11 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         const unsigned char *src = (const unsigned char *)blob;
         for (unsigned i = 0; i < want; ++i) dst[i] = src[i];
         *out_mr0 = (seL4_Word)want;
-        reply_len = 1;
+        /* seL4 only copies `length` words of the IPC buffer across the
+         * Call boundary.  Header (mr0..mr3) is 4 words; payload bytes
+         * round up to whole words.  Without this, the client sees only
+         * mr0 and reads stale data from its own IPC buffer. */
+        reply_len = 4 + (want + 7) / 8;
         break;
     }
     case TM_REQ_PING_CLIENTINFO: {

@@ -19,7 +19,7 @@
 #
 # Targets:
 #   make            build build/qsoe.elf            (default)
-#   make run        boot it under qemu-system-riscv64
+#   ./emu.sh        boot it under qemu-system-riscv64
 #   make kernel     build kernel.elf only
 #   make clean      remove build/
 #   make distclean  also remove scripts/sel4test-full/build-qsoe-riscv64/
@@ -73,7 +73,9 @@ DSER_ELF      := $(BUILD)/devc-ser8250.elf
 SBIN_PIPE_ELF := $(BUILD)/sbin-pipe.elf
 SBIN_REPATH_ELF := $(BUILD)/sbin-repath.elf
 SBIN_SLOGGER_ELF := $(BUILD)/sbin-slogger.elf
+SBIN_PCI_ELF  := $(BUILD)/sbin-pci-server.elf
 SLOGINFO_ELF  := $(BUILD)/sloginfo.elf
+LIBPCI_A      := $(BUILD)/libpci.a
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
 # ----------------------------------------------------------------------------
@@ -115,7 +117,8 @@ TM_CFLAGS := $(ARCH_CFLAGS) \
     -fno-builtin -Wall -Wextra \
     -I$(GEN) \
     -I$(CORE)/kernel/sel4_gen \
-    -I$(LIBQSOE_DIR)/include
+    -I$(LIBQSOE_DIR)/include \
+    -I$(TOP)/userland/libpci/include
 
 # ----------------------------------------------------------------------------
 # Source lists
@@ -145,7 +148,7 @@ EL_OBJS := \
 # Default target
 # ----------------------------------------------------------------------------
 
-.PHONY: all image kernel run clean distclean
+.PHONY: all image kernel clean distclean
 .DEFAULT_GOAL := all
 
 all: image
@@ -343,14 +346,14 @@ $(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
 TESTER_OBJS := \
     $(TESTBUILD)/main.o
 
-$(TESTER_ELF): $(BUILD)/crt0.o $(TESTER_OBJS) $(LIBQSOE_A) $(LIBC_A)
+$(TESTER_ELF): $(BUILD)/crt0.o $(TESTER_OBJS) $(LIBQSOE_A) $(LIBPCI_A) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
 	    -o $@ $(BUILD)/crt0.o $(TESTER_OBJS) \
 	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
-	    $(LIBC_A)
+	    $(LIBPCI_A) $(LIBC_A)
 
 # ----------------------------------------------------------------------------
 # init — /sbin/init.  In v0.7-rc3 init became a shell script; taskman
@@ -409,6 +412,25 @@ sloginfo: $(LIBQSOE_A) $(LIBC_A)
 $(SLOGINFO_ELF): | sloginfo
 	@true
 
+# libpci — client wrappers for /dev/pci, static archive at $(LIBPCI_A).
+# Linked into programs that talk to pci-server (tester for now;
+# devb-nvme / devnp-* later).
+.PHONY: libpci
+libpci: $(LIBQSOE_A)
+	+$(MAKE) -C $(TOP)/userland/libpci all
+
+$(LIBPCI_A): | libpci
+	@true
+
+# sbin/pci-server — PCI resource manager (v0.8-rc2).  Scans the bus
+# at boot, serves /dev/pci.
+.PHONY: sbin-pci-server
+sbin-pci-server: $(LIBQSOE_A) $(LIBC_A)
+	+$(MAKE) -C $(TOP)/userland/sbin/pci-server all
+
+$(SBIN_PCI_ELF): | sbin-pci-server
+	@true
+
 # ----------------------------------------------------------------------------
 # Userland CPIO — packs all spawnable binaries (init + tester + qsh +
 # devc-ser8250 + pipe) and gets embedded in taskman.elf via .incbin so
@@ -428,7 +450,7 @@ $(QSH_ELF): | qsh.elf-build
 
 $(USERLAND_CPIO): $(INIT_SH) $(TESTER_ELF) $(DSER_ELF) \
                   $(QSH_ELF) $(SBIN_PIPE_ELF) $(SBIN_REPATH_ELF) \
-                  $(SBIN_SLOGGER_ELF) $(SLOGINFO_ELF)
+                  $(SBIN_SLOGGER_ELF) $(SBIN_PCI_ELF) $(SLOGINFO_ELF)
 	@rm -rf $(BUILD)/cpio-root
 	@mkdir -p $(BUILD)/cpio-root/bin $(BUILD)/cpio-root/sbin
 	@install -m 0755 $(INIT_SH) $(BUILD)/cpio-root/sbin/init
@@ -438,12 +460,13 @@ $(USERLAND_CPIO): $(INIT_SH) $(TESTER_ELF) $(DSER_ELF) \
 	@cp $(SBIN_PIPE_ELF)     $(BUILD)/cpio-root/sbin/pipe
 	@cp $(SBIN_REPATH_ELF)   $(BUILD)/cpio-root/sbin/repath
 	@cp $(SBIN_SLOGGER_ELF)  $(BUILD)/cpio-root/sbin/slogger
+	@cp $(SBIN_PCI_ELF)      $(BUILD)/cpio-root/sbin/pci-server
 	@cp $(SLOGINFO_ELF)      $(BUILD)/cpio-root/bin/sloginfo
 	@ln -sf qsh $(BUILD)/cpio-root/bin/sh
 	@cd $(BUILD)/cpio-root && \
 	    printf '%s\n' sbin/init bin/tester bin/qsh bin/sh \
 	                  sbin/devc-ser8250 sbin/pipe sbin/repath \
-	                  sbin/slogger bin/sloginfo | \
+	                  sbin/slogger sbin/pci-server bin/sloginfo | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)
@@ -521,12 +544,9 @@ $(IMAGE): $(EL_OBJS) $(ELFBUILD)/archive.o $(ELFBUILD)/linker.lds_pp
 	    -o $@ $(EL_OBJS) $(ELFBUILD)/archive.o
 
 # ----------------------------------------------------------------------------
-# Run under QEMU
+# Run under QEMU — moved out to ./emu.sh once the device list grew past
+# a one-liner (NVMe drive image, gdb stub toggle, etc.).
 # ----------------------------------------------------------------------------
-
-run: $(IMAGE)
-	$(QEMU) -machine virt -nographic -m 512M -smp 4 \
-	    -bios default -kernel $(IMAGE)
 
 # ----------------------------------------------------------------------------
 # Cleanup

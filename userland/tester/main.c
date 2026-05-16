@@ -422,6 +422,77 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
+    /* v0.8-rc2: PCI smoke via libpci.  Open /dev/pci, list devices,
+     * attach one, read its BARs and IRQ, detach.  The pci-server lives
+     * at /sbin/pci-server and is brought up by init.sh before us. */
+    {
+        #include <pci/pci.h>
+        sel4_debug_puts("[tester] pci_smoke: pci_bios_present\n");
+        uint32_t lastbus = 0, version = 0;
+        if (pci_bios_present(&lastbus, &version) == 0) {
+            sel4_debug_puts("[tester]   lastbus=");
+            putd((int)lastbus);
+            sel4_debug_puts(" version=");
+            putd((int)version);
+            sel4_debug_putchar('\n');
+        } else {
+            sel4_debug_puts("[tester]   FAIL: pci_bios_present errno=");
+            putd(qsoe_errno);
+            sel4_debug_putchar('\n');
+        }
+
+        sel4_debug_puts("[tester] pci_smoke: enumerate (any vid)\n");
+        for (uint32_t idx = 0; idx < 16; ++idx) {
+            pci_bdf_t bdf = pci_device_find(0xffff, 0xffff, 0, idx);
+            if (bdf == PCI_BDF_NONE) break;
+            uint16_t vid = 0, did = 0;
+            uint32_t ccode = 0;
+            pci_device_read_vid  (bdf, &vid);
+            pci_device_read_did  (bdf, &did);
+            pci_device_read_ccode(bdf, &ccode);
+            sel4_debug_puts("[tester]   [");
+            putd((int)idx);
+            sel4_debug_puts("] bdf=");
+            puthex(bdf);
+            sel4_debug_puts(" vid:did=");
+            puthex(vid);
+            sel4_debug_putchar(':');
+            puthex(did);
+            sel4_debug_puts(" ccode=");
+            puthex(ccode >> 8);
+            sel4_debug_putchar('\n');
+
+            /* Attach + read BARs + IRQ + detach. */
+            pci_devhdl_t hdl = 0;
+            if (pci_device_attach(bdf, 0, &hdl) == 0) {
+                uint32_t nba = 0;
+                pci_ba_t ba[6];
+                pci_device_read_ba(hdl, &nba, ba);
+                uint32_t irq = 0;
+                (void)pci_device_read_irq(hdl, &irq);
+                sel4_debug_puts("[tester]       nba=");
+                putd((int)nba);
+                sel4_debug_puts(" irq=");
+                putd((int)irq);
+                sel4_debug_putchar('\n');
+                for (uint32_t i = 0; i < nba; ++i) {
+                    sel4_debug_puts("[tester]       BAR");
+                    putd((int)ba[i].bar_num);
+                    sel4_debug_puts(" type=");
+                    putd((int)ba[i].type);
+                    sel4_debug_puts(" addr=");
+                    puthex(ba[i].addr);
+                    sel4_debug_putchar('\n');
+                }
+                pci_device_detach(hdl);
+            } else {
+                sel4_debug_puts("[tester]       attach FAIL errno=");
+                putd(qsoe_errno);
+                sel4_debug_putchar('\n');
+            }
+        }
+    }
+
     sel4_debug_puts("[tester] done, returning 0 (→ _exit via crt0)\n");
     return 0;
 }

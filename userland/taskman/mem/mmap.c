@@ -37,15 +37,13 @@ void tm_mem_set_bootinfo(seL4_BootInfo *bi)
     s_bi = bi;
 }
 
-/* Find a device-untyped that exactly bases at `paddr` and is at
- * least `len` bytes long.  Returns the cap slot (`bi->untyped.start
- * + idx`) and sets *out_sizebits to the UT's sizeBits, or 0 / -1
- * on miss.  For v0.8 we require an exact base match — relaxing this
- * (mapping sub-regions of large UTs at offset) needs an offset-
- * tracking allocator we'll add when something actually wants it. */
-static seL4_CPtr find_device_ut_exact(unsigned long paddr,
-                                       unsigned long len,
-                                       unsigned *out_sizebits)
+/* Find a device-untyped that CONTAINS [paddr, paddr+len).  Returns
+ * the cap slot, sets *out_sizebits to the UT's sizeBits, and
+ * *out_offset to (paddr - ut_base).  Returns 0 on miss.            */
+static seL4_CPtr find_device_ut_containing(unsigned long paddr,
+                                            unsigned long len,
+                                            unsigned *out_sizebits,
+                                            unsigned long *out_offset)
 {
     if (!s_bi) return 0;
     unsigned n = s_bi->untyped.end - s_bi->untyped.start;
@@ -53,13 +51,16 @@ static seL4_CPtr find_device_ut_exact(unsigned long paddr,
         if (!s_bi->untypedList[i].isDevice) continue;
         unsigned long base = s_bi->untypedList[i].paddr;
         unsigned long size = 1UL << s_bi->untypedList[i].sizeBits;
-        if (base == paddr && size >= len) {
+        if (paddr >= base && (paddr + len) <= (base + size)) {
             if (out_sizebits) *out_sizebits = s_bi->untypedList[i].sizeBits;
+            if (out_offset)   *out_offset   = paddr - base;
             return s_bi->untyped.start + i;
         }
     }
     return 0;
 }
+
+
 
 /* Anonymous (Mega_Page) mmap — the v0.7 path, untouched.   */
 static int mmap_anonymous(tm_process_t *proc, unsigned long len,
@@ -91,69 +92,94 @@ static int mmap_anonymous(tm_process_t *proc, unsigned long len,
     return 0;
 }
 
-/* MAP_PHYS — retype 4 KiB pages from a device-untyped, map them
- * into the client's VSpace, return the base VA.                   */
+/* Count trailing zero bits of x (x must be non-zero).             */
+static unsigned ctz_ul(unsigned long x)
+{
+    unsigned n = 0;
+    while ((x & 1) == 0) { x >>= 1; ++n; }
+    return n;
+}
+
+/* MAP_PHYS — find the device-UT containing `phys`, advance its
+ * watermark to the offset (by burning intermediate retypes), then
+ * retype Mega_Page (2 MiB) frames for the actual mapping and slot
+ * them into the client's VSpace.  Returns the base VA.
+ *
+ * v0.8-rc2: requires `phys` and `len` to be 2 MiB-aligned.  Smaller
+ * 4 KiB mappings (e.g. single-page MMIO registers) land in rc3
+ * when the first device-driver port needs them. */
 static int mmap_phys(tm_process_t *proc, unsigned long phys,
                      unsigned long len, unsigned long *out_vaddr)
 {
     unsigned ut_sizebits = 0;
-    seL4_CPtr ut = find_device_ut_exact(phys, len, &ut_sizebits);
+    unsigned long ut_offset = 0;
+    seL4_CPtr ut = find_device_ut_containing(phys, len, &ut_sizebits,
+                                              &ut_offset);
     if (!ut) {
         sel4_debug_puts("tm_mmap_serve(PHYS): no matching device-UT\n");
         return -ENODEV;
     }
 
-    /* Round len up to 4 KiB; cap at UT size. */
-    unsigned long pages_4k = (len + QSOE_PAGE_4K - 1) / QSOE_PAGE_4K;
-    unsigned long ut_size = 1UL << ut_sizebits;
-    if (pages_4k * QSOE_PAGE_4K > ut_size) {
+    /* Require Mega_Page alignment for both base and length. */
+    if (phys & (QSOE_MEGA_PAGE - 1)) {
+        sel4_debug_puts("tm_mmap_serve(PHYS): phys not Mega-aligned\n");
         return -EINVAL;
     }
+    if (len & (QSOE_MEGA_PAGE - 1)) {
+        /* Round up to next Mega_Page. */
+        len = (len + QSOE_MEGA_PAGE - 1) & ~(QSOE_MEGA_PAGE - 1);
+    }
+    unsigned long pages_2m = len / QSOE_MEGA_PAGE;
+    unsigned long ut_size  = 1UL << ut_sizebits;
+    if (ut_offset + len > ut_size) return -EINVAL;
 
-    /* Pick a fresh VA range — align the base to 2 MiB (a Mega_Page
-     * boundary) so the L0 PTs we allocate cover it cleanly. */
-    unsigned long base_va = (proc->mmap_top + QSOE_MEGA_PAGE - 1) &
-                            ~(QSOE_MEGA_PAGE - 1);
-    unsigned long end_va  = base_va + pages_4k * QSOE_PAGE_4K;
-
-    /* Allocate one L0 PageTable per 2 MiB span touched.  Mapping an
-     * L0 PT that's already mapped under our process's L1 returns
-     * seL4_DeleteFirst which we'd need to handle if the same region
-     * were touched again — for now mmap_top monotonic guarantees
-     * we won't.  */
-    for (unsigned long va = base_va & ~(QSOE_MEGA_PAGE - 1);
-         va < end_va; va += QSOE_MEGA_PAGE) {
-        seL4_CPtr l0 = taskman_alloc_and_retype(seL4_RISCV_PageTableObject, 0);
-        if (!l0) return -ENOMEM;
-        seL4_Word err = qsoe_riscv_pagetable_map(l0, proc->vspace, va,
-                                                  QSOE_VM_ATTR_DEFAULT);
+    /* Advance the kernel's watermark past `ut_offset` by retyping
+     * power-of-2 chunks (as throw-away child UTs) until we land at
+     * exactly `ut_offset`.  Greedy biggest-chunk-first.             */
+    unsigned long advanced = 0;
+    while (advanced < ut_offset) {
+        unsigned long rem = ut_offset - advanced;
+        /* Biggest chunk we can carve: limited by remaining offset AND
+         * by alignment of (UT base + advanced). */
+        unsigned chunk_sb = ctz_ul(rem);
+        unsigned align_sb = ctz_ul(advanced ? advanced : ut_size);
+        if (chunk_sb > align_sb) chunk_sb = align_sb;
+        seL4_CPtr dummy = taskman_alloc_empty_slot();
+        if (!dummy) return -ENOMEM;
+        seL4_Word err = qsoe_untyped_retype(ut, seL4_UntypedObject,
+                                             chunk_sb, s_cnode_root,
+                                             0, 0, dummy, 1);
         if (err) {
-            sel4_debug_puts("tm_mmap_serve(PHYS): L0 PageTable_Map failed\n");
+            sel4_debug_puts("tm_mmap_serve(PHYS): skip-retype failed\n");
             return -ENOMEM;
         }
+        advanced += 1UL << chunk_sb;
     }
 
-    /* Retype N consecutive 4 KiB Pages from the device-untyped and
-     * map them into the client's VSpace.  Each retype advances the
-     * kernel's per-UT watermark; one device-UT can be carved up
-     * across multiple MAP_PHYS calls.  Allocate caps in taskman's
-     * CSpace so we can invoke Page_Map; the kernel maps the device
-     * frame into the caller's VSpace, no copy needed in the child. */
-    for (unsigned long i = 0; i < pages_4k; ++i) {
+    /* Pick a fresh VA range — Mega-aligned.  No L0 PTs needed: each
+     * Mega_Page is a L1-level leaf in SV39, and the L1 PTs covering
+     * mmap_top are already installed at process startup (same as the
+     * anonymous-mmap path). */
+    unsigned long base_va = (proc->mmap_top + QSOE_MEGA_PAGE - 1) &
+                            ~(QSOE_MEGA_PAGE - 1);
+    unsigned long end_va  = base_va + len;
+
+    /* Retype Mega_Pages from the device-UT and map them in. */
+    for (unsigned long i = 0; i < pages_2m; ++i) {
         seL4_CPtr page = taskman_alloc_empty_slot();
         if (!page) return -ENOMEM;
-        seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_4K_Page, 0,
+        seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_Mega_Page, 0,
                                              s_cnode_root, 0, 0, page, 1);
         if (err) {
-            sel4_debug_puts("tm_mmap_serve(PHYS): device retype failed\n");
+            sel4_debug_puts("tm_mmap_serve(PHYS): Mega_Page retype failed\n");
             return -ENOMEM;
         }
         err = qsoe_riscv_page_map(page, proc->vspace,
-                                   base_va + i * QSOE_PAGE_4K,
+                                   base_va + i * QSOE_MEGA_PAGE,
                                    QSOE_RIGHTS_ALL,
                                    QSOE_VM_ATTR_DEFAULT);
         if (err) {
-            sel4_debug_puts("tm_mmap_serve(PHYS): Page_Map failed\n");
+            sel4_debug_puts("tm_mmap_serve(PHYS): Mega_Page_Map failed\n");
             return -ENOMEM;
         }
     }

@@ -38,7 +38,7 @@ typedef struct {
 #define TM_SYSCFG_TAG_BOOT_HART     6   /* u32                      */
 #define TM_SYSCFG_TAG_MEMORY        7   /* (u64 base, u64 size)     */
 #define TM_SYSCFG_TAG_PCI_ECAM      8   /* (u64 base, u64 size, u32 lastbus) */
-#define TM_SYSCFG_TAG_PCI_IRQ       9   /* u32: PLIC IRQ for INTA   */
+#define TM_SYSCFG_TAG_PCI_IRQ       9   /* 4 * u32: PLIC vectors for INTA/B/C/D */
 #define TM_SYSCFG_TAG_PCI_WINDOW   10   /* (u64 cpu, u64 pci, u64 size, u32 flags) */
 #define TM_SYSCFG_TAG_DW_MSI       11   /* (u64 dbi_base, u64 dbi_size, u32 plic_irq) */
 #define TM_SYSCFG_TAG_UART         12   /* (u64 base, u64 size, u32 irq) */

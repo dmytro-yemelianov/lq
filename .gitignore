@@ -9,6 +9,9 @@ CLAUDE.md
 # Upstream checkout pulled by extraction script
 /sel4test-full/
 
+# Runtime artefacts created by ./emu.sh (disk images etc.)
+/test/
+
 *.aux
 *.fdb_latexmk
 *.fls

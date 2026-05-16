@@ -71,7 +71,7 @@ sel4test-full/                 upstream seL4 + sel4test checkout (gitignored)
 make                                # builds kernel, elfloader, taskman,
                                     # libqsoe, libc, qsh, init, tester,
                                     # devc-ser8250, sbin/pipe, sbin/repath
-make run                            # boot under qemu-system-riscv64
+./emu.sh                            # boot under qemu-system-riscv64
 ```
 
 Exit QEMU with `Ctrl-A x`. First-time builds take a few minutes because

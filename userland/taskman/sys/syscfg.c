@@ -182,6 +182,128 @@ int tm_syscfg_build(const void *fdt_blob)
         }
     }
 
+    /* PCI host bridge — generic ECAM (qemu-virt and any other board that
+     * exposes a "pci-host-ecam-generic" node).  Emit:
+     *   TM_SYSCFG_TAG_PCI_ECAM   — (u64 base, u64 size, u32 lastbus)
+     *   TM_SYSCFG_TAG_PCI_WINDOW — one per ranges entry
+     *   TM_SYSCFG_TAG_PCI_IRQ    — four PLIC vectors (INTA..INTD)
+     *
+     * Other PCI flavours (SiFive FU740 DesignWare) land in v0.8-rc3
+     * along with TM_SYSCFG_TAG_DW_MSI. */
+    int pci = tm_fdt_compatible(fdt_blob, "pci-host-ecam-generic");
+    if (pci >= 0) {
+        /* ECAM base + size from the node's `reg` (cells = 2,2 on
+         * qemu-virt; the parent /soc declares #address-cells=2,
+         * #size-cells=2). */
+        uint64_t ecam_base, ecam_size;
+        if (tm_fdt_reg(fdt_blob, pci, 2, 2, 0, &ecam_base, &ecam_size) == 0) {
+            unsigned char buf[20];
+            for (int b = 0; b < 8; ++b) buf[b]      = (unsigned char)((ecam_base >> (b * 8)) & 0xff);
+            for (int b = 0; b < 8; ++b) buf[8 + b]  = (unsigned char)((ecam_size >> (b * 8)) & 0xff);
+            /* `bus-range` carries the actual lastbus when present; fall
+             * back to 255 (ECAM size / 1 MiB - 1 covers the whole
+             * window). */
+            uint32_t lastbus = 0xff;
+            const void *brp; unsigned brlen;
+            if (tm_fdt_prop(fdt_blob, pci, "bus-range", &brp, &brlen) == 0 &&
+                brlen == 8) {
+                const unsigned char *bp = (const unsigned char *)brp;
+                lastbus = ((uint32_t)bp[4] << 24) | ((uint32_t)bp[5] << 16) |
+                          ((uint32_t)bp[6] <<  8) |  (uint32_t)bp[7];
+            }
+            buf[16] = (unsigned char)(lastbus & 0xff);
+            buf[17] = (unsigned char)((lastbus >> 8) & 0xff);
+            buf[18] = (unsigned char)((lastbus >> 16) & 0xff);
+            buf[19] = (unsigned char)((lastbus >> 24) & 0xff);
+            (void)emit(TM_SYSCFG_TAG_PCI_ECAM, buf, 20);
+        }
+
+        /* `ranges` property: each entry is (PCI #addr-cells=3 +
+         * parent #addr-cells=2 + PCI #size-cells=2) = 7 u32s = 28
+         * bytes.  The first PCI address cell's high bits encode the
+         * window type:
+         *     0x01000000 → I/O space
+         *     0x02000000 → 32-bit memory
+         *     0x03000000 → 64-bit memory
+         *     0x40000000 → prefetchable (OR'd in)
+         * (see Open Firmware "Numerical Representation" Annex C, table
+         * "PCI Bus Binding".) */
+        const void *rp; unsigned rlen;
+        if (tm_fdt_prop(fdt_blob, pci, "ranges", &rp, &rlen) == 0 &&
+            rlen % 28 == 0) {
+            const unsigned char *bp = (const unsigned char *)rp;
+            unsigned n = rlen / 28;
+            for (unsigned i = 0; i < n; ++i) {
+                const unsigned char *r = bp + i * 28;
+                /* PCI high-addr cell (4 bytes BE). */
+                uint32_t hi = ((uint32_t)r[0] << 24) | ((uint32_t)r[1] << 16) |
+                              ((uint32_t)r[2] <<  8) |  (uint32_t)r[3];
+                /* PCI mid+lo addr cells (skip the high 4 bytes — bits
+                 * 0..63 carry the PCI address). */
+                uint64_t pci_addr = 0;
+                for (int b = 4; b < 12; ++b) pci_addr = (pci_addr << 8) | r[b];
+                uint64_t cpu_addr = 0;
+                for (int b = 12; b < 20; ++b) cpu_addr = (cpu_addr << 8) | r[b];
+                uint64_t size = 0;
+                for (int b = 20; b < 28; ++b) size = (size << 8) | r[b];
+
+                uint32_t flags = 0;
+                switch ((hi >> 24) & 0x3) {
+                case 0x1: flags |= TM_SYSCFG_PCI_WINDOW_IO;  break;
+                case 0x2: flags |= TM_SYSCFG_PCI_WINDOW_MEM; break;
+                case 0x3: flags |= TM_SYSCFG_PCI_WINDOW_MEM; break;
+                default:  continue;     /* configuration space, skip */
+                }
+                if (hi & 0x40000000u) flags |= TM_SYSCFG_PCI_WINDOW_PREFETCH;
+
+                unsigned char wbuf[28];
+                for (int b = 0; b < 8; ++b) wbuf[b]      = (unsigned char)((cpu_addr >> (b * 8)) & 0xff);
+                for (int b = 0; b < 8; ++b) wbuf[8 + b]  = (unsigned char)((pci_addr >> (b * 8)) & 0xff);
+                for (int b = 0; b < 8; ++b) wbuf[16 + b] = (unsigned char)((size     >> (b * 8)) & 0xff);
+                wbuf[24] = (unsigned char)(flags & 0xff);
+                wbuf[25] = (unsigned char)((flags >> 8) & 0xff);
+                wbuf[26] = (unsigned char)((flags >> 16) & 0xff);
+                wbuf[27] = (unsigned char)((flags >> 24) & 0xff);
+                (void)emit(TM_SYSCFG_TAG_PCI_WINDOW, wbuf, 28);
+            }
+        }
+
+        /* `interrupt-map`: PCI INTx routing.  On qemu-virt each entry
+         * is (PCI #addr-cells=3 + PCI #int-cells=1 + parent phandle=1 +
+         * parent #int-cells=1) = 6 u32s = 24 bytes.  Pin number is at
+         * offset 3 (1..4 for INTA..INTD); PLIC vector is the last u32.
+         * Collect the first vector seen for each pin. */
+        const void *ip; unsigned ilen;
+        if (tm_fdt_prop(fdt_blob, pci, "interrupt-map", &ip, &ilen) == 0 &&
+            ilen % 24 == 0) {
+            uint32_t vec[4] = { 0, 0, 0, 0 };
+            const unsigned char *bp = (const unsigned char *)ip;
+            unsigned n = ilen / 24;
+            for (unsigned i = 0; i < n; ++i) {
+                const unsigned char *e = bp + i * 24;
+                uint32_t pin =
+                    ((uint32_t)e[12] << 24) | ((uint32_t)e[13] << 16) |
+                    ((uint32_t)e[14] <<  8) |  (uint32_t)e[15];
+                uint32_t plic =
+                    ((uint32_t)e[20] << 24) | ((uint32_t)e[21] << 16) |
+                    ((uint32_t)e[22] <<  8) |  (uint32_t)e[23];
+                if (pin >= 1 && pin <= 4 && vec[pin - 1] == 0) {
+                    vec[pin - 1] = plic;
+                }
+            }
+            if (vec[0] || vec[1] || vec[2] || vec[3]) {
+                unsigned char ibuf[16];
+                for (int p = 0; p < 4; ++p) {
+                    ibuf[p * 4 + 0] = (unsigned char)(vec[p] & 0xff);
+                    ibuf[p * 4 + 1] = (unsigned char)((vec[p] >> 8) & 0xff);
+                    ibuf[p * 4 + 2] = (unsigned char)((vec[p] >> 16) & 0xff);
+                    ibuf[p * 4 + 3] = (unsigned char)((vec[p] >> 24) & 0xff);
+                }
+                (void)emit(TM_SYSCFG_TAG_PCI_IRQ, ibuf, 16);
+            }
+        }
+    }
+
     /* Sentinel. */
     if (emit(TM_SYSCFG_TAG_END, 0, 0) != 0) return -1;
 
