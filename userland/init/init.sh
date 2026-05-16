@@ -8,6 +8,9 @@
 # and the next line of the script can already see /dev/ser1 in the
 # pathmgr.  No backgrounding required.
 #
+echo "[init] starting slogger..."
+/sbin/slogger
+
 echo "[init] starting devc-ser8250..."
 /sbin/devc-ser8250
 

@@ -72,6 +72,7 @@ INIT_SH       := $(TOP)/userland/init/init.sh
 DSER_ELF      := $(BUILD)/devc-ser8250.elf
 SBIN_PIPE_ELF := $(BUILD)/sbin-pipe.elf
 SBIN_REPATH_ELF := $(BUILD)/sbin-repath.elf
+SBIN_SLOGGER_ELF := $(BUILD)/sbin-slogger.elf
 USERLAND_CPIO := $(BUILD)/userland.cpio
 
 # ----------------------------------------------------------------------------
@@ -390,6 +391,15 @@ sbin-repath: $(LIBQSOE_A) $(LIBC_A)
 $(SBIN_REPATH_ELF): | sbin-repath
 	@true
 
+# sbin/slogger — system logger (v0.8-rc1).  Registers /dev/slog;
+# backs the libqsoe slogf() / sloginfo CLI.
+.PHONY: sbin-slogger
+sbin-slogger: $(LIBQSOE_A) $(LIBC_A)
+	+$(MAKE) -C $(TOP)/userland/sbin/slogger all
+
+$(SBIN_SLOGGER_ELF): | sbin-slogger
+	@true
+
 # ----------------------------------------------------------------------------
 # Userland CPIO — packs all spawnable binaries (init + tester + qsh +
 # devc-ser8250 + pipe) and gets embedded in taskman.elf via .incbin so
@@ -408,19 +418,22 @@ $(QSH_ELF): | qsh.elf-build
 	@true
 
 $(USERLAND_CPIO): $(INIT_SH) $(TESTER_ELF) $(DSER_ELF) \
-                  $(QSH_ELF) $(SBIN_PIPE_ELF) $(SBIN_REPATH_ELF)
+                  $(QSH_ELF) $(SBIN_PIPE_ELF) $(SBIN_REPATH_ELF) \
+                  $(SBIN_SLOGGER_ELF)
 	@rm -rf $(BUILD)/cpio-root
 	@mkdir -p $(BUILD)/cpio-root/bin $(BUILD)/cpio-root/sbin
 	@install -m 0755 $(INIT_SH) $(BUILD)/cpio-root/sbin/init
-	@cp $(TESTER_ELF)      $(BUILD)/cpio-root/bin/tester
-	@cp $(QSH_ELF)         $(BUILD)/cpio-root/bin/qsh
-	@cp $(DSER_ELF)        $(BUILD)/cpio-root/sbin/devc-ser8250
-	@cp $(SBIN_PIPE_ELF)   $(BUILD)/cpio-root/sbin/pipe
-	@cp $(SBIN_REPATH_ELF) $(BUILD)/cpio-root/sbin/repath
+	@cp $(TESTER_ELF)        $(BUILD)/cpio-root/bin/tester
+	@cp $(QSH_ELF)           $(BUILD)/cpio-root/bin/qsh
+	@cp $(DSER_ELF)          $(BUILD)/cpio-root/sbin/devc-ser8250
+	@cp $(SBIN_PIPE_ELF)     $(BUILD)/cpio-root/sbin/pipe
+	@cp $(SBIN_REPATH_ELF)   $(BUILD)/cpio-root/sbin/repath
+	@cp $(SBIN_SLOGGER_ELF)  $(BUILD)/cpio-root/sbin/slogger
 	@ln -sf qsh $(BUILD)/cpio-root/bin/sh
 	@cd $(BUILD)/cpio-root && \
 	    printf '%s\n' sbin/init bin/tester bin/qsh bin/sh \
-	                  sbin/devc-ser8250 sbin/pipe sbin/repath | \
+	                  sbin/devc-ser8250 sbin/pipe sbin/repath \
+	                  sbin/slogger | \
 	    cpio --quiet --create -H newc \
 	         --owner=+0:+0 --reproducible \
 	         --file=$(USERLAND_CPIO)

@@ -341,6 +341,17 @@ int main(int argc, char **argv, char **envp)
         sel4_debug_putchar('\n');
     }
 
+    /* v0.8-rc1: slogf smoke test. */
+    {
+        #include <sys/slog.h>
+        #include <sys/slogcodes.h>
+        sel4_debug_puts("[tester] slogf smoke: writing 3 events\n");
+        slogf(_SLOGC_TEST, _SLOG_INFO,    "hello from tester pid %d", (int)qsoe_self_pid);
+        slogf(_SLOGC_TEST, _SLOG_WARNING, "this is a warning at counter %d", 42);
+        slogf(_SLOGC_TEST, _SLOG_DEBUG1,  "debug payload");
+        sel4_debug_puts("[tester]   3 events sent\n");
+    }
+
     /* v0.8-rc1: rsrcdb smoke test.  Boot seeded MEMORY entries from
      * the FDT (via syscfg); query a few back, then create an IRQ
      * range, attach a single IRQ, detach it, destroy the range. */
