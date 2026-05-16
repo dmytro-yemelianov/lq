@@ -1,15 +1,24 @@
 /*
  * open.c — POSIX open() for QSOE.
  *
- * Lives in userland/libc/qsoe/ (surfaced inside the musl source tree
- * as src/os_dependent/open.c via a symlink the libc Makefile creates).
- * Compiled into libc.a alongside the rest of musl, so callers see a
- * plain POSIX open() resolved directly to this function — no
- * __syscall / __sysinfo / dispatcher hop.
+ * Pre-processing before TM_REQ_OPEN goes to taskman:
  *
- * The body is the v0.5/0.6 qsoe_open() logic moved here verbatim:
- * pack the path into the IPC buffer's msg[4..], TM_REQ_OPEN to
- * taskman, bind the returned cap into the fd/coid namespace.
+ *   1. If the path is relative, prepend the calling process's cwd
+ *      (TM_REQ_GETCWD) so taskman's pathmgr always sees an absolute
+ *      path.  Pathmgr is keyed on registered prefixes ("/", "/bin",
+ *      "/dev/null", ...) and has no concept of "." / cwd itself.
+ *
+ *   2. Canonicalise: collapse "." and ".." components, fold "//" to
+ *      "/".  Without this, "ls" from cwd="/" builds "/." which is
+ *      unregistered → ENOENT; "cd dev && ls" builds "/dev/." → same
+ *      failure.  Canonicalisation runs in a fixed-size buffer;
+ *      longer paths return ENAMETOOLONG.
+ *
+ * After both passes, the absolute, canonical path goes into
+ * msg[4..] and TM_REQ_OPEN runs as before.
+ *
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <qsoe-system.h>
@@ -19,11 +28,76 @@
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
 
+extern char *getcwd(char *buf, unsigned long size);
+
+#define PATH_BUF_BYTES 256
+
 static unsigned path_strlen(const char *s)
 {
     unsigned n = 0;
     while (s[n]) ++n;
     return n;
+}
+
+/* Canonicalise an absolute path in place.  Splits on '/', walks
+ * components, drops "" (consecutive slashes) and ".", pops the
+ * previous component on "..".  Uses an explicit input length so the
+ * output cursor's writes (which include a trailing '/' after each
+ * real component) can safely clobber what used to be the input's
+ * NUL terminator without confusing the input-read loop.
+ *
+ * Returns 0 on success, -1 on a non-absolute input.  *out_len gets
+ * the new length on success; buf is NUL-terminated. */
+static int canon_inplace(char *buf, unsigned in_len, unsigned *out_len)
+{
+    if (in_len == 0 || buf[0] != '/') return -1;
+
+    /* Two cursors, both indices into buf.  `o` only writes; `i` only
+     * reads from the original input region [0, in_len).  Writes
+     * cannot extend past `o`, and `o` never overtakes `i` (each
+     * iteration writes ≤ (i - o) + len + 1 bytes ≤ component bytes
+     * already read).  Past the explicit end-of-input, *i would be
+     * undefined — the `i < in_len` guards prevent that. */
+    unsigned o = 0;
+    unsigned i = 0;
+
+    buf[o++] = '/';
+    ++i;                              /* skip the leading '/' */
+
+    while (i < in_len) {
+        unsigned comp = i;
+        while (i < in_len && buf[i] != '/') ++i;
+        unsigned len = i - comp;
+
+        if (len == 0) {
+            /* "//" — empty component, drop. */
+        } else if (len == 1 && buf[comp] == '.') {
+            /* ".": drop. */
+        } else if (len == 2 && buf[comp] == '.' && buf[comp + 1] == '.') {
+            /* "..": pop the previous component (or stay at root). */
+            if (o > 1) {
+                --o;                 /* drop trailing '/' */
+                while (o > 1 && buf[o - 1] != '/') --o;
+            }
+        } else {
+            /* Real component — append, then a trailing '/'.  Read
+             * each byte BEFORE we write at `o`, since o ≤ i and a
+             * write at o could be at the comp source byte. */
+            for (unsigned k = 0; k < len; ++k) {
+                char c = buf[comp + k];   /* read first */
+                buf[o++] = c;             /* then write */
+            }
+            buf[o++] = '/';
+        }
+
+        if (i < in_len && buf[i] == '/') ++i;
+    }
+
+    /* Strip trailing '/' unless we're at the bare root. */
+    if (o > 1 && buf[o - 1] == '/') --o;
+    buf[o]   = 0;
+    *out_len = o;
+    return 0;
 }
 
 int open(const char *path, int flags, ...);
@@ -32,14 +106,49 @@ int open(const char *path, int flags, ...)
     (void)flags;  /* mode (variadic) and flags ignored for now */
 
     if (!path) { qsoe_errno = EINVAL; return -1; }
-    unsigned plen = path_strlen(path);
-    if (plen == 0 || plen >= 128) { qsoe_errno = EINVAL; return -1; }
 
+    /* Stage 1 — assemble an absolute path. */
+    char abs[PATH_BUF_BYTES];
+    unsigned alen = 0;
+
+    if (path[0] == '/') {
+        unsigned plen = path_strlen(path);
+        if (plen >= sizeof abs) { qsoe_errno = ENAMETOOLONG; return -1; }
+        for (unsigned i = 0; i < plen; ++i) abs[i] = path[i];
+        abs[plen] = 0;
+        alen = plen;
+    } else {
+        if (!getcwd(abs, sizeof abs)) return -1;
+        unsigned cwdlen = 0;
+        while (abs[cwdlen] && cwdlen < sizeof abs) ++cwdlen;
+        /* Add separator unless cwd is the bare "/". */
+        if (!(cwdlen == 1 && abs[0] == '/')) {
+            if (cwdlen + 1 >= sizeof abs) { qsoe_errno = ENAMETOOLONG; return -1; }
+            abs[cwdlen++] = '/';
+        }
+        unsigned i = 0;
+        while (path[i] && cwdlen + i < sizeof abs - 1) {
+            abs[cwdlen + i] = path[i];
+            ++i;
+        }
+        if (path[i] != 0) { qsoe_errno = ENAMETOOLONG; return -1; }
+        abs[cwdlen + i] = 0;
+        alen = cwdlen + i;
+    }
+
+    /* Stage 2 — canonicalise. */
+    if (canon_inplace(abs, alen, &alen) != 0) {
+        qsoe_errno = EINVAL;
+        return -1;
+    }
+    if (alen == 0 || alen >= 128) { qsoe_errno = EINVAL; return -1; }
+
+    /* Stage 3 — TM_REQ_OPEN. */
     unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
-    for (unsigned i = 0; i < plen; ++i) dst[i] = (unsigned char)path[i];
+    for (unsigned i = 0; i < alen; ++i) dst[i] = (unsigned char)abs[i];
 
-    seL4_Word mr0 = plen, mr1 = 0, mr2 = 0, mr3 = 0;
-    unsigned nwords = 4 + (plen + 7) / 8;
+    seL4_Word mr0 = alen, mr1 = 0, mr2 = 0, mr3 = 0;
+    unsigned nwords = 4 + (alen + 7) / 8;
     seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_OPEN, 0, 0, nwords);
     seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
                                               &mr0, &mr1, &mr2, &mr3);
