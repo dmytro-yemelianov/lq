@@ -22,6 +22,14 @@
  *     returns the line so far without the EOF marker.
  *   - VINTR with isig set aborts readline; qsoe_errno = EINTR.
  *
+ * I/O shape:
+ *   The state machine pulls one byte at a time from a per-LDISC
+ *   pushback buffer; the buffer is refilled by one read() of up to
+ *   LDISC_BATCH_SIZE bytes from fd_in.  This amortises the IPC
+ *   round-trip across a whole UART burst (e.g. a pasted line, or a
+ *   multi-byte escape sequence).  Unconsumed bytes after a line
+ *   terminator stay in the pushback buffer for the next call.
+ *
  * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -33,12 +41,18 @@ extern long write(int fd, const void *buf, unsigned long n);
 extern void *malloc(unsigned long n);
 extern void  free(void *p);
 
-#define LDISC_LINE_CAP  256
+#define LDISC_BATCH_SIZE  64
 
 struct qsoe_ldisc {
     int               fd_in;    /* keystrokes come in here       */
     int               fd_out;   /* echo / erase / line feeds out */
     qsoe_ldisc_attr_t attr;
+    /* Pushback buffer.  Refilled by one read() of up to BATCH_SIZE
+     * bytes; the state machine consumes from here byte-by-byte.
+     * Bytes left over after a line terminator persist across calls. */
+    unsigned char     pb_buf[LDISC_BATCH_SIZE];
+    unsigned int      pb_pos;   /* next byte index */
+    unsigned int      pb_len;   /* valid bytes in pb_buf */
 };
 
 static void ldisc_default_attr(qsoe_ldisc_attr_t *a)
@@ -63,6 +77,8 @@ qsoe_ldisc_t *qsoe_ldisc_open(int fd_in, int fd_out,
     if (!ld) { qsoe_errno = ENOMEM; return 0; }
     ld->fd_in  = fd_in;
     ld->fd_out = fd_out;
+    ld->pb_pos = 0;
+    ld->pb_len = 0;
     if (attr) ld->attr = *attr;
     else      ldisc_default_attr(&ld->attr);
     return ld;
@@ -138,11 +154,28 @@ long qsoe_ldisc_write(qsoe_ldisc_t *ld, const void *buf, unsigned long n)
     return ldisc_write_cooked(ld, buf, n);
 }
 
+/* Get one byte from the pushback buffer, refilling it with one read()
+ * of up to LDISC_BATCH_SIZE bytes from fd_in if empty.  Return value:
+ *    1 on success (byte stored in *c),
+ *    0 on EOF on the underlying fd,
+ *   -1 on read error (qsoe_errno already set by the read syscall).
+ * The state machine driving canonical mode pulls bytes through this. */
+static long ldisc_getbyte(qsoe_ldisc_t *ld, unsigned char *c)
+{
+    if (ld->pb_pos >= ld->pb_len) {
+        long r = read(ld->fd_in, ld->pb_buf, LDISC_BATCH_SIZE);
+        if (r <= 0) return r;
+        ld->pb_pos = 0;
+        ld->pb_len = (unsigned int)r;
+    }
+    *c = ld->pb_buf[ld->pb_pos++];
+    return 1;
+}
+
 long qsoe_ldisc_readbyte(qsoe_ldisc_t *ld, unsigned char *c)
 {
     if (!ld || !c) { qsoe_errno = EINVAL; return -1; }
-    long r = read(ld->fd_in, c, 1);
-    return r;
+    return ldisc_getbyte(ld, c);
 }
 
 /* Echo a single character or a special sequence.  Honours echo/echoe. */
@@ -179,21 +212,50 @@ static void ldisc_echo_erase(qsoe_ldisc_t *ld)
     }
 }
 
+/* Erase the last UTF-8 codepoint from `buf` (of current length `len`),
+ * returning the new length.  A codepoint is one ASCII byte (top bit 0)
+ * or one lead byte followed by 1-3 continuation bytes (0b10xxxxxx).
+ * Malformed sequences (lone continuation bytes) erase just one byte
+ * — best-effort recovery, matches what most terminals do.
+ *
+ * Display width is assumed 1 column per codepoint, so one echoe
+ * triplet covers the visual erase.  Wide-char (CJK / emoji) width
+ * tracking is a v0.8+ refinement that needs a wcwidth-equivalent. */
+static unsigned long ldisc_codepoint_backspace(const char *buf,
+                                               unsigned long len)
+{
+    if (len == 0) return 0;
+    unsigned long i = len - 1;
+    /* Walk back over continuation bytes (top two bits == 10). */
+    while (i > 0 && ((unsigned char)buf[i] & 0xC0) == 0x80) {
+        --i;
+    }
+    return i;
+}
+
 long qsoe_ldisc_readline(qsoe_ldisc_t *ld, char *buf, unsigned long cap)
 {
     if (!ld || !buf || cap == 0) { qsoe_errno = EINVAL; return -1; }
 
-    /* Raw mode: just hand bytes back unchanged, up to `cap`. */
+    /* Raw mode: drain any pushback first (left over from canonical
+     * mode), then read fresh bytes straight from fd_in.  Editors
+     * flipping to raw mode mid-session see no lost bytes this way. */
     if (!ld->attr.icanon) {
-        long r = read(ld->fd_in, buf, cap);
-        return r;
+        if (ld->pb_pos < ld->pb_len) {
+            unsigned long avail = ld->pb_len - ld->pb_pos;
+            if (avail > cap) avail = cap;
+            for (unsigned long i = 0; i < avail; ++i)
+                buf[i] = (char)ld->pb_buf[ld->pb_pos + i];
+            ld->pb_pos += (unsigned int)avail;
+            return (long)avail;
+        }
+        return read(ld->fd_in, buf, cap);
     }
 
     unsigned long len = 0;
-    unsigned long room = (cap < LDISC_LINE_CAP) ? cap : LDISC_LINE_CAP;
     for (;;) {
         unsigned char c;
-        long r = read(ld->fd_in, &c, 1);
+        long r = ldisc_getbyte(ld, &c);
         if (r == 0) {
             /* EOF on the underlying fd — return whatever we have. */
             return (long)len;
@@ -213,19 +275,19 @@ long qsoe_ldisc_readline(qsoe_ldisc_t *ld, char *buf, unsigned long cap)
             return -1;
         }
 
-        /* Erase one char back. */
+        /* Erase one codepoint back (UTF-8 aware). */
         if (c == ld->attr.verase || c == 0x08 || c == 0x7F) {
             if (len > 0) {
-                --len;
+                len = ldisc_codepoint_backspace(buf, len);
                 ldisc_echo_erase(ld);
             }
             continue;
         }
 
-        /* Erase to start of line. */
+        /* Erase to start of line — one echo per codepoint, not per byte. */
         if (c == ld->attr.vkill) {
             while (len > 0) {
-                --len;
+                len = ldisc_codepoint_backspace(buf, len);
                 ldisc_echo_erase(ld);
             }
             continue;
@@ -242,15 +304,15 @@ long qsoe_ldisc_readline(qsoe_ldisc_t *ld, char *buf, unsigned long cap)
 
         /* '\n' terminates the line; include it in the returned bytes. */
         if (c == '\n') {
-            if (len < room) buf[len++] = (char)c;
+            if (len < cap) buf[len++] = (char)c;
             return (long)len;
         }
 
-        if (len < room - 1) {
+        if (len < cap - 1) {
             buf[len++] = (char)c;
         }
         /* If the buffer is full before a newline arrives, swallow
          * further chars until '\n' (matches what canonical-mode
-         * terminals do in practice — but bound at room). */
+         * terminals do in practice — but bound at cap). */
     }
 }
