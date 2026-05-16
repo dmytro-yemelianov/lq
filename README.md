@@ -48,8 +48,9 @@ core/                          vendored upstream (gitignored; populated
 
 userland/                      QSOE-native source (this is the work)
   taskman/                     central system server (sys/proc/mem/path/)
-  libqsoe/                     QNX-compatible IPC + line discipline
-                                 (single header: <qsoe-system.h>)
+  libqsoe/                     QNX-compatible IPC, Sync*, hwinfo, line
+                                 discipline (single header: <qsoe-system.h>)
+  libpci/                      static libpci.a — PCI client API
   libc/qsoe/                   QSOE-native POSIX entry points, symlinked
                                  into musl's src/os_dependent/
   qsh/                         interactive shell (mksh-derived)
@@ -57,6 +58,10 @@ userland/                      QSOE-native source (this is the work)
   dev/ser8250/                 16550 UART driver / resmgr
   sbin/pipe/                   POSIX pipe / FIFO resmgr
   sbin/repath/                 pathmgr-rewire CLI helper
+  sbin/slogger/                system log ring resmgr (/dev/slog)
+  sbin/pci-server/             PCI bus resmgr (/dev/pci)
+  utils/                       /bin tools (ls, cat) — one .c per binary
+  sloginfo/                    /bin/sloginfo — drain the slog ring
   tester/                      end-to-end test program
 
 scripts/                       source extraction and build helpers
@@ -69,9 +74,12 @@ sel4test-full/                 upstream seL4 + sel4test checkout (gitignored)
 ```
 ./scripts/extract-sel4-riscv.sh     # one-time: fetch upstream sources
 make                                # builds kernel, elfloader, taskman,
-                                    # libqsoe, libc, qsh, init, tester,
-                                    # devc-ser8250, sbin/pipe, sbin/repath
+                                    # libqsoe, libpci, libc, qsh, init,
+                                    # tester, the resmgrs, and /bin tools
 ./emu.sh                            # boot under qemu-system-riscv64
+                                    #   -gdb       attach gdb on :1234
+                                    #   -no-nvme   omit the NVMe drive
+                                    #   --         pass-through to qemu
 ```
 
 Exit QEMU with `Ctrl-A x`. First-time builds take a few minutes because
@@ -81,7 +89,7 @@ incremental builds are seconds.
 ## Current status
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version log. Highlights as
-of **v0.7**:
+of **v0.8**:
 
 - QNX-style synchronous IPC — `ChannelCreate`/`Destroy`,
   `ConnectAttach`/`Detach`, `MsgSend`/`Receive`/`Reply`, plus
@@ -94,21 +102,55 @@ of **v0.7**:
 - Processes (`ProcessCreate`/`Terminate`, `posix_spawn`, `_exit`,
   shebang `#!`) with per-child untyped budget, cap-leak hygiene, and
   argv/envp on the child's initial stack per RISC-V SysV ABI.
+- **PCI bus support** — `/sbin/pci-server` enumerates qemu-virt's
+  PCIe root complex over generic ECAM; on boot the QEMU Q35 host
+  bridge plus an attached NVMe controller (1b36:0010) show up in
+  `/dev/slog`.  Client API via `libpci.a` (`pci_device_find` /
+  `_attach` / `_cfg_rd*` / `_read_ba` / `_read_irq`).  INTx routing
+  via four PLIC vectors.  DesignWare MSI / iATU and SiFive Unmatched
+  bring-up are v0.9.
+- **`Sync*` primitives** — QNX-shape mutex / condvar / semaphore in
+  libqsoe, fast-path CAS in userland, slow path through an
+  address-keyed wait queue in taskman (`TM_REQ_SYNC_WAIT`/`_WAKE`).
+  No futex layer; priority-inheritance deferred to the seL4/MCS
+  port.
+- **Resource Manager Database** — `rsrcdbmgr_create` / `_attach` /
+  `_detach` / `_query` in libqsoe, table backed by taskman.  Used
+  by pci-server to seed PCI windows and reserve INTx vectors.
+- **System logger** — `/sbin/slogger` owns a 64 KiB ring at
+  `/dev/slog`; `slogf(opcode, severity, fmt, ...)` from libqsoe
+  drops records; `/bin/sloginfo` drains them.
+- **FDT-driven syscfg** — taskman parses the device tree at boot
+  into a tagged blob (`_MEMORY`, `_CPUS`, `_PLIC`, `_PCI_ECAM`,
+  `_PCI_WINDOW`, `_PCI_IRQ`).  `TM_REQ_GET_SYSCFG` returns it;
+  libqsoe's `<qsoe/hwinfo.h>` walks the tags.
+- **`MAP_PHYS`** — physical-memory mapping via `qsoe_mmap`, with
+  greedy power-of-2 skip-retypes when an aperture sits inside a
+  larger untyped (PCI ECAM at `0x30000000` inside the 512 MiB UT
+  at `0x20000000`).
+- **`InterruptAttachThread` / `InterruptWait` / `InterruptUnmask`**
+  in libqsoe — QNX/QRV-compatible IRQ surface, used by both
+  `devc-ser8250` and `pci-server`.
 - **Path manager** in taskman (prefix-tree namespace registry) with
-  `register` / `repath` / `resolve` wire ops.
-- **`/dev/console`** routed at boot to `/dev/ser1` (the real UART)
-  by `/sbin/init`.
-- POSIX surface — ~25 entry points in `userland/libc/qsoe/`:
-  `open`/`close`/`read`/`write`/`writev`/`lseek`/`dup2`/`fcntl`,
-  `chdir`/`getcwd`/`unlink`/`fstat`/`fstatat`/`readlink`/`access`,
-  `opendir`/`readdir`, the `getpid`/`getppid`/`getuid`/... family,
-  `clock_gettime`/`gettimeofday`/`time`/`times`,
-  `nanosleep`/`setitimer`/`pause`, `umask`, `sysconf`, `isatty`,
-  `pthread_sigmask`, `strerror`.
+  `register` / `repath` / `resolve` / `symlink` wire ops, plus
+  the new `PATHMGR_HANDLER_TASKMAN_PMDIR` synthetic-directory
+  handler that backs `/dev` (so `ls /` sees `dev` even though no
+  single resmgr owns it).
+- **/dev populated**: `null` (1, 3), `zero` (1, 5), `console`
+  (5, 1), `tty` (symlink → console), `ser1` (4, 65 — Linux
+  ttyS1), `slog` (10, 100), `pci` (10, 200).  `ls -la /dev`
+  shows major / minor in the GNU `ls` shape via
+  `<sys/sysmacros.h>`.
+- POSIX surface — ~30 entry points in `userland/libc/qsoe/`,
+  including the v0.8 additions of `getpwent` / `getgrent` /
+  `getspent` (parsers ported from QRV) and a byte-oriented
+  `getopt` replacement for musl's locale-heavy version.
 - **musl libc** linked into spawned binaries — no `__sysinfo`
   indirection; QSOE-native POSIX entry points live in
   `userland/libc/qsoe/` and are symlinked into musl's
-  `src/os_dependent/`.
+  `src/os_dependent/`.  An OS-owned `pthread_impl.h` shim
+  (symlinked at parse time into musl's `src/internal/`) makes
+  `putchar` / `putc` link.
 - **mmap-only memory model** — no `brk` anywhere.  musl's three
   malloc backends are filtered out of `libc.a`; libqsoe provides
   `malloc`/`realloc`/`free` over `mmap`, which routes to taskman's
@@ -116,30 +158,27 @@ of **v0.7**:
 - **cpiofs** — embedded `userland.cpio` mounted read-only at `/`,
   with one level of CPIO symlink resolution
   (`/bin/sh` → `/bin/qsh`).
-- **BSD-style boot** — `/sbin/init` is a shell script:
-  ```sh
-  #!/bin/sh
-  /sbin/devc-ser8250
-  /sbin/repath /dev/console /dev/ser1
-  exec /bin/qsh -i
-  ```
-  Drivers detach via `procmgr_detach`; `wait` semantics + the
-  shebang machinery in `tm_spawn` make this work.
-- **`devc-ser8250`** — 16550 UART driver / resmgr, **rewritten in
-  v0.7-rc3 to use only `libqsoe` + `libc`**.  No `seL4_*`, no
-  `qsoe_sys_*`, no `taskman/` includes.  Three new libqsoe
-  primitives (`qsoe_irq_set_notification` / `_wait` / `_ack`)
-  encapsulate the IRQ-handler / Notification surface; blocking
-  reads park via `MsgSavereply`.
+- **BSD-style boot** — `/sbin/init` is a shell script.  Drivers
+  detach via `procmgr_detach`; `wait` semantics + the shebang
+  machinery in `tm_spawn` make this work.
+- **`devc-ser8250`** — 16550 UART driver / resmgr, **only
+  `libqsoe` + `libc`**.  Blocking reads park via `MsgSavereply`.
 - **`/sbin/pipe`** — POSIX pipe / FIFO resmgr.  16-pipe pool,
-  4 KiB ring each, QNX rcvid-park on full / empty.  Same "libqsoe +
-  libc only" discipline.
+  4 KiB ring each, QNX rcvid-park on full / empty.
 - **`<qsoe-system.h>`** — single top-level header for the libqsoe
   public surface (analogous to QNX's `<sys/neutrino.h>`).
 - **qsh** with working line discipline: backspace, VKILL, VEOF
   visible erase all work on the real UART via libqsoe's
-  `qsoe_ldisc_*` line-discipline primitives.  Arrow-key history
-  remains v0.7+ work.
+  `qsoe_ldisc_*` line-discipline primitives, now with batched
+  reads and UTF-8 codepoint-aware erase.  Arrow-key history
+  remains a future-version item.
+- **taskman logging discipline** — single `sel4_debug_*` callsite
+  behind five severity macros (`tm_err` / `tm_warn` / `tm_info`
+  / `tm_dbg` / `tm_trace`); `tm_crash()` halts with a loud banner
+  in place of `for (;;) __asm__ volatile("nop");`.
+- **`/bin/ls`** and **`/bin/cat`** — first two entries in the new
+  `userland/utils/` framework (wildcard Makefile, one `.c` per
+  binary).
 
 ## Documentation
 

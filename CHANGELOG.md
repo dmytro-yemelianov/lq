@@ -5,6 +5,225 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.8] — 2026-05-17
+
+**Milestone: PCI bus, system logger, real synchronisation, and a
+populated `/dev`.**  qemu-virt's PCIe root complex enumerates, the NVMe
+controller appears at BDF 0:1:0, every taskman log line carries a
+severity, `Sync*` primitives back QNX-shape mutexes/condvars/semaphores
+through an address-keyed wait queue (no futex layer), and `ls -la /dev`
+prints every device node with Linux-compatible `major, minor` numbers.
+Built up over rc1 → rc2 → rc3.
+
+### PCI subsystem (rc2)
+- **`/sbin/pci-server`** — first user-space driver port from QRV
+  (~7 000 LoC).  v0.8-rc2 scope: single-bus generic ECAM
+  (qemu-virt `pci-host-ecam-generic`), VID/DID/class scan, INTx vector
+  capture, client-API switch (`QSOE_PCI_REQ_BIOS_PRESENT`,
+  `FIND_DEV`, `CFG_RD`/`WR`, `ATTACH`/`DETACH`, `READ_BA`,
+  `READ_IRQ`).  Boot transcript:
+  `[pci-server] scan complete: 2 devices on bus 0` — the QEMU Q35
+  host bridge (1b36:0008) plus the NVMe controller (1b36:0010).
+- **`userland/libpci/`** — static `libpci.a`, ports QRV's
+  `pci_client.c` + `pci_strerror.c` + public `<pci/pci.h>`.  Lazy
+  `open("/dev/pci")` cached in a libqsoe `Sync*` mutex; each call
+  marshals into the matching `IOM_PCI_*` wire struct and `MsgSend`s.
+  MSI / MSI-X return `ENOSYS` in v0.8 (lands in v0.9 with the
+  DesignWare-MSI controller for SiFive Unmatched).
+- **hwinfo helpers in libqsoe** — `<qsoe/hwinfo.h>` /
+  `libqsoe/src/hwinfo.c`.  Lazy `TM_REQ_GET_SYSCFG` fetch
+  guarded by a `Sync*` mutex (singleton blob cached for process
+  lifetime); cursor walks the tag stream
+  (`TM_SYSCFG_TAG_PCI_ECAM`, `_WINDOW`, `_IRQ`).
+- **taskman `syscfg` extended** — `userland/taskman/sys/syscfg.c`
+  walks the FDT `/soc/pci@*` node, emitting one `_ECAM` tag, one
+  `_WINDOW` tag per `ranges` record (IO / MEM32 / MEM64 + prefetch
+  flags decoded from the child-addr high cell), and one `_IRQ` tag
+  carrying the four INTx PLIC legs.
+
+### Resource Manager Database (rc1)
+- **`userland/libqsoe/src/rsrcdb.c`** — QNX-shape `rsrcdbmgr_create` /
+  `_attach` / `_detach` / `_query`.  Each call wraps the new
+  `TM_REQ_RSRCDB_*` ops.
+- **taskman side** — `userland/taskman/sys/rsrcdb.c` carries a
+  small static table of resource ranges (IO ports, memory windows,
+  IRQ vectors).  Used by pci-server to seed PCI memory / I/O
+  windows from the FDT-derived `_WINDOW` tags and to reserve the
+  four INTx PLIC vectors so client drivers can't double-claim them.
+
+### Interrupt API
+- **`InterruptAttachThread` / `InterruptWait` / `InterruptUnmask`**
+  in `userland/libqsoe/src/interrupt.c` — QNX/QRV-compatible IRQ
+  surface.  Per-thread cap of 16 attaches.  Replaces the v0.7-era
+  hand-rolled `seL4_IRQHandler_*` choreography in
+  `dev/ser8250/src/irq.c`.
+
+### MAP_PHYS for drivers
+- **`QSOE_MAP_PHYS`** flag on `qsoe_mmap` — physical-memory mapping
+  with greedy power-of-2 skip-retypes when the requested aperture
+  sits inside a larger untyped (e.g. PCI ECAM at `0x30000000` inside
+  the 512 MiB UT at `0x20000000`).  Taskman side does the retype
+  walk; client gets back a virtual mapping.  Uses `Mega_Page` (2 MiB)
+  for windows ≥ 2 MiB.
+
+### FDT parser + syscfg blob
+- **`userland/taskman/sys/fdt.c`** — minimal FDT walker (depth-first,
+  no live-tree allocation) sufficient for the nodes QSOE cares about
+  on qemu-virt and the Unmatched.  Path-keyed `tm_fdt_path()` returns
+  a node cursor; property lookup is byte-oriented.
+- **`syscfg.c`** — builds a self-describing tagged blob at boot.
+  Tag list: `_END`, `_MEMORY`, `_BOOTHART`, `_CPUS`, `_PLIC`,
+  `_PCI_ECAM`, `_PCI_WINDOW`, `_PCI_IRQ`.  Future tags
+  (`_DW_MSI`, `_CLOCK_FREQ`) land in v0.9.
+- **`TM_REQ_GET_SYSCFG`** — wire op returns the blob into the
+  caller's IPC buffer.  Reply framing fixed in rc2:
+  `reply_len = 4 + (want + 7) / 8` so the kernel actually
+  transfers `msg[4..]` to the client.
+
+### System logger
+- **`/sbin/slogger`** — system log ring (64 KiB) backed by a
+  resmgr at `/dev/slog`.  Wire op `TM_REQ_IO_WRITE` from `slogf()`
+  drops records into the ring; `TM_REQ_IO_READ` drains them.
+  Standard hand-built `MsgReceive` loop modelled on devc-ser8250.
+- **`slogf(opcode, severity, fmt, ...)`** in libqsoe —
+  `<sys/slog.h>` API.  Severities `_SLOG_*` and codes
+  `_SLOGC_*` mirror QRV exactly.
+- **`/bin/sloginfo`** — drain the slog ring to stdout.  Used at
+  the qsh prompt to inspect what drivers logged during boot.
+
+### Synchronisation: Sync* primitives, no futexes
+- **`<sys/sync.h>`** in libqsoe — QNX-shape `SyncTypeCreate`,
+  `SyncDestroy`, `SyncMutexLock`/`_Unlock`, `SyncCondvarWait`/
+  `_Signal`/`_Broadcast`, `SyncSemPost`/`_Wait`.  `sync_t = {long
+  count; unsigned long owner;}`; flag bits use the `QRV_` prefix
+  (`QRV_SYNC_WAITERS = 0x80000000`).
+- **Userspace fast path** — CAS on the `sync_t` word.  Uncontended
+  lock / unlock never enters taskman.
+- **Slow path: address-keyed wait/wake in taskman, NOT futex(2).**
+  `userland/taskman/sys/sync.c` — 16-bucket wait list, 4 waiters
+  per bucket.  Two modes: credit-absorb (for mutex) and gen-check
+  (for condvar).  Reply parking via `qsoe_cnode_save_caller`.
+  Wire ops `TM_REQ_SYNC_WAIT` / `_WAKE`.
+- **Priority inheritance deferred** to the eventual seL4/MCS port —
+  current scheduling model has no `sched_context_donate` analogue,
+  so PI would be either a no-op or a custom hand-coded boost.  Both
+  ugly; sidestep until MCS.
+
+### POSIX surface: user database, getopt, pthread_impl
+- **`userland/libc/qsoe/getpwent.c` / `getgrent.c` / `getspent.c`** —
+  parsers ported from QRV; supersede musl's locale-heavy versions
+  (which are now excluded in `placement.txt`).  In v0.8 there is no
+  `/etc/passwd` on disk; the parsers will switch to reading
+  `/usr/etc/passwd` once `fs-qrv` lands in v0.9.
+- **`userland/libc/qsoe/getopt.c`** — byte-oriented replacement for
+  musl's locale-dependent version (also excluded).
+- **`userland/libc/include/pthread_impl.h`** — OS-owned shim,
+  symlinked at parse-time into `core/userland/libc/src/internal/`.
+  Defines `struct __pthread { int tid; }`, `__pthread_self()`
+  reads the `tp` register, `__wake` / `__futexwait` stub out so
+  musl's `putc.h` (which depends on `pthread_impl.h`) finally
+  links — `putchar` works again.
+
+### userland/utils framework
+- **New top-level `userland/utils/`** — wildcard Makefile, one
+  `.c` per binary, drops the result into `$(BUILD)/utils/<name>.elf`
+  and packs it as `/bin/<name>` in the CPIO.
+- **`/bin/ls`** — ported from QRV (xv6-based, MIT + Apache-2.0,
+  164 LoC).  Flags `-l` and `-a`.  In v0.8-rc3, `-l` on a
+  char/block device replaces the size column with `major, minor`
+  (via `<sys/sysmacros.h>`) — matches GNU coreutils.
+- **`/bin/cat`** — 71 LoC, reads a list of files into stdout.
+
+### /dev and pathmgr improvements
+- **/dev/null + /dev/zero** — pseudo-devices in taskman, mirror
+  Linux `(1, 3)` / `(1, 5)`.
+- **/dev/tty** — pathmgr symlink to `/dev/console`.
+  `tm_pathmgr_symlink()` is a new node type that resolves at open
+  time (one level; no recursion).
+- **fstat in devc-ser8250** — `/dev/ser1` reports
+  `S_IFCHR | 0666` with `(major, minor) = (4, 65)` (Linux ttyS1).
+  `isatty(open("/dev/ser1"))` now returns 1 → qsh engages the
+  interactive line editor without an explicit `-i`.
+- **Synthetic `/dev` directory** (rc3) — new
+  `PATHMGR_HANDLER_TASKMAN_PMDIR` backing path nodes that have
+  registered children but no resmgr.  `path/pmdir.c` carries the
+  per-open slot table; readdir iterates the pathmgr-tree
+  children (so `ls /dev` lists `null zero console tty slog ser1
+  pci` even though no single resmgr owns the directory).
+- **cpiofs readdir** merges pathmgr-root children after the CPIO
+  walk completes, so `ls /` sees `dev` alongside `bin` and `sbin`.
+- **cpiofs readdir** subdirectory dedup widened from a single
+  slot to a 16-entry list — fixes a double-listing of `bin/` and
+  `sbin/` when CPIO interleaves entries from multiple directories.
+- **fstat on external resmgrs** — slogger / devc-ser8250 / pci-server
+  each now reply to `TM_REQ_FSTAT` with a char-device stat.  Without
+  this, `lstat("/dev/pci")` returned `ENOSYS` and `ls /dev` printed
+  "cannot stat /dev/pci".
+- **Linux-compat (major, minor)** across the board:
+  `/dev/null = (1, 3)`, `/dev/zero = (1, 5)`,
+  `/dev/console = (5, 1)`, `/dev/ser1 = (4, 65)`,
+  `/dev/slog = (10, 100)`, `/dev/pci = (10, 200)`.
+
+### Logging & crash discipline in taskman
+- **Single `sel4_debug_*` callsite** — `userland/taskman/tm_log.c`.
+  Five severity macros — `tm_err` / `tm_warn` / `tm_info` /
+  `tm_dbg` / `tm_trace` — expand to a printf-lite formatter
+  (`%s` / `%c` / `%d` / `%u` / `%x` / `%p` / `%l` / `%0NX`).  All
+  17 prior raw `sel4_debug_puts` sites converted; pci-server's
+  two sites converted to `slogf`; tester converted to `printf`.
+- **`tm_crash()`** — loud unmistakable banner + halt-in-WFI.
+  Replaces 17 occurrences of
+  `tm_err(...); for(;;) __asm__ volatile("nop");` across `main.c`.
+
+### Path canonicalisation in open()
+- **`userland/libc/qsoe/open.c`** — relative paths are prepended
+  with the cwd, then `./` / `../` / `//` are collapsed in-place
+  before the path goes on the wire.  Fixes `ls` in any subdirectory
+  (e.g. `cd /bin; ls .` was previously
+  `ls: cannot stat .` because pathmgr saw `/bin/.`).
+
+### taskman scratch VA, future-proof
+- **`TM_SCRATCH_VADDR = 0x40000000`** with lazy
+  `ensure_scratch_pt()` allocating its own L1 + L0 page tables on
+  first use.  The previous strategy (scratch immediately after
+  the image) broke when taskman.elf grew past `0x1F8000` with
+  `tm_log` + `sync.c` added; the new layout has 1 GiB of headroom
+  below the image and is independent of image size.
+
+### Build / boot
+- **`emu.sh`** — replaces `make run`.  Default device set attaches
+  an NVMe controller backed by a sparse 64 MiB file
+  (`test/nvme.img`, auto-created), so pci-server's scan finds
+  something interesting to enumerate.  Flags: `-gdb`, `-no-nvme`,
+  `--` pass-through.
+- **crt0 consolidation** — five identical `userland/*/start.S`
+  files unified into one shared `crt0.S` in libqsoe; per-binary
+  Makefiles pick it up from `$(LIBQSOE_DIR)/src/`.
+- **Top-level `Makefile` shrunk** — each component owns its own
+  Makefile; the top level delegates rather than spawning rules
+  per-file.
+
+### LDISC refactor (rc1)
+- **Batch reads** — `qsoe_ldisc_readline` now consumes whatever
+  bytes the driver has buffered in one `read()` instead of
+  one-at-a-time.
+- **UTF-8 codepoint erase** — backspace deletes a full codepoint
+  (1–4 bytes) rather than a single byte.
+
+### Known gaps / deferred to v0.9 / v0.10
+- DesignWare MSI / iATU controller — needed for SiFive Unmatched
+  boot; pci-server gains the runtime-detect path in v0.9.
+- `fs-qrv` + `devb-nvme` — block-device resmgr and on-disk
+  filesystem, mounted at `/usr`, with `/etc` symlinked into it.
+  Once present, `/etc/passwd` / `group` / `shadow` go live.
+- `poll()` is still a stub; real pulse-based per-fd readiness
+  with timer integration is the v0.9 ticket.
+- `TM_CLOCK_FREQ_HZ` is still hardcoded; v0.9 reads
+  `/cpus/timebase-frequency` from the FDT (the parser exists now;
+  just plumb the field through).
+- Hotplug / surprise-remove on PCI, MSI-X capability programming,
+  AER / DPC error handling, SR-IOV — all v0.9+.
+
 ## [v0.7] — 2026-05-15
 
 **Milestone: full QNX-shape userland.**  Interactive shell with working
