@@ -13,7 +13,7 @@
 #   ./emu.sh -no-nvme              omit the NVMe controller
 #   ./emu.sh -- <extra qemu args>  pass-through to qemu after `--`
 #
-# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
 # SPDX-License-Identifier: Apache-2.0
 
 set -e
@@ -21,6 +21,13 @@ set -e
 TOP=$(cd "$(dirname "$0")" && pwd)
 BUILD=$TOP/build
 IMAGE=$BUILD/qsoe.elf
+# Note: the userland module package (modpkg.cpio, built by
+# `make -C ../quser cpio`) is NOT passed via QEMU `-initrd`.  Taskman
+# embeds it directly via .incbin (see taskman/Makefile), so the bytes
+# already live inside taskman.elf and travel into RAM as part of the
+# kernel image.  A vestigial FDT-driven loader exists at
+# taskman/sys/initrd.c -- see comments there before flipping back to
+# QEMU-initrd delivery.
 TESTDIR=$TOP/test
 
 CPUS=4
@@ -65,7 +72,7 @@ QEMUOPTS=(-machine virt -nographic -m "$MEM" -smp "$CPUS"
 # ---------------------------------------------------------------------
 # NVMe — attach a backing-file disk so /sbin/pci-server enumerates the
 # QEMU NVMe controller (vid:did 1b36:0010, class 0x010802) at boot.
-# Image is just a sparse 64 MiB file at test/nvme.img — actual
+# Image is just a sparse 64 MiB file at build/nvme.img — actual
 # partition / filesystem layout lands in v0.9 once devb-nvme + a real
 # QSOE filesystem are up.
 #
@@ -73,12 +80,12 @@ QEMUOPTS=(-machine virt -nographic -m "$MEM" -smp "$CPUS"
 # is the v0.8-rc2 goal: prove that the PCI walker sees the device.
 # ---------------------------------------------------------------------
 if [[ $ATTACH_NVME -eq 1 ]]; then
-    mkdir -p "$TESTDIR"
-    if [[ ! -s $TESTDIR/nvme.img ]]; then
-        echo "emu.sh: creating $TESTDIR/nvme.img (64 MiB, sparse, blank)..."
-        truncate -s 64M "$TESTDIR/nvme.img"
+    mkdir -p "$BUILD"
+    if [[ ! -s $BUILD/nvme.img ]]; then
+        echo "emu.sh: creating $BUILD/nvme.img (64 MiB, sparse, blank)..."
+        truncate -s 64M "$BUILD/nvme.img"
     fi
-    QEMUOPTS+=(-drive   "file=$TESTDIR/nvme.img,if=none,format=raw,id=nvm0"
+    QEMUOPTS+=(-drive   "file=$BUILD/nvme.img,if=none,format=raw,id=nvm0"
                -device  "nvme,drive=nvm0,serial=qsoe-test")
 fi
 

@@ -7,11 +7,23 @@
 #   OpenSBI  →  elfloader  →  seL4 kernel  →  taskman (rootserver)
 #
 # Build inputs:
-#   core/kernel/startup/  — elfloader sources (extracted from sel4test)
-#   core/lib/cpio/        — libcpio (CPIO parser used by elfloader)
-#   userland/taskman/     — hand-written taskman (currently a spin loop)
-#   scripts/sel4test-full/ — upstream sel4test; we run its CMake build
-#                            once to produce kernel.elf.
+#   ../sel4-bootstrap/seL4/        — upstream seL4 kernel; cloned by `make
+#                                    prepare` (shallow); kernel.elf built
+#                                    directly via cmake against it.
+#   ../sel4-bootstrap/seL4_tools/  — upstream seL4 tooling; cloned by
+#                                    `make prepare` (shallow).  We compile
+#                                    elfloader-tool/src/ ourselves with
+#                                    rules below; no CMake involvement.
+#   ../common/                     — umbrella shared code.  Currently:
+#                                    libcpio (vendored from seL4 util_libs;
+#                                    see ../common/NOTICE-libcpio.md).  A
+#                                    self-referencing symlink `cpio -> .`
+#                                    makes both `<cpio.h>` and the
+#                                    upstream-style `<cpio/cpio.h>`
+#                                    resolve to ../common/cpio.h, so no
+#                                    per-OS shim header is needed.
+#   taskman/                       — hand-written taskman + vendored
+#                                    sel4runtime (taskman/runenv/).
 #
 # Generated configuration headers (build/gen/) are written by this Makefile
 # directly, with the minimum set of CONFIG_ defines the RISC-V elfloader
@@ -22,7 +34,7 @@
 #   ./emu.sh        boot it under qemu-system-riscv64
 #   make kernel     build kernel.elf only
 #   make clean      remove build/
-#   make distclean  also remove scripts/sel4test-full/build-qsoe-riscv64/
+#   make distclean  also remove ../sel4test-full/build-qsoe-riscv64/
 
 # ----------------------------------------------------------------------------
 # Toolchain
@@ -43,40 +55,82 @@ GEN         := $(BUILD)/gen
 ELFBUILD    := $(BUILD)/elfloader
 TASKBUILD   := $(BUILD)/taskman
 
-CORE        := $(TOP)/core
-ELFSRC      := $(CORE)/kernel/startup
-LIBCPIO     := $(CORE)/lib/cpio
+# Bootstrap clones live at the QSOE umbrella root (~/proj/QSOE/
+# sel4-bootstrap/), one level UP from lq/.  `make prepare` populates
+# them on first build; downstream rules reach into them by path.
+SEL4_BOOTSTRAP := $(abspath $(TOP)/..)/sel4-bootstrap
+SEL4_DIR       := $(SEL4_BOOTSTRAP)/seL4
+SEL4_TOOLS_DIR := $(SEL4_BOOTSTRAP)/seL4_tools
 
-TASKMAN_DIR := $(TOP)/userland/taskman
-LIBQSOE_DIR := $(TOP)/userland/libqsoe
-TESTER_DIR  := $(TOP)/userland/tester
-TESTBUILD   := $(BUILD)/tester
+# Elfloader sources live INSIDE seL4_tools' clone; we compile them
+# ourselves with our own Make rules — no upstream CMake involvement
+# for the elfloader.
+ELFSRC      := $(SEL4_TOOLS_DIR)/elfloader-tool/src
+ELFINCLUDE  := $(SEL4_TOOLS_DIR)/elfloader-tool/include
 
-# v0.5.1: musl libc. Vendored at core/userland/libc/; built into a
-# static archive that gets linked into spawnable QSOE binaries.
-MUSL_DIR     := $(CORE)/userland/libc
-MUSL_PATCHES := $(MUSL_DIR)/patches
-MUSL_GEN     := $(BUILD)/libc-gen
-LIBC_BUILD   := $(BUILD)/libc-obj
-LIBC_A       := $(BUILD)/libc.a
+# libcpio lives in the umbrella's common/ tree (vendored from seL4
+# util_libs, BSD-2-Clause; see ../common/NOTICE-libcpio.md).  A
+# `cpio -> .` symlink at common/cpio lets the upstream-style include
+# `<cpio/cpio.h>` resolve to common/./cpio.h via the same -I path
+# that our flat `<cpio.h>` uses -- no per-OS shim header needed.
+LIBCPIO     := $(TOP)/../common
 
-SEL4TEST    := $(TOP)/sel4test-full
-SEL4BUILD   := $(SEL4TEST)/build-qsoe-riscv64
-KERNEL_SRC  := $(SEL4BUILD)/kernel/kernel.elf
+TASKMAN_DIR := $(TOP)/taskman
+
+# libc — shared OS-independent body lives in the sibling repo
+# ~/proj/QSOE/libc/; LQ's seL4-specific seam (POSIX entry points that
+# translate to TM_REQ_* over seL4 IPC) lives in lq/libc/.  The local
+# Makefile under lq/libc/ drives the cross-tree build and lands the
+# archives under $(BUILD)/libc/.  Replaced the older vendored musl
+# tree at core/userland/libc/ on 2026-05-31.
+LIBC_DIR     := $(TOP)/libc
+LIBC_BUILD   := $(BUILD)/libc
+LIBC_A       := $(LIBC_BUILD)/libc.a
+LIBC_SO      := $(LIBC_BUILD)/libc.so
+LIBC_CRT0    := $(LIBC_BUILD)/crt0.o
+LIBC_INCLUDE := $(TOP)/../libc/include
+
+# libtaskman — OS-independent body of every QSOE taskman.  Lives at the
+# umbrella root, will graduate to its own gitlab repo (qsoe/libtaskman).
+# Linked into taskman.elf; provides pathmgr / cred / syscfg / cpio /
+# elf primitives plus init/seams.  See ~/proj/QSOE/libtaskman/CLAUDE.md
+# (when written) and project_libtaskman memory.
+LIBTASKMAN_DIR := $(abspath $(TOP)/..)/libtaskman
+LIBTASKMAN_BUILD := $(BUILD)/libtaskman
+LIBTASKMAN_A     := $(LIBTASKMAN_BUILD)/libtaskman.a
+
+# rtld -- the QSOE dynamic linker (ld-qsoe.so.1).  Lives in the shared
+# libc/rtld/ tree (OS-independent: walks libc.so's .dynsym at startup
+# for POSIX entrypoints, no raw kernel calls).  Borrowed from FreeBSD,
+# see project_borrow_rtld memory.
+RTLD_DIR        := $(abspath $(TOP)/..)/libc/rtld
+RTLD_BUILD      := $(BUILD)/rtld
+RTLD_SO         := $(RTLD_BUILD)/ld-qsoe.so.1
+
+# Kernel build directory: lives next to the bootstrap clones so a
+# `git pull` of seL4 doesn't clobber our build state, but is kept
+# off the bootstrap tree itself so it can be wiped via distclean
+# without touching the sources.
+SEL4BUILD   := $(SEL4_BOOTSTRAP)/build-qsoe-riscv64
+KERNEL_SRC  := $(SEL4BUILD)/kernel.elf
 KERNEL_ELF  := $(BUILD)/kernel.elf
 
 IMAGE         := $(BUILD)/qsoe.elf
 TASKMAN_ELF   := $(BUILD)/taskman.elf
-TESTER_ELF    := $(BUILD)/tester.elf
-INIT_SH       := $(TOP)/userland/init/init.sh
-DSER_ELF      := $(BUILD)/devc-ser8250.elf
-SBIN_PIPE_ELF := $(BUILD)/sbin-pipe.elf
-SBIN_REPATH_ELF := $(BUILD)/sbin-repath.elf
-SBIN_SLOGGER_ELF := $(BUILD)/sbin-slogger.elf
-SBIN_PCI_ELF  := $(BUILD)/sbin-pci-server.elf
-SLOGINFO_ELF  := $(BUILD)/sloginfo.elf
-LIBPCI_A      := $(BUILD)/libpci.a
-USERLAND_CPIO := $(BUILD)/userland.cpio
+
+# Userland module package -- the spawnable-binary archive that taskman
+# walks at runtime.  Lives in the sibling quser/ tree (one repo per QRV
+# convention) and is built there by `make -C ../quser cpio`.  This LQ
+# build does NOT produce its own userland.cpio (retired 2026-05-31).
+# Taskman embeds the archive via .incbin (see taskman/Makefile and
+# taskman/main.c #else branch); the bytes therefore travel inside
+# taskman.elf, no QEMU `-initrd` plumbing.  A vestigial FDT-driven
+# loader path is parked behind -DTM_USE_INITRD_LOADER pending
+# elfloader work on reserved-memory delivery -- see
+# taskman/sys/initrd.c.
+QUSER         := $(abspath $(TOP)/..)/quser
+MODPKG_CPIO   := $(QUSER)/build/modpkg.cpio
+export MODPKG_CPIO
 
 # ----------------------------------------------------------------------------
 # Platform configuration (qemu-riscv-virt, RV64)
@@ -107,25 +161,31 @@ EL_CFLAGS := $(ARCH_CFLAGS) \
 
 EL_INCLUDES := \
     -I$(GEN) \
-    -I$(ELFSRC)/include \
-    -I$(ELFSRC)/include/arch-riscv \
-    -I$(LIBCPIO)/include
+    -I$(ELFINCLUDE) \
+    -I$(ELFINCLUDE)/arch-riscv \
+    -I$(LIBCPIO)
 
+# Taskman's sel4_types.h / sel4_syscalls.h are our own minimal seL4
+# surface, but they transitively #include <arch/api/invocation.h>
+# and <arch/api/syscall.h> — generated by the kernel build, 4 files
+# under $(SEL4BUILD)/gen_headers/.  Anyone using TM_CFLAGS therefore
+# needs that include path.
 TM_CFLAGS := $(ARCH_CFLAGS) \
     -ffreestanding -nostdlib -nostdinc \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
     -fno-builtin -Wall -Wextra \
     -I$(GEN) \
-    -I$(CORE)/kernel/sel4_gen \
-    -I$(LIBQSOE_DIR)/include \
-    -I$(TOP)/userland/libpci/include
+    -I$(SEL4BUILD)/gen_headers \
+    -I$(LIBC_INCLUDE)
 
 # ----------------------------------------------------------------------------
 # Source lists
 # ----------------------------------------------------------------------------
 
-# Elfloader sources actually needed for RISC-V (drivers/ is ARM-only upstream).
-EL_C_SRCS := \
+# Elfloader sources actually needed for RISC-V (drivers/ is ARM-only
+# upstream).  Sources span two roots — upstream seL4_tools and our
+# vendored libcpio — so the object-name mapping is done explicitly.
+EL_UP_C_SRCS := \
     $(ELFSRC)/common.c \
     $(ELFSRC)/defaults.c \
     $(ELFSRC)/fdt.c \
@@ -135,24 +195,61 @@ EL_C_SRCS := \
     $(ELFSRC)/arch-riscv/console.c \
     $(ELFSRC)/binaries/elf/elf.c \
     $(ELFSRC)/binaries/elf/elf32.c \
-    $(ELFSRC)/binaries/elf/elf64.c \
-    $(LIBCPIO)/src/cpio.c
+    $(ELFSRC)/binaries/elf/elf64.c
 
-EL_S_SRCS := $(ELFSRC)/arch-riscv/crt0.S
+EL_UP_S_SRCS := $(ELFSRC)/arch-riscv/crt0.S
+
+EL_CPIO_C_SRCS := $(LIBCPIO)/cpio.c
 
 EL_OBJS := \
-    $(patsubst $(CORE)/%.c,$(ELFBUILD)/%.o,$(EL_C_SRCS)) \
-    $(patsubst $(CORE)/%.S,$(ELFBUILD)/%.o,$(EL_S_SRCS))
+    $(patsubst $(ELFSRC)/%.c,$(ELFBUILD)/elfloader/%.o,$(EL_UP_C_SRCS)) \
+    $(patsubst $(ELFSRC)/%.S,$(ELFBUILD)/elfloader/%.o,$(EL_UP_S_SRCS)) \
+    $(patsubst $(LIBCPIO)/%.c,$(ELFBUILD)/cpio/%.o,$(EL_CPIO_C_SRCS))
 
 # ----------------------------------------------------------------------------
 # Default target
 # ----------------------------------------------------------------------------
 
-.PHONY: all image kernel clean distclean
+.PHONY: all image kernel clean distclean prepare
 .DEFAULT_GOAL := all
 
-all: image
+# `all` triggers `prepare` first so a clean clone is auto-populated
+# on the very first build.  `prepare` is idempotent: it checks for
+# the bootstrap clones and only fetches what is missing.  modpkg is
+# also folded in so a clean `make` produces both qsoe.elf AND the
+# userland CPIO that emu.sh hands to QEMU as initrd.
+all: prepare image modpkg
 image: $(IMAGE)
+
+# ----------------------------------------------------------------------------
+# Prepare: shallow-clone seL4 + seL4_tools into ../sel4-bootstrap/.
+#
+# Two repos.  No `repo` tool, no manifest, no test apps, no musl, no
+# CapDL, no nanopb — just the kernel and the elfloader source we
+# actually compile.  Total footprint ~50 MB vs ~2 GB for the full
+# sel4test-manifest checkout.
+#
+# Idempotent: existing clones are left alone.  To refresh, either
+# `git pull` inside each clone, or `rm -rf ../sel4-bootstrap/` and
+# re-run `make prepare`.
+# ----------------------------------------------------------------------------
+
+SEL4_URL       := https://github.com/seL4/seL4.git
+SEL4_TOOLS_URL := https://github.com/seL4/seL4_tools.git
+
+prepare:
+	@if [ ! -d $(SEL4_DIR) ]; then \
+	    echo "==> Cloning seL4 kernel into $(SEL4_DIR)..."; \
+	    git clone --depth 1 $(SEL4_URL) $(SEL4_DIR); \
+	else \
+	    echo "==> seL4 already present at $(SEL4_DIR)"; \
+	fi
+	@if [ ! -d $(SEL4_TOOLS_DIR) ]; then \
+	    echo "==> Cloning seL4_tools into $(SEL4_TOOLS_DIR)..."; \
+	    git clone --depth 1 $(SEL4_TOOLS_URL) $(SEL4_TOOLS_DIR); \
+	else \
+	    echo "==> seL4_tools already present at $(SEL4_TOOLS_DIR)"; \
+	fi
 
 # ----------------------------------------------------------------------------
 # Generated configuration headers
@@ -216,11 +313,18 @@ $(GEN)/platform_info.h:
 # Elfloader: per-file compile rules
 # ----------------------------------------------------------------------------
 
-$(ELFBUILD)/%.o: $(CORE)/%.c $(GEN_HEADERS)
+# Two source roots — upstream elfloader and our vendored libcpio —
+# get separate rules so the object-tree under $(ELFBUILD) mirrors
+# the source layout cleanly.
+$(ELFBUILD)/elfloader/%.o: $(ELFSRC)/%.c $(GEN_HEADERS) | prepare
 	@mkdir -p $(@D)
 	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
 
-$(ELFBUILD)/%.o: $(CORE)/%.S $(GEN_HEADERS)
+$(ELFBUILD)/elfloader/%.o: $(ELFSRC)/%.S $(GEN_HEADERS) | prepare
+	@mkdir -p $(@D)
+	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
+
+$(ELFBUILD)/cpio/%.o: $(LIBCPIO)/%.c $(GEN_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
 
@@ -228,7 +332,7 @@ $(ELFBUILD)/%.o: $(CORE)/%.S $(GEN_HEADERS)
 # Elfloader: preprocess linker script
 # ----------------------------------------------------------------------------
 
-$(ELFBUILD)/linker.lds_pp: $(ELFSRC)/linker.lds $(GEN_HEADERS)
+$(ELFBUILD)/linker.lds_pp: $(ELFSRC)/linker.lds $(GEN_HEADERS) | prepare
 	@mkdir -p $(@D)
 	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -P -E -x c -o $@ $<
 
@@ -252,11 +356,10 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/path/cpiofs.h \
     $(TASKMAN_DIR)/sys/console.h \
     $(TASKMAN_DIR)/sys/platform.h \
-    $(LIBQSOE_DIR)/include/qsoe-system.h \
-    $(LIBQSOE_DIR)/include/qsoe/slots.h \
-    $(LIBQSOE_DIR)/include/qsoe/tls.h \
-    $(LIBQSOE_DIR)/include/qsoe/wire.h \
-    $(LIBQSOE_DIR)/src/state.h \
+    $(LIBC_INCLUDE)/qsoe-system.h \
+    $(LIBC_INCLUDE)/qsoe/slots.h \
+    $(LIBC_INCLUDE)/qsoe/tls.h \
+    $(LIBC_INCLUDE)/qsoe/wire.h \
     $(GEN)/qsoe/sys_version.h
 
 # Auto-generated version header. Pulls the latest git tag (vMAJOR.MINOR[.PATCH])
@@ -280,229 +383,108 @@ $(GEN)/qsoe/sys_version.h: $(wildcard .git/HEAD .git/index)
 	 printf '#endif\n' >> $@
 
 # ----------------------------------------------------------------------------
-# musl libc — build delegated to userland/libc/Makefile.
+# libc — build delegated to lq/libc/Makefile, which drives the shared
+# OS-independent body in ~/proj/QSOE/libc/ with LQ's seam.
 #
-# Run `make -C userland/libc clean all` for a standalone libc.a rebuild;
-# the top-level `libc` target below proxies the same submake invocation
-# so existing dependencies keep working.
+# Run `make -C libc clean all` for a standalone rebuild.
 # ----------------------------------------------------------------------------
-
-MUSL_GEN_HDRS := $(MUSL_GEN)/include/bits/alltypes.h \
-                 $(MUSL_GEN)/include/bits/syscall.h \
-                 $(MUSL_GEN)/src/internal/version.h
 
 AR := $(CROSS)ar
 
 .PHONY: libc
 libc:
-	+$(MAKE) -C $(TOP)/userland/libc all
+	+$(MAKE) -C $(LIBC_DIR) all
 
-# Order-only proxy targets — when a downstream rule has $(LIBC_A) or one
-# of $(MUSL_GEN_HDRS) as a prerequisite, make sees libc as the producer
-# and recurses into userland/libc.
-$(LIBC_A) $(MUSL_GEN_HDRS): | libc
+# Order-only proxy: downstream rules listing $(LIBC_A) / $(LIBC_SO) /
+# $(LIBC_CRT0) as a prerequisite trigger the libc submake.
+$(LIBC_A) $(LIBC_SO) $(LIBC_CRT0): | libc
 	@true
 
-# libqsoe — build delegated to userland/libqsoe/Makefile.  Produces two
-# archives:
-#   $(LIBQSOE_A)    — normal flavour (init/tester/qsh/devc-ser8250/pipe)
-#   $(LIBQSOE_TM_A) — IN_TASKMAN flavour (taskman links this in)
-LIBQSOE_A    := $(BUILD)/libqsoe.a
-LIBQSOE_TM_A := $(BUILD)/libqsoe-tm.a
+# libqsoe — retired 2026-06-01.  User-mode primitives folded into the
+# libc seam at lq/libc/qsoe/; taskman absorbed its own private copies
+# under taskman/qsoe/.  See project_libqsoe_folds_into_libc.
 
-.PHONY: libqsoe
-libqsoe:
-	+$(MAKE) -C $(TOP)/userland/libqsoe all
+# taskman — build delegated to taskman/Makefile.  Embeds the quser-
+# built modpkg.cpio via .incbin (the path retired 2026-05-31 then
+# restored 2026-06-01; see taskman/Makefile top-of-file).
+# Depends on $(MODPKG_CPIO) so changing a quser binary triggers a
+# taskman re-link.
+.PHONY: rtld
+rtld: $(RTLD_SO)
 
-$(LIBQSOE_A) $(LIBQSOE_TM_A) $(BUILD)/crt0.o: | libqsoe
-	@true
+# Build ld-qsoe.so.1 from the shared libc/rtld/ tree.  Pure userland
+# shared object -- no taskman/seL4 dependency at build time.  LIBC_INC
+# plumbs <qsoe-system.h>.
+$(RTLD_SO):
+	@mkdir -p $(RTLD_BUILD)
+	+$(MAKE) -C $(RTLD_DIR) \
+	    O=$(RTLD_BUILD) \
+	    LIBC_INC=$(LIBC_INCLUDE) \
+	    EXTRA_CPPFLAGS=-DQSOE_KERNEL_SEL4 \
+	    ARCHFLAGS="-march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany" \
+	    all
 
-# taskman — build delegated to userland/taskman/Makefile.  Embeds the
-# userland CPIO via .incbin, so depends on $(USERLAND_CPIO) existing
-# first (built by the cpio rule further down).
+.PHONY: libtaskman
+libtaskman: $(LIBTASKMAN_A)
+
+# Build libtaskman.a from the umbrella-root tree.  Taskman is a freestanding
+# static-link client, so override PICFLAG to -fno-pic to match the rest of
+# taskman.  LIBC_INC plumbs <qsoe-system.h> in.
+$(LIBTASKMAN_A):
+	@mkdir -p $(LIBTASKMAN_BUILD)
+	+$(MAKE) -C $(LIBTASKMAN_DIR) \
+	    O=$(LIBTASKMAN_BUILD) \
+	    LIBC_INC=$(LIBC_INCLUDE) \
+	    PICFLAG=-fno-pic \
+	    ARCHFLAGS="$(ARCH_CFLAGS)" \
+	    all
+
 .PHONY: taskman
-taskman: $(USERLAND_CPIO) $(LIBQSOE_TM_A)
-	+$(MAKE) -C $(TOP)/userland/taskman all
+taskman: $(MODPKG_CPIO) $(LIBTASKMAN_A) $(GEN)/qsoe/sys_version.h
+	+$(MAKE) -C $(TOP)/taskman all LIBTASKMAN_A=$(LIBTASKMAN_A) LIBTASKMAN_INC=$(LIBTASKMAN_DIR)/include
 
 $(TASKMAN_ELF): | taskman
 	@true
 
-# ----------------------------------------------------------------------------
-# Tester — second user-space program, spawned by taskman.
-# ----------------------------------------------------------------------------
-
-TESTER_CFLAGS := $(TM_CFLAGS) \
-    -isystem $(MUSL_GEN)/include \
-    -isystem $(MUSL_DIR)/include \
-    -isystem $(MUSL_DIR)/arch/riscv64 \
-    -isystem $(MUSL_DIR)/arch/generic
-
-$(TESTBUILD)/main.o: $(TESTER_DIR)/main.c $(TASKMAN_DIR)/sel4_syscalls.h \
-                     $(TASKMAN_DIR)/sel4_types.h \
-                     $(LIBQSOE_DIR)/include/qsoe-system.h \
-                     $(LIBQSOE_DIR)/include/qsoe/slots.h \
-                     $(MUSL_GEN_HDRS) | $(LIBC_A)
-	@mkdir -p $(@D)
-	$(CC) $(TESTER_CFLAGS) -c -o $@ $<
-
-# Tester links against $(LIBQSOE_A) (normal flavour: real-IPC path).
-# --whole-archive ensures start_main / syscall_dispatch / float128_stubs
-# are pulled in even when tester's own code doesn't reference them
-# directly (crt0 calls _qsoe_start_main; musl needs __sysinfo; etc.).
-# crt0.o comes from libqsoe's Makefile — shared by every userland prog.
-TESTER_OBJS := \
-    $(TESTBUILD)/main.o
-
-$(TESTER_ELF): $(BUILD)/crt0.o $(TESTER_OBJS) $(LIBQSOE_A) $(LIBPCI_A) $(LIBC_A)
-	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -static -nostdlib \
-	    -Wl,--build-id=none \
-	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(BUILD)/crt0.o $(TESTER_OBJS) \
-	    -Wl,--whole-archive $(LIBQSOE_A) -Wl,--no-whole-archive \
-	    $(LIBPCI_A) $(LIBC_A)
+# Standalone tester (lq/userland/tester) retired 2026-06-01.  The same
+# exercises now live in the umbrella's quser/test/suite/ alongside
+# QRV's syscall conformance suite, build into a single `suite` binary
+# that travels via modpkg.cpio and runs on both NQ and LQ.
 
 # ----------------------------------------------------------------------------
-# init — /sbin/init.  In v0.7-rc3 init became a shell script; taskman
-# spawns it as such, the shebang machinery in spawn.c re-dispatches via
-# /bin/sh (symlink to /bin/qsh), and qsh interprets it.  No compile.
+# Spawnable userland (init.sh, qsh, devc-ser8250, sbin/{pipe,repath,slogger,
+# pci-server}, sloginfo, libpci, utils) lives in the umbrella-level
+# quser/ tree.  Its CPIO archive (modpkg.cpio, QRV-style name) is built
+# by `make -C ../quser cpio` and embedded into taskman.elf via .incbin
+# (see taskman/Makefile -- restored 2026-06-01 from the brief
+# FDT-initrd interlude).  See top-of-file MODPKG_CPIO note.
 # ----------------------------------------------------------------------------
 
-# ----------------------------------------------------------------------------
-# devc-ser8250 — 16550 UART driver / resource manager (v0.6.1+).
-# QSOE's first userland resmgr. Spawned by init. Receives PLIC IRQs
-# on a dedicated thread bound to a kernel-signaled Notification.
-# ----------------------------------------------------------------------------
+.PHONY: modpkg
+modpkg: $(MODPKG_CPIO)
 
-
-# devc-ser8250 — build delegated to userland/dev/ser8250/Makefile.
-.PHONY: devc-ser8250
-devc-ser8250: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/dev/ser8250 all
-
-$(DSER_ELF): | devc-ser8250
-	@true
-
-# sbin/pipe — POSIX pipe / FIFO resource manager.  v0.7+ System Program;
-# ships in /sbin/ inside the userland CPIO.  Spawning is handled by a
-# system manager later (intentionally not by init in v0.7).
-.PHONY: sbin-pipe
-sbin-pipe: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/sbin/pipe all
-
-$(SBIN_PIPE_ELF): | sbin-pipe
-	@true
-
-# sbin/repath — CLI wrapper for qsoe_pathmgr_repath, used by init.sh
-# to swap /dev/console at boot.
-.PHONY: sbin-repath
-sbin-repath: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/sbin/repath all
-
-$(SBIN_REPATH_ELF): | sbin-repath
-	@true
-
-# sbin/slogger — system logger (v0.8-rc1).  Registers /dev/slog;
-# backs the libqsoe slogf() / sloginfo CLI.
-.PHONY: sbin-slogger
-sbin-slogger: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/sbin/slogger all
-
-$(SBIN_SLOGGER_ELF): | sbin-slogger
-	@true
-
-# sloginfo — CLI for the slog ring.  Lands at /bin/sloginfo.
-.PHONY: sloginfo
-sloginfo: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/sloginfo all
-
-$(SLOGINFO_ELF): | sloginfo
-	@true
-
-# libpci — client wrappers for /dev/pci, static archive at $(LIBPCI_A).
-# Linked into programs that talk to pci-server (tester for now;
-# devb-nvme / devnp-* later).
-.PHONY: libpci
-libpci: $(LIBQSOE_A)
-	+$(MAKE) -C $(TOP)/userland/libpci all
-
-$(LIBPCI_A): | libpci
-	@true
-
-# sbin/pci-server — PCI resource manager (v0.8-rc2).  Scans the bus
-# at boot, serves /dev/pci.
-.PHONY: sbin-pci-server
-sbin-pci-server: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/sbin/pci-server all
-
-$(SBIN_PCI_ELF): | sbin-pci-server
-	@true
-
-# userland/utils — single-file utilities (ls / cat / future echo /
-# pwd / etc.).  One .c per binary; the subdir's Makefile globs and
-# builds each into $(BUILD)/utils/<name>.elf.  The CPIO step below
-# scoops up every .elf via $(wildcard) and copies it to /bin/<name>.
-.PHONY: utils
-utils: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/utils all
+# Always re-enter quser's submake so per-component changes propagate;
+# quser is responsible for its own incremental rebuild discipline.
+# Pass LQ's own libc.so + rtld so they ship inside modpkg.cpio's /lib/
+# tree -- needed at load time by every dynamically-linked binary
+# (qsh + drivers + utils).  Regular deps on $(LIBC_SO) / $(RTLD_SO)
+# (not order-only) so an updated libc.so triggers cpio rebuild + the
+# downstream taskman .incbin re-link.
+$(MODPKG_CPIO): $(LIBC_SO) $(LIBC_CRT0) $(RTLD_SO)
+	+$(MAKE) -C $(QUSER) cpio \
+	    LIBC_SO=$(LIBC_SO) \
+	    RTLD_SO=$(RTLD_SO) \
+	    DYNLIBC_SO=$(LIBC_SO)
 
 # ----------------------------------------------------------------------------
-# Userland CPIO — packs all spawnable binaries (init + tester + qsh +
-# devc-ser8250 + pipe) and gets embedded in taskman.elf via .incbin so
-# taskman can fetch them at runtime through libcpio. See plan §2.
-# ----------------------------------------------------------------------------
-
-
-QSH_ELF := $(BUILD)/qsh.elf
-
-# qsh is built by userland/qsh/Makefile.
-.PHONY: qsh.elf-build
-qsh.elf-build: $(LIBQSOE_A) $(LIBC_A)
-	+$(MAKE) -C $(TOP)/userland/qsh all
-
-$(QSH_ELF): | qsh.elf-build
-	@true
-
-$(USERLAND_CPIO): $(INIT_SH) $(TESTER_ELF) $(DSER_ELF) \
-                  $(QSH_ELF) $(SBIN_PIPE_ELF) $(SBIN_REPATH_ELF) \
-                  $(SBIN_SLOGGER_ELF) $(SBIN_PCI_ELF) $(SLOGINFO_ELF) \
-                  | utils
-	@rm -rf $(BUILD)/cpio-root
-	@mkdir -p $(BUILD)/cpio-root/bin $(BUILD)/cpio-root/sbin
-	@install -m 0755 $(INIT_SH) $(BUILD)/cpio-root/sbin/init
-	@cp $(TESTER_ELF)        $(BUILD)/cpio-root/bin/tester
-	@cp $(QSH_ELF)           $(BUILD)/cpio-root/bin/qsh
-	@cp $(DSER_ELF)          $(BUILD)/cpio-root/sbin/devc-ser8250
-	@cp $(SBIN_PIPE_ELF)     $(BUILD)/cpio-root/sbin/pipe
-	@cp $(SBIN_REPATH_ELF)   $(BUILD)/cpio-root/sbin/repath
-	@cp $(SBIN_SLOGGER_ELF)  $(BUILD)/cpio-root/sbin/slogger
-	@cp $(SBIN_PCI_ELF)      $(BUILD)/cpio-root/sbin/pci-server
-	@cp $(SLOGINFO_ELF)      $(BUILD)/cpio-root/bin/sloginfo
-	@ln -sf qsh $(BUILD)/cpio-root/bin/sh
-	@# userland/utils — copy every $(BUILD)/utils/<name>.elf to
-	@# $(BUILD)/cpio-root/bin/<name>, then add bin/<name> to the
-	@# filelist below.
-	@for f in $(wildcard $(BUILD)/utils/*.elf); do \
-	     base=$$(basename $$f .elf); \
-	     cp "$$f" $(BUILD)/cpio-root/bin/$$base; \
-	 done
-	@cd $(BUILD)/cpio-root && \
-	    { printf '%s\n' sbin/init bin/tester bin/qsh bin/sh \
-	                    sbin/devc-ser8250 sbin/pipe sbin/repath \
-	                    sbin/slogger sbin/pci-server bin/sloginfo; \
-	      for f in $(notdir $(basename $(wildcard $(BUILD)/utils/*.elf))); do \
-	          echo bin/$$f; \
-	      done; \
-	    } | \
-	    cpio --quiet --create -H newc \
-	         --owner=+0:+0 --reproducible \
-	         --file=$(USERLAND_CPIO)
-
-# userland_archive.S/.o (CPIO .incbin shim) is built by the taskman
-# submake at $(BUILD)/taskman/userland_archive.{S,o}.
-
-# ----------------------------------------------------------------------------
-# Kernel: produced one-time by sel4test CMake build
+# Kernel: built directly via cmake against ../sel4-bootstrap/seL4/.
+#
+# No sel4test layer, no init-build.sh, no settings.cmake from
+# projects/sel4test/.  The seL4 kernel's own CMakeLists.txt declares
+# `project(seL4 C ASM)` -- no CXX, so no g++-riscv64-linux-gnu host
+# requirement and no sed hacks.  We feed it the Kernel* cache vars
+# directly; the kernel build produces $(SEL4BUILD)/kernel.elf, which
+# we copy into our build tree at $(BUILD)/kernel.elf.
 # ----------------------------------------------------------------------------
 
 kernel: $(KERNEL_ELF)
@@ -511,27 +493,47 @@ $(KERNEL_ELF): $(KERNEL_SRC)
 	@mkdir -p $(@D)
 	cp $< $@
 
-$(KERNEL_SRC):
-	@echo "==> Bootstrapping seL4 kernel via sel4test (one-time, ~5 min)..."
-	@# Drop CXX from sel4test's project() declarations: we only need kernel.elf,
-	@# and the test suite's lone .cxx file is not in our build graph. Avoids
-	@# needing g++-riscv64-linux-gnu just to pass CMake's language check.
-	@sed -i 's/project(sel4test C CXX ASM)/project(sel4test C ASM)/' \
-	    $(SEL4TEST)/projects/sel4test/CMakeLists.txt
-	@sed -i 's/project(sel4test-tests C CXX)/project(sel4test-tests C)/' \
-	    $(SEL4TEST)/projects/sel4test/apps/sel4test-tests/CMakeLists.txt
+$(KERNEL_SRC): | prepare
+	@echo "==> Configuring seL4 kernel (one-time, ~1 min)..."
 	@mkdir -p $(SEL4BUILD)
-	@# QEMU_MEMORY (in MiB) is baked into the kernel's compile-time memory
-	@# map (via the DTS extracted from QEMU at build time). It must match the
-	@# `-m` value used in the `run` target; otherwise the kernel will try to
-	@# touch RAM that doesn't exist and trap in S-mode.
-	cd $(SEL4BUILD) && $(SEL4TEST)/init-build.sh \
-	    -DPLATFORM=qemu-riscv-virt \
+	@# Kernel cache vars (Kernel*):
+	@#   KernelPlatform        — qemu-riscv-virt selects the virt machine
+	@#   KernelSel4Arch        — riscv64 selects RV64
+	@#   KernelMaxNumNodes=4   — SMP, 4 harts (must match -smp passed
+	@#                            to qemu in ./emu.sh)
+	@#   KernelIsMCS=OFF       — stay on the stable scheduler for v0.x
+	@#   KernelVerificationBuild=OFF — keep debug syscalls (printf etc.)
+	@#                                  available; the verification mode
+	@#                                  strips them.
+	@#   QEMU_MEMORY=512       — MiB.  The kernel build runs qemu with
+	@#                            `-m $QEMU_MEMORY` at CONFIGURE TIME
+	@#                            to extract the DTS and bakes the
+	@#                            resulting memory map into the kernel
+	@#                            image.  MUST match the `-m 512M`
+	@#                            passed by ./emu.sh at RUN TIME --
+	@#                            otherwise the kernel maps phantom RAM
+	@#                            beyond the qemu-allocated range and
+	@#                            faults on first access (scause=7
+	@#                            store/AMO access fault).
+	@#                            qemu-riscv-virt's default is 3 GiB
+	@#                            which exceeds our launch config.
+	@# seL4's gcc.cmake is a template (configure_file expects @var@s to
+	@# be expanded by the outer project); without that pre-pass the
+	@# toolchain falls through to host gcc and fails with riscv flags.
+	@# Bypass it by setting CROSS_COMPILER_PREFIX directly + a tiny
+	@# CMAKE_TOOLCHAIN_FILE that only sets CMAKE_SYSTEM_NAME.
+	cd $(SEL4BUILD) && cmake -G Ninja \
+	    -DCMAKE_SYSTEM_NAME=Generic \
+	    -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+	    -DCMAKE_ASM_COMPILER=riscv64-linux-gnu-gcc \
+	    -DCROSS_COMPILER_PREFIX=riscv64-linux-gnu- \
+	    -DKernelPlatform=qemu-riscv-virt \
 	    -DKernelSel4Arch=riscv64 \
+	    -DKernelMaxNumNodes=4 \
+	    -DKernelIsMCS=OFF \
+	    -DKernelVerificationBuild=OFF \
 	    -DQEMU_MEMORY=512 \
-	    -DSMP=TRUE \
-	    -DNUM_NODES=4 \
-	    -DSIMULATION=TRUE
+	    $(SEL4_DIR)
 	cd $(SEL4BUILD) && ninja kernel.elf
 
 # ----------------------------------------------------------------------------

@@ -1,31 +1,40 @@
 /*
- * setxid.c — musl-internal __setxid() backing setuid / setgid /
+ * setxid.c — musl-internal __setxid() for LQ — backs setuid / setgid /
  *            seteuid / setegid / setreuid / setregid / setresuid /
  *            setresgid.
  *
- * Musl's per-function setuid.c / setgid.c / etc. call
- *   __setxid(nr, a, b, c)
- * where `nr` is the Linux syscall number identifying which exact
- * flavour is being requested.  We translate that into a single
- * TM_REQ_SET_CRED call whose 3 MRs pack the 6 (r/e/s)uid/gid
- * fields, with 0xFFFFFFFF meaning "leave alone".
+ * The shared OS-independent libc body keeps the per-function wrappers
+ * (setuid.c, setgid.c, ...) that call __setxid(nr, a, b, c), where `nr`
+ * is a flavour-dispatch tag — internal to this TU and NEVER reaches
+ * the kernel.  We switch on it and emit a TM_REQ_SET_CRED to taskman
+ * over seL4 IPC; the message packs all six (r/e/s)uid/gid fields,
+ * with KEEP meaning "leave this one alone".
  *
- * Linux setresXXX semantics:
- *   - argument == -1 (i.e., (unsigned)-1) means "don't change this field"
- *   - other values overwrite
- * setXXid / setXuid map to either setresXXX with two -1's or to a
- * change-both-real-and-effective convention; we follow Linux's
- * setuid()/setgid() (change ruid AND euid if privileged, else just
- * euid) — v0.7 has no privilege check so we apply both.
+ * setresXXX semantics: an argument of -1 means "don't change"; v0.x
+ * has no privilege check, so setuid()/setgid() change all three of
+ * r/e/s.
+ *
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <unistd.h>
-#include <sys/syscall.h>
 #include <qsoe-system.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
+
+/* Local flavour tags — internal dispatch keys, NOT Linux syscall
+ * numbers.  Upstream musl reused Linux SYS_set{uid,gid,reuid,regid,
+ * resuid,resgid} here, which we explicitly retired.  Values are
+ * arbitrary; they never leave this TU. */
+#define SYS_setuid     1
+#define SYS_setgid     2
+#define SYS_setreuid   3
+#define SYS_setregid   4
+#define SYS_setresuid  5
+#define SYS_setresgid  6
 
 #define KEEP  0xFFFFFFFFu
 
