@@ -20,7 +20,7 @@
  *   FDT_NOP         (4)  no payload; skip.
  *   FDT_END         (9)  end of structure block.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

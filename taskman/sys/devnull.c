@@ -7,7 +7,7 @@
  * Hosted inside taskman like /dev/console — TM_DEVNULL_CHID shares
  * taskman's primary endpoint; path/io.c routes IO traffic by chid.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

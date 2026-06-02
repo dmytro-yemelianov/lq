@@ -4,8 +4,8 @@
 # taskman is QSOE's rootserver: process/path/memory manager.  First
 # userland process the seL4 kernel starts after boot.
 #
-# The userland CPIO archive (modpkg.cpio -- QRV name) lives in the
-# umbrella-level quser/ tree and is built by `make -C ../quser cpio`.
+# The userland modpkg.cpio lives in the umbrella-level quser/ tree
+# and is built by `make -C ../quser cpio`.
 # Taskman embeds it as section `.userland_cpio` via .incbin; the
 # emitted symbols _userland_cpio_start[] / _userland_cpio_end[] are
 # consumed by main.c to seed the cpiofs.  This mirrors QRV's startup-
@@ -23,7 +23,7 @@
 # the cpio bytes to taskman through a reserved-memory + device-
 # untyped path.  Kept on disk because that work is on the roadmap.
 #
-# v0.7 layout -- code split across subsystem dirs:
+# Taskman code is split across subsystem dirs:
 #   sys/   — system services (console + initrd loader)
 #   proc/  — processes / threads / channels / connections / pulses + spawn
 #   mem/   — memory manager (mmap)
@@ -31,7 +31,7 @@
 #
 # Hand-run: cd taskman && make clean all
 #
-# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+# Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
 # SPDX-License-Identifier: Apache-2.0
 #
 
@@ -54,8 +54,7 @@ SEL4_BOOTSTRAP := $(abspath $(TOP)/..)/sel4-bootstrap
 SEL4BUILD      := $(SEL4_BOOTSTRAP)/build-qsoe-riscv64
 SEL4_GEN_HDRS  := $(SEL4BUILD)/gen_headers
 
-# libcpio is vendored in-tree (2 files, see lq/elfloader/cpio/NOTICE.md).
-LIBCPIO     := $(TOP)/elfloader/cpio
+LIBCPIO     := $(TOP)/../common
 GEN         := $(BUILD)/gen
 
 OBJDIR     := $(BUILD)/taskman
@@ -74,7 +73,7 @@ ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 \
 # needs (state/msg/process/thread/channel/connect/io/time -- the
 # IN_TASKMAN flavour of the retired libqsoe).  They live under
 # qsoe/ and link directly into taskman.elf -- taskman never links
-# libc, mirroring the NQ pattern.  See project_libqsoe_folds_into_libc.
+# libc, mirroring the NQ pattern.
 # libtaskman -- portable taskman body lives at the umbrella root.
 # Top-level lq Makefile passes paths down; sub-Makefile-invoked
 # builds fall back to defaults.
@@ -123,7 +122,7 @@ $(OBJDIR)/start.o: $(TASKMAN_DIR)/start.S
 
 $(OBJDIR)/main.o: $(TASKMAN_DIR)/main.c $(TM_HEADERS)
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO) -c -o $@ $<
 
 # tm_log — the sole sel4_debug_* callsite in taskman.
 $(OBJDIR)/tm_log.o: $(TASKMAN_DIR)/tm_log.c $(TM_HEADERS)
@@ -133,7 +132,7 @@ $(OBJDIR)/tm_log.o: $(TASKMAN_DIR)/tm_log.c $(TM_HEADERS)
 # proc/ — process registry, channels, connections, threads, pulses, spawn.
 $(OBJDIR)/proc/%.o: $(TASKMAN_DIR)/proc/%.c $(TM_HEADERS)
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO) -c -o $@ $<
 
 # mem/ — memory manager.
 $(OBJDIR)/mem/%.o: $(TASKMAN_DIR)/mem/%.c $(TM_HEADERS)
@@ -143,7 +142,7 @@ $(OBJDIR)/mem/%.o: $(TASKMAN_DIR)/mem/%.c $(TM_HEADERS)
 # path/ — pathmgr + cpiofs + IO dispatch.
 $(OBJDIR)/path/%.o: $(TASKMAN_DIR)/path/%.c $(TM_HEADERS)
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO) -c -o $@ $<
 
 # sys/ — console (other system services later).
 $(OBJDIR)/sys/%.o: $(TASKMAN_DIR)/sys/%.c $(TM_HEADERS)
@@ -159,11 +158,10 @@ $(OBJDIR)/qsoe/%.o: $(TASKMAN_DIR)/qsoe/%.c $(TM_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -c -o $@ $<
 
-# libcpio from core/.  Same .o as elfloader uses to navigate its own
-# CPIO; we just compile a second copy with taskman's flags.
-$(OBJDIR)/cpio.o: $(LIBCPIO)/src/cpio.c
+# cpio.o: source is in ../common
+$(OBJDIR)/cpio.o: $(LIBCPIO)/cpio.c
 	@mkdir -p $(@D)
-	$(CC) $(TM_CFLAGS) -I$(LIBCPIO)/include -c -o $@ $<
+	$(CC) $(TM_CFLAGS) -I$(LIBCPIO) -c -o $@ $<
 
 # userland_archive.S -- .incbin shim that embeds the quser-built
 # modpkg.cpio into taskman.elf at a known section.  The emitted

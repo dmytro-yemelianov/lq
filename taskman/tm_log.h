@@ -32,7 +32,7 @@
  * tm_raw_putc() instead, which lives in the same module so it can
  * eventually fan out through the same trace machinery.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #ifndef QSOE_TASKMAN_TM_LOG_H

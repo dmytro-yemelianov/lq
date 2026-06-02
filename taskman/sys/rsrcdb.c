@@ -23,7 +23,7 @@
  * For v0.8-rc1: linear walk per class; 256-entry pool; no name-based
  * lookup yet (FLAG_NAME ignored except as a passthrough field).
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

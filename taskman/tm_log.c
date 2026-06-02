@@ -10,7 +10,7 @@
  * a ring buffer alongside the live putchar.  Callers don't change —
  * they keep calling tm_err(...) etc.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

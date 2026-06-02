@@ -4,7 +4,7 @@
  * Per-class sorted lists of [start, end] ranges, each FREE or owned
  * by a process.  Backs the TM_REQ_RSRC_* wire ops.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #ifndef QSOE_TASKMAN_RSRCDB_H

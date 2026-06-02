@@ -5,7 +5,7 @@
  * TM_REQ_GET_SYSCFG message.  Wire format is defined in
  * <qsoe/syscfg.h> (shared with clients).
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #ifndef QSOE_TASKMAN_SYSCFG_H

@@ -14,7 +14,7 @@
  * PCI port lands (they need FDT walks of /soc/pci@*, MSI controllers,
  * etc., and consume more bytes).
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

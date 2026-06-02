@@ -2,7 +2,7 @@
  * sys/initrd.h -- LQ taskman initrd loader.  Vestigial; activate via
  *                 -DTM_USE_INITRD_LOADER.  See sys/initrd.c.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #ifndef TM_SYS_INITRD_H

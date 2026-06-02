@@ -43,7 +43,7 @@
  *
  * Replaces the userland_archive.S/.incbin shim (retired 2026-05-31).
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

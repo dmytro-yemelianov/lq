@@ -33,7 +33,7 @@
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <qsoe/sys_version.h>
-#include <cpio/cpio.h>
+#include <cpio.h>
 
 #ifdef TM_USE_INITRD_LOADER
 /* Vestigial FDT-driven initrd loader.  See sys/initrd.c top-of-file

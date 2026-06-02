@@ -8,7 +8,7 @@
  * Hosted inside taskman like /dev/null; TM_DEVZERO_CHID shares
  * taskman's primary endpoint and path/io.c demuxes by chid.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

@@ -20,7 +20,7 @@
  * Carried forward from v0.7: bump-allocated VAs (mmap_top), no
  * munmap.  All process state lives in tm_process_t.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

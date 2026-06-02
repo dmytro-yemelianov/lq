@@ -16,7 +16,7 @@
 #include "../path/cpiofs.h"  /* tm_cpio_lookup */
 #include "../tm_log.h"
 #include <qsoe/slots.h>
-#include <cpio/cpio.h>
+#include <cpio.h>
 
 static tm_process_t g_processes[TM_MAX_PROCESSES];
 

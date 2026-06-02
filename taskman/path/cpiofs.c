@@ -8,7 +8,7 @@
 #include "../sel4_syscalls.h"
 #include "../proc/proc.h"
 #include <qsoe-system.h>
-#include <cpio/cpio.h>
+#include <cpio.h>
 
 /* Set at boot from main.c — same CPIO blob taskman uses for spawn. */
 static const void *s_cpio_start;

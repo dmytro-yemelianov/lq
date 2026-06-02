@@ -20,7 +20,7 @@
  * No allocation — the parser is stateless, every call takes the
  * blob pointer.  Thread-safe by construction.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #ifndef QSOE_TASKMAN_FDT_H

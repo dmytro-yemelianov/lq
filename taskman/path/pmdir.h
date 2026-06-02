@@ -12,7 +12,7 @@
  * Each slot remembers the path prefix (e.g. "/dev") and the next
  * child index to return.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #ifndef QSOE_TASKMAN_PATH_PMDIR_H

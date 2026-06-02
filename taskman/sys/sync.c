@@ -13,7 +13,7 @@
  * waiter consumes one CSpace slot in taskman, which gets returned to
  * the pool when WAKE replies on it.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 
