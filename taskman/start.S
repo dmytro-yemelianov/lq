@@ -24,7 +24,7 @@ _start:
 
     /* Plant tp = &qsoe_main_tcb so libqsoe's per-thread state
      * accessors (qsoe_curthr() in <qsoe/tls.h>) resolve. qsoe_main_tcb
-     * is BSS, so any .ipcbuf/.qerrno reads before qsoe_libqsoe_init()
+     * is BSS, so any .ipcbuf/.qerrno reads before qsoe_libc_init()
      * see zeros, which is the correct uninitialised state. */
     la tp, qsoe_main_tcb
 

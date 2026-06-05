@@ -17,6 +17,7 @@
 #include <qsoe/slots.h>
 #include <tm_elf.h>
 #include <tm_reloc.h>
+#include <tm_script.h>
 
 /* ELF64 minimal types — just enough to walk PHDRs. */
 typedef unsigned char  u8;
@@ -618,39 +619,24 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     /* Shebang handling.  If the blob starts with "#!", look up the
      * interpreter in the CPIO and re-invoke ourselves with it.  Linux
      * argv convention: argv = [interp, optional_arg, script_path,
-     * original_argv[1..]].  Recursion limit 1 — the interpreter must
-     * itself be ELF, not another script. */
+     * original_argv[1..]].  Recursion limit 1 -- the interpreter must
+     * itself be ELF, not another script.  Parsing of the "#!..." line
+     * lives in libtaskman (<tm_script.h>) so NQ and LQ share it. */
     {
-        const unsigned char *b = (const unsigned char *)elf_blob;
-        if (elf_len >= 2 && b[0] == '#' && b[1] == '!') {
-            unsigned long scan = elf_len < 128 ? elf_len : 128;
-            unsigned long eol  = 2;
-            while (eol < scan && b[eol] != '\n' && b[eol] != 0) ++eol;
-
-            unsigned long p = 2;
-            while (p < eol && (b[p] == ' ' || b[p] == '\t')) ++p;
-            unsigned long interp_start = p;
-            while (p < eol && b[p] != ' ' && b[p] != '\t') ++p;
-            unsigned long interp_end = p;
-            if (interp_end == interp_start || b[interp_start] != '/') {
-                tm_err("spawn: shebang interp missing or not absolute");
+        /* Static buffers keep new_argv[]'s pointers valid across the
+         * tm_spawn recursion call without per-call stack churn. */
+        static char interp_path[80];
+        static char opt_arg[80];
+        unsigned scan_len = (unsigned) (elf_len < 256 ? elf_len : 256);
+        if (tm_script_parse_shebang((const uint8_t *) elf_blob, scan_len,
+                                    interp_path, sizeof interp_path,
+                                    opt_arg, sizeof opt_arg) == 0) {
+            if (interp_path[0] != '/') {
+                tm_err("spawn: shebang interp must be absolute");
                 return -ENOEXEC;
             }
-            while (p < eol && (b[p] == ' ' || b[p] == '\t')) ++p;
-            unsigned long arg_start = p;
-            unsigned long arg_end   = eol;
-            while (arg_end > arg_start &&
-                   (b[arg_end-1] == ' ' || b[arg_end-1] == '\t')) --arg_end;
-            int has_arg = (arg_end > arg_start);
-
-            /* Interpreter path stripped of leading '/' for CPIO lookup. */
-            static char interp_cpio[64];
-            unsigned long ilen = interp_end - interp_start - 1;
-            if (ilen == 0 || ilen >= sizeof interp_cpio) return -ENOEXEC;
-            for (unsigned long i = 0; i < ilen; ++i) {
-                interp_cpio[i] = (char)b[interp_start + 1 + i];
-            }
-            interp_cpio[ilen] = 0;
+            const char *interp_cpio = interp_path + 1;   /* skip leading '/' */
+            int has_arg = (opt_arg[0] != 0);
 
             unsigned long interp_size = 0;
             const void *interp_blob = tm_cpio_lookup(interp_cpio, &interp_size);
@@ -659,32 +645,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                 return -ENOENT;
             }
             /* Recursion limit: interpreter must itself be ELF. */
-            const unsigned char *ib = (const unsigned char *)interp_blob;
+            const unsigned char *ib = (const unsigned char *) interp_blob;
             if (interp_size < 4 ||
                 ib[0] != 0x7f || ib[1] != 'E' ||
                 ib[2] != 'L'  || ib[3] != 'F') {
                 tm_err("spawn: nested shebang not supported");
                 return -ENOEXEC;
-            }
-
-            /* Preserve the interpreter path (with leading '/') for new
-             * argv[0], and the optional argument, into static buffers. */
-            static char interp_path[80];
-            unsigned long plen = interp_end - interp_start;
-            if (plen >= sizeof interp_path) return -ENOEXEC;
-            for (unsigned long i = 0; i < plen; ++i) {
-                interp_path[i] = (char)b[interp_start + i];
-            }
-            interp_path[plen] = 0;
-
-            static char opt_arg[80];
-            if (has_arg) {
-                unsigned long alen = arg_end - arg_start;
-                if (alen >= sizeof opt_arg) return -ENOEXEC;
-                for (unsigned long i = 0; i < alen; ++i) {
-                    opt_arg[i] = (char)b[arg_start + i];
-                }
-                opt_arg[alen] = 0;
             }
 
             /* Build new argv: [interp, opt_arg?, script_path, argv[1..]].
@@ -992,7 +958,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     pattern (see nq/taskman/sys/spawn.c).
      *
      *     Zero-init is enough for the libc seam: tid=0, qsoe_errno=0,
-     *     and the rest defaulted; libqsoe_init refines on first
+     *     and the rest defaulted; libc_init refines on first
      *     syscall. */
     seL4_CPtr tcb_frame = alloc_object(seL4_RISCV_4K_Page, 0);
     if (!tcb_frame) return -ENOMEM;

@@ -7,7 +7,7 @@
  *
  * The IPC buffer pointer lives in the current thread's qsoe_tcb_t
  * (see <qsoe/tls.h>) — the crt0 plants &qsoe_main_tcb in tp before
- * any call below, and qsoe_libqsoe_init() then writes the buffer
+ * any call below, and qsoe_libc_init() then writes the buffer
  * address into that struct.
  */
 #ifndef QSOE_INVOKE_H
@@ -479,5 +479,16 @@ qsoe_riscv_asidpool_assign(seL4_CPtr asid_pool, seL4_CPtr vspace)
     seL4_MessageInfo_t reply = qsoe_sys_call(asid_pool, tag, &mr0, &mr1, &mr2, &mr3);
     return seL4_MessageInfo_get_label(reply);
 }
+
+/*
+ * LQ-private continuation of retired wire opcode 0x114.  The shared
+ * <qsoe/wire.h> dropped TM_REQ_DUP_CAP in favor of the
+ * ConnectServerInfo + ConnectAttach(index_hint) + _IO_DUP idiom (the
+ * shape NQ implements); LQ's dup2 / fcntl(F_DUPFD) seam and the
+ * taskman dispatcher still ride the cap-copy form.  The value stays
+ * 0x114 -- the slot is documented as reserved in wire.h, so nothing
+ * else can claim it.  Delete together with the migration.
+ */
+#define TM_REQ_DUP_CAP  0x114
 
 #endif /* QSOE_INVOKE_H */

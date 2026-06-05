@@ -808,7 +808,7 @@ static const void *find_fdt_in_extra_bi(seL4_BootInfo *bi,
 int main(seL4_BootInfo *bi)
 {
     print_banner();
-    qsoe_libqsoe_init(bi->ipcBuffer, QSOE_PID_TASKMAN);
+    qsoe_libc_init(bi->ipcBuffer, QSOE_PID_TASKMAN);
 
     /* Parse FDT (if seL4 published one) and build the syscfg blob.
      * If anything fails, syscfg-dependent handlers fall back to the

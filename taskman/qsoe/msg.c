@@ -46,7 +46,7 @@
  * QSOE_CAP_TASKMAN_EP. spawn.c minted the cap into that CSpace slot at
  * spawn time, so the connection is already live — we just teach
  * libqsoe's coid table about it. */
-void qsoe_libqsoe_init(void *ipcbuf, pid_t self_pid)
+void qsoe_libc_init(void *ipcbuf, pid_t self_pid)
 {
     qsoe_curthr()->ipcbuf   = ipcbuf;
     qsoe_curthr()->self_pid = self_pid;

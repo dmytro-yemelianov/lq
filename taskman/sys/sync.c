@@ -6,7 +6,7 @@
  * misses, and freed when its wait list empties AND its credit goes
  * to zero.  No hashing in v0.8 — a linear scan of a 64-entry table
  * is fine for the contention rates we see.  Bump TM_SYNC_MAX_ENTRIES
- * (and the matching QRV_SYNC_MAX_WAITERS for waiters per entry) when
+ * (and the matching QSOE_SYNC_MAX_WAITERS for waiters per entry) when
  * profiling says so.
  *
  * Parked replies use the standard taskman SaveCaller pattern: each
