@@ -98,8 +98,8 @@ int InterruptWait(int flags, const uint64_t *timeout)
     if (rc != 0) return -1;
 
     /* QSOE_INTR_WAIT_FLAGS_UNMASK: auto-ack on the way out, saving
-     * the caller an InterruptUnmask kercall.  Matches QRV's
-     * QRV_INTR_WAIT_FLAGS_UNMASK semantics. */
+     * the caller an InterruptUnmask kercall.  Carries the QRV
+     * intr-wait auto-unmask semantics across. */
     if (flags & QSOE_INTR_WAIT_FLAGS_UNMASK) {
         (void)qsoe_irq_ack(s_attach[iid - 1].handler_slot);
     }

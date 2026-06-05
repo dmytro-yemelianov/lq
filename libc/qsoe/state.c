@@ -24,7 +24,7 @@ static qsoe_spinlock_t g_state_lock;
 
 /* The per-process main thread's TCB record. Lives in BSS at a known
  * address so the crt0 can load &qsoe_main_tcb into tp. tid is 1; the
- * rest is filled by qsoe_libqsoe_init() at process startup. */
+ * rest is filled by qsoe_libc_init() at process startup. */
 qsoe_tcb_t qsoe_main_tcb = { .tid = 1 };
 
 /* Worker thread state pool — tids 2..32. Indexed by tid-2. */

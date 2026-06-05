@@ -49,13 +49,13 @@
  * libqsoe's coid table about it. */
 /* Minimum aux-vector mallocng's init walks via __libc.auxv -- just
  * AT_PAGESZ followed by AT_NULL.  Mirrors NQ's qsoe_min_auxv (see
- * nq/libc/libqsoe_init.c) so behaviour is identical across kernels. */
+ * nq/libc/libc_init.c) so behaviour is identical across kernels. */
 static const size_t qsoe_min_auxv[] = {
     6,    4096,   /* AT_PAGESZ = page size */
     0,    0,      /* AT_NULL */
 };
 
-void qsoe_libqsoe_init(void *ipcbuf, pid_t self_pid)
+void qsoe_libc_init(void *ipcbuf, pid_t self_pid)
 {
     /* crt0 stashes the kernel-set a0 (= taskman's spawn-time pid)
      * into s3 and passes it here as self_pid; ipcbuf is wired as

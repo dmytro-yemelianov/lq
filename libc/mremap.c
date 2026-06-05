@@ -9,7 +9,7 @@
  * caller can detect.  A real implementation needs a corresponding LQ
  * taskman opcode + VSpace cap move — Stage-B work.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <sys/mman.h>

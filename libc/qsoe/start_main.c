@@ -27,7 +27,7 @@ extern int qsoe_query_clock_freq(unsigned long *out_hz);
 void _qsoe_start_main(pid_t pid, int argc, char **argv, char **envp);
 void _qsoe_start_main(pid_t pid, int argc, char **argv, char **envp)
 {
-    qsoe_libqsoe_init((void *)0x1FE000UL, pid);
+    qsoe_libc_init((void *)0x1FE000UL, pid);
 
     /* v0.7: cache the platform's `rdtime` frequency so ClockTime /
      * ClockCycles / nanosleep can convert ticks→nsec without IPC.

@@ -8,7 +8,7 @@
  * VA range becomes a permanent hole, which is fine because mmap
  * always returns a fresh higher VA.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <sys/mman.h>

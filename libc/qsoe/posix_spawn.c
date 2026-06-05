@@ -18,7 +18,7 @@
  * unconditionally; the future fd-actions replay happens taskman-side
  * once TM_REQ_SPAWN gains a file-actions list parameter).
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

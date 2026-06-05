@@ -15,7 +15,7 @@
  * silent stubs get forgotten and waste hours later (see
  * feedback_stubs_announce memory).
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <sys/mman.h>

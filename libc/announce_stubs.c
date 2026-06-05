@@ -19,7 +19,7 @@
  *   - __environ     : data; defined as a NULL pointer alongside the
  *                     announcing function stubs below.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -51,13 +51,8 @@ char **__environ = 0;
 
 /* --- POSIX file-descriptor + tty stubs ----------------------------- */
 
-int ioctl(int fd, unsigned long request, ...)
-{
-    ANNOUNCE_ONCE("ioctl", "-1 (ENOSYS)");
-    (void)fd; (void)request;
-    errno = ENOSYS;
-    return -1;
-}
+/* ioctl() lives in the shared libc body (libc/qsoe/ioctl.c) --
+ * termios fake-success + announcing fallthrough for both kernels. */
 
 int tcdrain(int fd)
 {
@@ -76,12 +71,8 @@ int execve(const char *path, char *const argv[], char *const envp[])
     return -1;
 }
 
-int raise(int sig)
-{
-    ANNOUNCE_ONCE("raise", "0 (no-op)");
-    (void)sig;
-    return 0;
-}
+/* raise() lives in the shared libc body (libc/qsoe/posix_stubs.c)
+ * since 2026-06-05 -- one announcing stub for both kernels. */
 
 /* --- stdio variants ------------------------------------------------ */
 

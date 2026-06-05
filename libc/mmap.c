@@ -10,10 +10,10 @@
  * Wire shape matches userland/libqsoe/src/mmap.c (Phase 2 reaches
  * through libqsoe; Phase 2.5 will fold libqsoe in and this file
  * absorbs the qsoe_invoke wrapper directly).  Only the anonymous
- * path (the shared body's only use) lives here; QSOE_MAP_PHYS stays
- * in libqsoe's qsoe_mmap() helper for now.
+ * path (the shared body's only use) lives here; MAP_PHYS stays in
+ * libqsoe's qsoe_mmap() helper for now.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <sys/mman.h>

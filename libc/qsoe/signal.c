@@ -14,7 +14,7 @@
  * links cleanly, but signals are not actually delivered.  Tracked
  * by the LQ v0.7 signal-delivery ticket.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 

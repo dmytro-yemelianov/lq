@@ -18,7 +18,7 @@
  * directly here and this file's save/restore disappears in favour of
  * a single shared core called by both _r and non-_r forms.
  *
- * Copyright (c) 2026 Yuri Zaporozhets <r_tty@yahoo.co.uk>
+ * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <sys/qsoe.h>
