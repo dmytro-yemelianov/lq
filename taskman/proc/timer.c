@@ -29,7 +29,7 @@
 typedef struct {
     int            in_use;
     pid_t          caller_pid;
-    seL4_CPtr      reply_slot;     /* SaveCaller'd in taskman's CSpace */
+    seL4_CPtr      reply_slot;     /* parked reply object (MCS) in taskman's CSpace */
     unsigned long  expiry_ticks;   /* rdtime tick count when nanosleep wakes */
 } tm_sleeper_t;
 
@@ -87,10 +87,8 @@ int tm_nanosleep(pid_t caller_pid, unsigned long total_ns, int *out_parked)
     for (int i = 0; i < TM_MAX_SLEEPERS; ++i) {
         if (g_sleepers[i].in_use) continue;
 
-        seL4_CPtr slot = taskman_alloc_empty_slot();
-        if (qsoe_cnode_save_caller(s_cnode_root, slot,
-                                    TM_DEPTH_TASKMAN) != 0) {
-            taskman_free_slot(slot);
+        seL4_CPtr slot = tm_reply_park();
+        if (slot == 0) {
             return -ENOMEM;
         }
         g_sleepers[i].in_use       = 1;
@@ -201,8 +199,7 @@ void tm_timer_sweep(void)
 
         /* Reply: label=0 (success), no payload. */
         seL4_MessageInfo_t tag = seL4_MessageInfo_new(0, 0, 0, 0);
-        qsoe_sys_send(g_sleepers[i].reply_slot, tag, 0, 0, 0, 0);
-        taskman_free_slot(g_sleepers[i].reply_slot);
+        tm_reply_deliver(g_sleepers[i].reply_slot, tag, 0, 0, 0, 0);
         g_sleepers[i].in_use = 0;
     }
 

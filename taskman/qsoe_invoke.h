@@ -42,12 +42,16 @@ qsoe_sys_call(seL4_CPtr dest, seL4_MessageInfo_t info,
     return out;
 }
 
-/* seL4_Recv: block on `ep` until a message arrives. Out-fills *badge
- * with the sender's badge (acts as our rcvid) and *mr0..*mr3 with the
- * first four message words; longer messages spill into ipcbuf->msg[4..].
- * Returns the message info tag. */
+/* seL4_Recv (MCS): block on `ep` until a message arrives. Out-fills
+ * *badge with the sender's badge (acts as our rcvid) and *mr0..*mr3
+ * with the first four message words; longer messages spill into
+ * ipcbuf->msg[4..]. Returns the message info tag.
+ *
+ * MCS adds the `reply` argument (register a6): the reply object the
+ * kernel binds to the incoming Call so a later Send/ReplyRecv can
+ * answer it.  Pass the caller's own reply object cap. */
 static inline seL4_MessageInfo_t
-qsoe_sys_recv(seL4_CPtr ep, seL4_Word *badge,
+qsoe_sys_recv(seL4_CPtr ep, seL4_Word *badge, seL4_CPtr reply,
               seL4_Word *mr0, seL4_Word *mr1, seL4_Word *mr2, seL4_Word *mr3)
 {
     register seL4_Word a0 __asm__("a0") = ep;
@@ -56,40 +60,30 @@ qsoe_sys_recv(seL4_CPtr ep, seL4_Word *badge,
     register seL4_Word a3 __asm__("a3");
     register seL4_Word a4 __asm__("a4");
     register seL4_Word a5 __asm__("a5");
+    register seL4_Word a6 __asm__("a6") = reply;
     register seL4_Word a7 __asm__("a7") = (seL4_Word)SYS_Recv;
     __asm__ volatile("ecall"
                  : "+r"(a0), "=r"(a1), "=r"(a2), "=r"(a3), "=r"(a4), "=r"(a5)
-                 : "r"(a7)
+                 : "r"(a6), "r"(a7)
                  : "memory");
     *badge = a0;
     *mr0 = a2; *mr1 = a3; *mr2 = a4; *mr3 = a5;
     seL4_MessageInfo_t out; out.words[0] = a1; return out;
 }
 
-/* seL4_Reply: reply to the previous Recv's implicit caller cap (the
- * one the kernel stashed in tcbCaller on Recv). No destination param —
- * non-MCS reply is per-thread, not per-cap. */
-static inline void
-qsoe_sys_reply(seL4_MessageInfo_t info,
-               seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3)
-{
-    register seL4_Word a1 __asm__("a1") = info.words[0];
-    register seL4_Word a2 __asm__("a2") = mr0;
-    register seL4_Word a3 __asm__("a3") = mr1;
-    register seL4_Word a4 __asm__("a4") = mr2;
-    register seL4_Word a5 __asm__("a5") = mr3;
-    register seL4_Word a7 __asm__("a7") = (seL4_Word)SYS_Reply;
-    __asm__ volatile("ecall"
-                 : "+r"(a1), "+r"(a2), "+r"(a3), "+r"(a4), "+r"(a5)
-                 : "r"(a7)
-                 : "memory");
-}
+/* MCS has no standalone seL4_Reply syscall: a reply is delivered by
+ * Send-ing to the reply object cap the kernel bound at Recv time (see
+ * qsoe_sys_send below — Send to a reply cap unblocks the original
+ * caller).  ReplyRecv folds that Send into the next receive. */
 
-/* seL4_ReplyRecv: atomic reply-to-previous + receive-next. The taskman
- * dispatch loop is built around this — it's the cheapest way to process
- * a stream of requests. */
+/* seL4_ReplyRecv (MCS): atomic reply-to-previous + receive-next. The
+ * taskman dispatch loop is built around this — it's the cheapest way to
+ * process a stream of requests.  `reply` (register a6) is the reply
+ * object the previous Recv bound to the caller being answered; the
+ * kernel re-binds it to the next caller before returning. */
 static inline seL4_MessageInfo_t
 qsoe_sys_reply_recv(seL4_CPtr ep, seL4_MessageInfo_t info, seL4_Word *badge,
+                    seL4_CPtr reply,
                     seL4_Word *mr0, seL4_Word *mr1, seL4_Word *mr2, seL4_Word *mr3)
 {
     register seL4_Word a0 __asm__("a0") = ep;
@@ -98,10 +92,11 @@ qsoe_sys_reply_recv(seL4_CPtr ep, seL4_MessageInfo_t info, seL4_Word *badge,
     register seL4_Word a3 __asm__("a3") = *mr1;
     register seL4_Word a4 __asm__("a4") = *mr2;
     register seL4_Word a5 __asm__("a5") = *mr3;
+    register seL4_Word a6 __asm__("a6") = reply;
     register seL4_Word a7 __asm__("a7") = (seL4_Word)SYS_ReplyRecv;
     __asm__ volatile("ecall"
                  : "+r"(a0), "+r"(a1), "+r"(a2), "+r"(a3), "+r"(a4), "+r"(a5)
-                 : "r"(a7)
+                 : "r"(a6), "r"(a7)
                  : "memory");
     *badge = a0;
     *mr0 = a2; *mr1 = a3; *mr2 = a4; *mr3 = a5;
@@ -230,8 +225,14 @@ qsoe_tcb_write_registers(seL4_CPtr tcb, int resume_target,
     return seL4_MessageInfo_get_label(reply);
 }
 
+/* seL4_TCB_Configure (MCS): the fault endpoint moved out to
+ * SetSchedParams/SetSpace, so Configure no longer carries it — 3 MRs
+ * (cnode_data, vspace_data, ipc_buffer_vaddr) + 3 caps (cnode_root,
+ * vspace_root, ipc_buffer_frame).  A TCB configured this way still
+ * cannot run until a scheduling context is bound (see
+ * qsoe_tcb_set_sched_params). */
 static inline seL4_Word
-qsoe_tcb_configure(seL4_CPtr tcb, seL4_CPtr fault_ep,
+qsoe_tcb_configure(seL4_CPtr tcb,
                    seL4_CPtr cnode_root, seL4_Word cnode_data,
                    seL4_CPtr vspace_root, seL4_Word vspace_data,
                    seL4_Word ipc_buffer_vaddr, seL4_CPtr ipc_buffer_frame)
@@ -240,12 +241,55 @@ qsoe_tcb_configure(seL4_CPtr tcb, seL4_CPtr fault_ep,
     qsoe_ipcbuf->caps_or_badges[1] = vspace_root;
     qsoe_ipcbuf->caps_or_badges[2] = ipc_buffer_frame;
 
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBConfigure, 0, 3, 4);
-    seL4_Word mr0 = fault_ep;
-    seL4_Word mr1 = cnode_data;
-    seL4_Word mr2 = vspace_data;
-    seL4_Word mr3 = ipc_buffer_vaddr;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBConfigure, 0, 3, 3);
+    seL4_Word mr0 = cnode_data;
+    seL4_Word mr1 = vspace_data;
+    seL4_Word mr2 = ipc_buffer_vaddr;
+    seL4_Word mr3 = 0;
     seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+/* seL4_TCB_SetSchedParams (MCS): set max-controlled-priority + priority,
+ * AND bind a scheduling context + fault handler in one invocation —
+ * 2 MRs (mcp, prio) + 3 caps (authority TCB, sched_context, fault EP).
+ * Binding a (configured) SC is what makes the thread runnable.  Passing
+ * fault_ep = 0 (a null cap) means "no fault handler".  Replaces the
+ * non-MCS SetPriority + SetAffinity pair (affinity now comes from which
+ * core's SchedControl configured the SC). */
+static inline seL4_Word
+qsoe_tcb_set_sched_params(seL4_CPtr tcb, seL4_CPtr authority,
+                          seL4_Word mcp, seL4_Word prio,
+                          seL4_CPtr sched_context, seL4_CPtr fault_ep)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = authority;
+    qsoe_ipcbuf->caps_or_badges[1] = sched_context;
+    qsoe_ipcbuf->caps_or_badges[2] = fault_ep;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBSetSchedParams, 0, 3, 2);
+    seL4_Word mr0 = mcp, mr1 = prio, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
+    return seL4_MessageInfo_get_label(reply);
+}
+
+/* seL4_SchedControl_ConfigureFlags (MCS): program a scheduling context's
+ * budget/period (microseconds) by invoking the per-core SchedControl cap
+ * (bootinfo.schedcontrol.start + core).  budget == period yields a
+ * round-robin / best-effort thread — the closest match to the non-MCS
+ * scheduler QSOE/L ran before v0.10.  4 MRs + flags in msg[4], 1 cap
+ * (the target SC). */
+static inline seL4_Word
+qsoe_sched_control_configure(seL4_CPtr sched_control, seL4_CPtr sc,
+                             seL4_Word budget_us, seL4_Word period_us,
+                             seL4_Word extra_refills, seL4_Word badge,
+                             seL4_Word flags)
+{
+    qsoe_ipcbuf->caps_or_badges[0] = sc;
+    qsoe_ipcbuf->msg[4] = flags;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_SchedControlConfigureFlags,
+                                                  0, 1, 5);
+    seL4_Word mr0 = budget_us, mr1 = period_us, mr2 = extra_refills, mr3 = badge;
+    seL4_MessageInfo_t reply = qsoe_sys_call(sched_control, tag,
+                                             &mr0, &mr1, &mr2, &mr3);
     return seL4_MessageInfo_get_label(reply);
 }
 
@@ -259,19 +303,11 @@ qsoe_tcb_set_priority(seL4_CPtr tcb, seL4_CPtr authority_tcb, seL4_Word prio)
     return seL4_MessageInfo_get_label(reply);
 }
 
-/* seL4_TCB_SetAffinity (SMP only). Pins the given TCB to logical CPU
- * `affinity` (0..CONFIG_MAX_NUM_NODES-1). New TCBs default to CPU 0;
- * call this right after Configure (and before Resume) to spread work
- * across harts. v0.4's ThreadCreate uses _thread_attr.runmask as the
- * affinity hint. */
-static inline seL4_Word
-qsoe_tcb_set_affinity(seL4_CPtr tcb, seL4_Word affinity)
-{
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_TCBSetAffinity, 0, 0, 1);
-    seL4_Word mr0 = affinity, mr1 = 0, mr2 = 0, mr3 = 0;
-    seL4_MessageInfo_t reply = qsoe_sys_call(tcb, tag, &mr0, &mr1, &mr2, &mr3);
-    return seL4_MessageInfo_get_label(reply);
-}
+/* Under MCS there is no TCB_SetAffinity: a thread runs on whichever
+ * core's SchedControl cap configured its scheduling context.  Choose
+ * the core by passing sched_control = bootinfo.schedcontrol.start +
+ * core_index to qsoe_sched_control_configure.  v0.4's ThreadCreate
+ * runmask hint now selects that SchedControl cap instead. */
 
 static inline seL4_Word
 qsoe_tcb_resume(seL4_CPtr tcb)
@@ -318,27 +354,32 @@ qsoe_tcb_unbind_notification(seL4_CPtr tcb)
     return seL4_MessageInfo_get_label(reply);
 }
 
-/* seL4_CNode_SaveCaller — moves the current thread's implicit reply
- * cap (the one set up by the most recent Recv/ReplyRecv) into the
- * named CNode slot. After this returns 0 the server can Recv again
- * without consuming the reply state; the saved slot holds a single-
- * use Reply cap. Sending to that slot delivers the deferred reply
- * and the kernel clears the slot. Used by v0.6.1's waitpid handler
- * to park the parent's call until the child detaches. */
+/* seL4_CNode_Move — move a cap from (src_root, src_index) to
+ * (dest_root, dest_index), leaving the source slot empty.  Under MCS
+ * this is how taskman stashes a deferred reply: move the dispatcher's
+ * active reply-object cap out into a per-waiter slot (then replenish a
+ * fresh reply object for the next Recv).  Later Send-ing to the stashed
+ * slot delivers the deferred reply (see qsoe_sys_send).  Marshalling
+ * mirrors CNodeCopy minus the rights word. */
 static inline seL4_Word
-qsoe_cnode_save_caller(seL4_CPtr root, seL4_Word index, seL4_Uint8 depth)
+qsoe_cnode_move(seL4_CPtr dest_root, seL4_Word dest_index, seL4_Uint8 dest_depth,
+                seL4_CPtr src_root, seL4_Word src_index, seL4_Uint8 src_depth)
 {
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_CNodeSaveCaller, 0, 0, 2);
-    seL4_Word mr0 = index, mr1 = (seL4_Word)(depth & 0xffu), mr2 = 0, mr3 = 0;
-    seL4_MessageInfo_t reply = qsoe_sys_call(root, tag, &mr0, &mr1, &mr2, &mr3);
+    qsoe_ipcbuf->caps_or_badges[0] = src_root;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_CNodeMove, 0, 1, 4);
+    seL4_Word mr0 = dest_index, mr1 = (seL4_Word)(dest_depth & 0xffu);
+    seL4_Word mr2 = src_index,  mr3 = (seL4_Word)(src_depth  & 0xffu);
+    seL4_MessageInfo_t reply = qsoe_sys_call(dest_root, tag, &mr0, &mr1, &mr2, &mr3);
     return seL4_MessageInfo_get_label(reply);
 }
 
 /* seL4_Send — one-shot Send on a cap. No reply, no implicit reply
- * state on the sender. Used to deliver a deferred reply via a slot
- * SaveCaller'd into: Send-on-saved-slot makes the original blocked
- * caller (the parent in waitpid()) unblock with this message.
- * Non-MCS kernels self-clear the slot after the Send consumes it. */
+ * state on the sender.  Two uses in QSOE/L MCS: (1) deliver a deferred
+ * reply by Send-ing to a stashed reply-object cap, which unblocks the
+ * original caller (the parent in waitpid(), a parked sleeper, ...);
+ * (2) Signal a notification.  Unlike the non-MCS save-caller slot, an
+ * MCS reply object is NOT self-cleared by the Send — the caller must
+ * delete/recycle it (see tm_reply_deliver). */
 static inline void
 qsoe_sys_send(seL4_CPtr ep, seL4_MessageInfo_t info,
               seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3)
@@ -416,8 +457,10 @@ qsoe_irq_handler_ack(seL4_CPtr handler)
     return seL4_MessageInfo_get_label(reply);
 }
 
-/* seL4_Wait — same syscall as Recv; kernel distinguishes by cap type.
- * Returns the badge (or 0 if the Notification cap is unbadged). */
+/* seL4_Wait (MCS): block on a Notification cap.  MCS gives Wait its own
+ * syscall number (distinct from Recv) and, unlike Recv, it takes no
+ * reply object — you can't reply to a notification.  Returns the badge
+ * (or 0 if the Notification cap is unbadged). */
 static inline seL4_Word
 qsoe_sys_wait(seL4_CPtr ntfn)
 {
@@ -427,7 +470,7 @@ qsoe_sys_wait(seL4_CPtr ntfn)
     register seL4_Word a3 __asm__("a3");
     register seL4_Word a4 __asm__("a4");
     register seL4_Word a5 __asm__("a5");
-    register seL4_Word a7 __asm__("a7") = (seL4_Word)SYS_Recv;
+    register seL4_Word a7 __asm__("a7") = (seL4_Word)SYS_Wait;
     __asm__ volatile("ecall"
                  : "+r"(a0), "=r"(a1), "=r"(a2), "=r"(a3), "=r"(a4), "=r"(a5)
                  : "r"(a7)

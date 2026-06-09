@@ -139,22 +139,20 @@ int tm_sync_wait(pid_t caller, unsigned long addr,
         if (!e) return -ENOMEM;
     }
 
-    /* Save the caller's reply cap and add it to the wait list. */
-    seL4_CPtr slot = taskman_alloc_empty_slot();
-    if (!slot) {
+    /* Park the caller's reply object and add it to the wait list.
+     * Check capacity FIRST so tm_reply_park() (which moves + replenishes
+     * the dispatcher's reply object) is the last fallible step — undoing
+     * a park after a later failure would strand the blocked caller. */
+    if (e->nwaiters >= TM_SYNC_MAX_WAITERS) {
         retire_if_idle(e);
         return -ENOMEM;
     }
-    if (qsoe_cnode_save_caller(s_cnode_root, slot, TM_DEPTH_TASKMAN) != 0) {
-        taskman_free_slot(slot);
+    seL4_CPtr slot = tm_reply_park();
+    if (slot == 0) {
         retire_if_idle(e);
         return -ENOMEM;
     }
-    if (push_waiter(e, slot) != 0) {
-        taskman_free_slot(slot);
-        retire_if_idle(e);
-        return -ENOMEM;
-    }
+    push_waiter(e, slot);   /* room guaranteed by the check above */
 
     *out_parked = 1;
     return 0;
@@ -182,8 +180,7 @@ int tm_sync_wake(pid_t caller, unsigned long addr, int max_n, unsigned mode)
             if (!slot) break;
             /* Deliver a 0-status reply to the parked waiter. */
             seL4_MessageInfo_t tag = seL4_MessageInfo_new(0, 0, 0, 0);
-            qsoe_sys_send(slot, tag, 0, 0, 0, 0);
-            taskman_free_slot(slot);
+            tm_reply_deliver(slot, tag, 0, 0, 0, 0);
             ++woken;
         }
     }
@@ -213,10 +210,11 @@ void tm_sync_pid_release(pid_t pid)
     for (int i = 0; i < TM_SYNC_MAX_ENTRIES; ++i) {
         if (!g_sync[i].in_use) continue;
         if (g_sync[i].pid != pid) continue;
-        /* Drop any saved reply caps — the process is gone, the caps
-         * point at TCBs that are about to be destroyed. */
+        /* Drop any parked reply objects — the process is gone, so the
+         * blocked callers will never be answered; delete the reply caps
+         * and recycle the slots. */
         for (int w = 0; w < g_sync[i].nwaiters; ++w) {
-            taskman_free_slot(g_sync[i].wait_slots[w]);
+            tm_reply_drop(g_sync[i].wait_slots[w]);
         }
         g_sync[i].in_use = 0;
         tm_warn("sync: dropped entry for terminated pid=%d addr=0x%x",

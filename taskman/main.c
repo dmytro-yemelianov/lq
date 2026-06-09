@@ -13,6 +13,7 @@
  */
 
 #include "sel4_types.h"
+#include "sel4_syscalls.h"
 #include "qsoe_invoke.h"
 #include "tm_log.h"
 
@@ -22,6 +23,7 @@
 #include "path/path.h"
 #include "path/pathmgr.h"
 #include "path/cpiofs.h"
+#include "path/sysfs.h"
 #include "sys/console.h"
 #include "sys/irq.h"
 #include "sys/platform.h"
@@ -260,20 +262,24 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     }
     case TM_REQ_THREAD_ALLOC: {
         int new_tid = 0;
-        seL4_CPtr tcb_slot = 0, ntfn_slot = 0;
+        seL4_CPtr tcb_slot = 0, ntfn_slot = 0, reply_slot = 0;
         unsigned prio_byte = (unsigned)(mr3 & 0xffu);
         unsigned affinity  = (unsigned)((mr3 >> 8) & 0xffu);
         int rc = tm_thread_alloc(caller,
                                   (unsigned long)mr0, (unsigned)mr1,
                                   (unsigned long)mr2,
                                   prio_byte, affinity,
-                                  &new_tid, &tcb_slot, &ntfn_slot);
+                                  &new_tid, &tcb_slot, &ntfn_slot,
+                                  &reply_slot);
         if (rc) { err = (seL4_Word)(-rc); }
         else {
+            /* MCS: mr3 carries the worker's own reply object slot (one
+             * per thread — reply objects can't be shared). */
             *out_mr0 = (seL4_Word)tcb_slot;
             *out_mr1 = (seL4_Word)ntfn_slot;
             *out_mr2 = (seL4_Word)new_tid;
-            reply_len = 3;
+            *out_mr3 = (seL4_Word)reply_slot;
+            reply_len = 4;
         }
         break;
     }
@@ -742,8 +748,19 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
 
 static void print_banner(void)
 {
-    tm_info("QSOE: Quick & Secure Operating Environment %s booting",
-            QSOE_VSHORT);
+    unsigned long i;
+    const char banner_str[] = "QSOE/N Operating System version ";
+    unsigned long n = sizeof(banner_str) + sizeof(QSOE_VSHORT);
+
+    sel4_debug_puts("\n+");
+    for (i = 0; i < n; i++)
+        sel4_debug_putchar('-');
+    sel4_debug_puts("+\n| ");
+    sel4_debug_puts(banner_str);
+    sel4_debug_puts(QSOE_VSHORT " |\n+");
+    for (i = 0; i < n; i++)
+        sel4_debug_putchar('-');
+    sel4_debug_puts("+\n\n");
 }
 
 static seL4_CPtr find_largest_ram_untyped(seL4_BootInfo *bi)
@@ -858,6 +875,15 @@ int main(seL4_BootInfo *bi)
     if (rerr != 0) {
         tm_crash("failed to retype primary endpoint");
     }
+
+    /* MCS: record the per-core SchedControl caps (needed to give every
+     * spawned thread a scheduling context — without one a TCB never
+     * runs) and allocate the dispatcher's own reply object before the
+     * first Recv. */
+    tm_set_sched_control(bi->schedcontrol.start, bi->numNodes);
+    if (tm_reply_init() != 0) {
+        tm_crash("failed to allocate dispatcher reply object");
+    }
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, 1,
                                       primary_ep, primary_ep) != 0) {
         tm_crash("failed to register primary channel");
@@ -882,6 +908,10 @@ int main(seL4_BootInfo *bi)
     if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_PMDIR_CHID,
                                       primary_ep, primary_ep) != 0) {
         tm_crash("failed to register pmdir channel");
+    }
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_SYSFS_CHID,
+                                      primary_ep, primary_ep) != 0) {
+        tm_crash("failed to register sysfs channel");
     }
 
     tm_pathmgr_init();
@@ -960,6 +990,23 @@ int main(seL4_BootInfo *bi)
         }
     }
 
+    /* Synthetic read-only /sys ("the kernel describes itself").  The
+     * model is the shared libtaskman core; tm_sysfs_populate() snapshots
+     * board/version/builddate from the syscfg blob (already built above)
+     * + the version header.  Backs `read BOARD < /sys/board` in init. */
+    tm_sysfs_populate();
+    {
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = QSOE_PID_TASKMAN,
+            .server_chid  = TM_SYSFS_CHID,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_TASKMAN_SYSFS,
+        };
+        if (tm_pathmgr_register("/sys", &obj) != 0) {
+            tm_crash("pathmgr register /sys failed");
+        }
+    }
+
     const void   *cpio_data;
     unsigned long cpio_len;
 #ifdef TM_USE_INITRD_LOADER
@@ -1006,7 +1053,12 @@ int main(seL4_BootInfo *bi)
 
     seL4_Word badge;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    /* MCS: every Recv/ReplyRecv carries the dispatcher's active reply
+     * object (register a6).  Deferred-reply handlers move it aside via
+     * tm_reply_park() and a fresh one replaces it, so tm_active_reply()
+     * is re-read each iteration. */
     seL4_MessageInfo_t info = qsoe_sys_recv(primary_ep, &badge,
+                                             tm_active_reply(),
                                              &mr0, &mr1, &mr2, &mr3);
     for (;;) {
         seL4_Word r0, r1, r2, r3;
@@ -1018,10 +1070,12 @@ int main(seL4_BootInfo *bi)
         if (no_reply) {
             mr0 = 0; mr1 = 0; mr2 = 0; mr3 = 0;
             info = qsoe_sys_recv(primary_ep, &badge,
+                                  tm_active_reply(),
                                   &mr0, &mr1, &mr2, &mr3);
         } else {
             mr0 = r0; mr1 = r1; mr2 = r2; mr3 = r3;
             info = qsoe_sys_reply_recv(primary_ep, reply_info, &badge,
+                                        tm_active_reply(),
                                         &mr0, &mr1, &mr2, &mr3);
         }
     }

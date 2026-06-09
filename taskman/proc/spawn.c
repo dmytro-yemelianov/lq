@@ -104,6 +104,11 @@ struct elf64_phdr {
 #define CHILD_STACK_TOP    0x1FE000UL  /* sp starts here, grows down */
 #define CHILD_STACK_PAGES  2
 #define CHILD_IPC_BUFFER   0x1FE000UL  /* one page, just above the stack */
+
+/* seL4 priority for spawned user processes — one below taskman so the
+ * server always preempts.  (seL4 priorities run 0..255; taskman, the
+ * root task, sits at 255.) */
+#define TM_PRIO_USER       254
 /* v0.6.4: no pre-allocated heap.  Memory comes on demand via
  * TM_REQ_MMAP — see tm_mmap_serve below.  The bottom of that region
  * is QSOE_MMAP_BASE (= 0x2000000, 32 MiB), well above the image,
@@ -1163,26 +1168,24 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             tm_err("spawn: UART frame copy failed");
             return -ENOMEM;
         }
-        /* (5) IRQHandler — mint into child slot QSOE_CAP_IRQ_HANDLER. */
-        err = qsoe_irq_control_get(seL4_CapIRQControl,
-                                    PLIC_UART_IRQ, TRIGGER_LEVEL,
-                                    cnode, QSOE_CAP_IRQ_HANDLER, 12);
-        if (err) {
-            tm_err("spawn: IRQControl_GetTrigger failed");
-            return -ENOMEM;
-        }
-        /* (6) IRQ Notification — retype from RAM untyped directly
-         *     into child's slot QSOE_CAP_IRQ_NTFN. node_depth=0 means
-         *     "use cnode as the dest CNode itself"; node_offset is the
-         *     slot inside. */
-        err = qsoe_untyped_retype(s_untyped, seL4_NotificationObject,
-                                    seL4_NotificationBits,
-                                    cnode, 0, 0,
-                                    QSOE_CAP_IRQ_NTFN, 1);
-        if (err) {
-            tm_err("spawn: IRQ Notification retype failed");
-            return -ENOMEM;
-        }
+        /* Steps (5)/(6) — the spawn-time pre-mint of an IRQHandler +
+         * Notification into QSOE_CAP_IRQ_HANDLER / QSOE_CAP_IRQ_NTFN —
+         * were removed (v0.10).  They are the leftover v0.7 "magic-named"
+         * IRQ wiring that sys/irq.c's comment says v0.8 superseded:
+         * devc-ser8250 now claims its line at runtime via
+         * InterruptAttachThread -> TM_REQ_IRQ_ATTACH (tm_irq_attach),
+         * which mints a fresh (IRQHandler, Notification) pair into the
+         * caller's CSpace.  Pre-minting the IRQHandler here claimed PLIC
+         * line 10 first, so the driver's runtime attach failed with
+         * "Rejecting request for IRQ 10. Already active." (errno=EBUSY)
+         * and the UART never became interrupt-driven.
+         *
+         * NOTE (for review): the UART-MMIO mapping in steps (1)-(4)
+         * above is now ALSO dead — devc-ser8250 maps the 16550 itself
+         * via mmap(MAP_PHYS, UART_PHYS) (quser/dev/ser8250/uart.c), so
+         * QSOE_CAP_UART_FRAME at 0xA00000 is never read.  Left in place
+         * pending confirmation; a follow-up can drop this whole
+         * spawn_name_eq("devc-ser8250") block. */
     }
 
     /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
@@ -1190,16 +1193,31 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    fit in 12 bits. seL4_CNode_CapData layout: bits[0..5] =
      *    guardSize, bits[6..63] = guard value. */
     seL4_Word cnode_data = 52UL;  /* guardSize=52, guard=0 */
-    err = qsoe_tcb_configure(tcb, 0 /*fault_ep*/,
+    err = qsoe_tcb_configure(tcb,
                               cnode, cnode_data,
                               vspace, 0 /*vspace_data*/,
                               CHILD_IPC_BUFFER, ipc_frame);
     if (err) { tm_err("spawn: TCB_Configure failed"); return -ENOMEM; }
 
-    /* Spawned processes run below taskman. taskman blocks on Recv when
-     * it has no work, so lower-priority threads always get the CPU. */
-    err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB, 254);
-    if (err) { tm_err("spawn: TCB_SetPriority failed"); return -ENOMEM; }
+    /* MCS: a TCB cannot run until a scheduling context is bound.  Give
+     * the main thread a round-robin SC on core 0 and bind it (along with
+     * priority) via SetSchedParams.  Spawned processes run below taskman
+     * (TM_PRIO_USER); taskman blocks on Recv when idle, so lower-priority
+     * threads always get the CPU. */
+    seL4_CPtr sc = tm_sched_context_create(/*core=*/0);
+    if (!sc) { tm_err("spawn: sched-context create failed"); return -ENOMEM; }
+    err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
+                                    /*mcp=*/TM_PRIO_USER, /*prio=*/TM_PRIO_USER,
+                                    sc, /*fault_ep=*/0);
+    if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return -ENOMEM; }
+
+    /* MCS: provision the child's reply object at the well-known slot its
+     * libc MsgReceive/MsgReply ride (register a6 / Send target).  Retype
+     * straight into the child's CNode (node_depth 0 => cnode is the dest
+     * CNode itself), mirroring the IRQ-notification retype above. */
+    err = qsoe_untyped_retype(s_untyped, seL4_ReplyObject, 0,
+                              cnode, 0, 0, QSOE_CAP_REPLY, 1);
+    if (err) { tm_err("spawn: child reply object retype failed"); return -ENOMEM; }
 
     /* 7. WriteRegisters: pc=entry, a0=pid, sp=initial_sp (pointing
      *    at argc in the SysV image we just wrote into the top stack

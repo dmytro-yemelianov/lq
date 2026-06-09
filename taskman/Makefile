@@ -201,6 +201,7 @@ TASKMAN_OBJS := \
     $(OBJDIR)/mem/mmap.o \
     $(OBJDIR)/path/cpiofs.o \
     $(OBJDIR)/path/pmdir.o \
+    $(OBJDIR)/path/sysfs.o \
     $(OBJDIR)/path/io.o \
     $(OBJDIR)/sys/console.o \
     $(OBJDIR)/sys/devnull.o \

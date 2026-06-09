@@ -22,7 +22,25 @@
 #ifndef CONFIG_ENABLE_SMP_SUPPORT
 # define CONFIG_ENABLE_SMP_SUPPORT 1
 #endif
-/* CONFIG_KERNEL_MCS intentionally NOT defined — non-MCS build. */
+/* v0.10: QSOE/L moved to the MCS variant of seL4 (scheduling contexts,
+ * reply objects, Wait-with-timeout).  CONFIG_KERNEL_MCS MUST be defined
+ * before the generated invocation/syscall enums below are included — those
+ * headers carry live `#if defined(CONFIG_KERNEL_MCS)` branches, so the
+ * enum positions (and which labels exist at all) depend on it.  Keep it in
+ * lockstep with the kernel's -DKernelIsMCS=ON (see lq/Makefile). */
+#ifndef CONFIG_KERNEL_MCS
+# define CONFIG_KERNEL_MCS 1
+#endif
+/* The kernel is built with debug syscalls enabled (KernelVerificationBuild
+ * =OFF keeps CONFIG_PRINTING on), so the generated <arch/api/syscall.h>
+ * gates SysDebugPutChar / SysDebugDumpScheduler behind CONFIG_PRINTING.
+ * Define it here — before that header is pulled in below — so the debug
+ * console putchar (sel4_syscalls.h) sees the member with the kernel's
+ * actual (explicitly-numbered) value rather than failing to compile or
+ * falling back to a stale literal. */
+#ifndef CONFIG_PRINTING
+# define CONFIG_PRINTING 1
+#endif
 
 typedef unsigned long       seL4_Word;
 
@@ -46,21 +64,40 @@ typedef struct { seL4_Word words[1]; } seL4_MessageInfo_t;
 
 typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 
-/* Object types (non-MCS, RISC-V 64; see objecttype.h enums). */
+/* Object types — RISC-V 64 (see objecttype.h enums).  MCS inserts
+ * SchedContext + Reply between CapTable and the arch page types,
+ * shifting every RISC-V page/PT type up by 2. */
 #define seL4_UntypedObject           0
 #define seL4_TCBObject               1
 #define seL4_EndpointObject          2
 #define seL4_NotificationObject      3
 #define seL4_CapTableObject          4
+#ifdef CONFIG_KERNEL_MCS
+#define seL4_SchedContextObject      5
+#define seL4_ReplyObject             6
+#define seL4_RISCV_Giga_Page         7
+#define seL4_RISCV_4K_Page           8
+#define seL4_RISCV_Mega_Page         9
+#define seL4_RISCV_PageTableObject  10
+#else
 #define seL4_RISCV_Giga_Page         5
 #define seL4_RISCV_4K_Page           6
 #define seL4_RISCV_Mega_Page         7
 #define seL4_RISCV_PageTableObject   8
+#endif
 
-/* Object size bits — for retype size_bits argument. */
-#define seL4_TCBBits             10  /* TCB is 2^10 = 1024 bytes (non-MCS) */
+/* Object size bits — for retype size_bits argument.  For fixed-size
+ * objects the kernel ignores size_bits; only Untyped, CapTable, and
+ * (MCS) SchedContext genuinely consume it. */
+#define seL4_TCBBits             10  /* TCB is 2^10 = 1024 bytes */
 #define seL4_EndpointBits         4
-#define seL4_NotificationBits     5  /* notification_t is 2^5 = 32 bytes (non-MCS) */
+#ifdef CONFIG_KERNEL_MCS
+#define seL4_NotificationBits     6  /* notification_t grows to 2^6 under MCS */
+#define seL4_ReplyBits            5  /* reply object is 2^5 bytes */
+#define seL4_MinSchedContextBits  7  /* sched_context is variable-size, >= 2^7 */
+#else
+#define seL4_NotificationBits     5  /* notification_t is 2^5 = 32 bytes */
+#endif
 #define seL4_PageBits            12  /* 4 KiB */
 #define seL4_PageTableBits       12  /* one PT level on Sv39 */
 #define seL4_VSpaceBits          seL4_PageTableBits
@@ -77,6 +114,22 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 #define seL4_CapIOSpace               8
 #define seL4_CapBootInfoFrame         9
 #define seL4_CapInitThreadIPCBuffer  10
+#define seL4_CapDomain               11
+#ifdef CONFIG_KERNEL_MCS
+/* MCS adds the init thread's scheduling-context cap.  Slots 12/13 are
+ * the SMMU SID/CB controls (null on RISC-V), so the SC lands at 14. */
+#define seL4_CapInitThreadSC         14
+#endif
+
+/* QSOE/L process CSpace: the main thread's reply object slot.  This is
+ * the seL4-MCS counterpart to the OS-independent well-known slots in
+ * <qsoe/slots.h>; it lives here (the LQ seL4-specific header, reachable
+ * by both taskman and the LQ libc seam) rather than the shared tree
+ * because reply objects are an seL4 concept QSOE/N never has.  taskman
+ * provisions it at spawn; libc MsgReceive passes it as the reply cap
+ * (register a6) and MsgReply Sends to it.  Occupies slot 10, reserved
+ * for this in <qsoe/slots.h>'s well-known range. */
+#define QSOE_CAP_REPLY               10
 
 /* Invocation method labels — aliases for upstream enum members.
  * The numeric values are determined by the kernel's invocation.h with
@@ -87,12 +140,22 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 #define INV_TCBSetPriority       TCBSetPriority
 #define INV_TCBSuspend           TCBSuspend
 #define INV_TCBResume            TCBResume
-#define INV_TCBSetAffinity       TCBSetAffinity
 #define INV_CNodeRevoke          CNodeRevoke
 #define INV_CNodeDelete          CNodeDelete
 #define INV_CNodeCopy            CNodeCopy
 #define INV_CNodeMint            CNodeMint
+#define INV_CNodeMove            CNodeMove
+#ifdef CONFIG_KERNEL_MCS
+/* MCS replaces SaveCaller (deferred replies) with reply objects, and
+ * folds per-core placement + SC binding into SetSchedParams + the
+ * per-core SchedControl cap (TCBSetAffinity is gone under MCS). */
+#define INV_TCBSetSchedParams           TCBSetSchedParams
+#define INV_SchedControlConfigureFlags  SchedControlConfigureFlags
+#define INV_SchedContextBind            SchedContextBind
+#else
+#define INV_TCBSetAffinity       TCBSetAffinity
 #define INV_CNodeSaveCaller      CNodeSaveCaller
+#endif
 #define INV_RISCVPageTableMap    RISCVPageTableMap
 #define INV_RISCVPageTableUnmap  RISCVPageTableUnmap
 #define INV_RISCVPageMap         RISCVPageMap
@@ -105,9 +168,18 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 #define SYS_Send    SysSend
 #define SYS_NBSend  SysNBSend
 #define SYS_Recv    SysRecv
-#define SYS_Reply   SysReply
 #define SYS_Yield   SysYield
 #define SYS_NBRecv  SysNBRecv
+#ifdef CONFIG_KERNEL_MCS
+/* MCS drops the dedicated SysReply (reply via Send to a reply object)
+ * and adds Wait/NBWait (notification receive, no reply) plus the
+ * combined NBSendRecv. */
+#define SYS_Wait       SysWait
+#define SYS_NBWait     SysNBWait
+#define SYS_NBSendRecv SysNBSendRecv
+#else
+#define SYS_Reply   SysReply
+#endif
 
 #define seL4_MsgMaxLength       120
 #define seL4_MsgMaxExtraCaps    3
@@ -148,6 +220,14 @@ typedef struct {
     seL4_SlotRegion  extraBIPages;
     seL4_Word        initThreadCNodeSizeBits;
     seL4_Domain      initThreadDomain;
+#ifdef CONFIG_KERNEL_MCS
+    /* One SchedControl cap per node (core); used to configure a
+     * scheduling context's budget/period and to place a thread on a
+     * core (schedcontrol.start + core_index).  Inserted here by the
+     * kernel between initThreadDomain and untyped — getting the field
+     * order wrong corrupts untyped parsing. */
+    seL4_SlotRegion  schedcontrol;
+#endif
     seL4_SlotRegion  untyped;
     seL4_UntypedDesc untypedList[];
 } seL4_BootInfo;

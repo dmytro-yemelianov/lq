@@ -11,6 +11,7 @@
 #include "pathmgr.h"
 #include "cpiofs.h"
 #include "pmdir.h"
+#include "sysfs.h"
 #include "../sys/console.h"
 #include "../sys/devnull.h"
 #include "../sys/devzero.h"
@@ -61,6 +62,16 @@ int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot)
                 return orc;
             }
         }
+    } else if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_SYSFS) {
+        /* Synthetic read-only /sys (file or the /sys directory). */
+        seL4_Word badge = 0;
+        if (tm_connection_badge_by_slot(caller, slot, &badge) == 0) {
+            int orc = tm_sysfs_open(s_open_path, badge);
+            if (orc) {
+                tm_connect_detach(caller, slot);
+                return orc;
+            }
+        }
     }
     *out_slot = slot;
     return 0;
@@ -88,6 +99,9 @@ int tm_io_close(pid_t caller, seL4_Word badge)
     }
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_PMDIR_CHID) {
         return tm_pmdir_close(badge);
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_SYSFS_CHID) {
+        return tm_sysfs_close(badge);
     }
     /* External resmgrs (e.g. /sbin/pipe): they receive TM_REQ_CLOSE
      * directly on their own channel (the fd's cap points at them);
@@ -141,6 +155,9 @@ int tm_io_read(pid_t caller, seL4_Word badge, unsigned want,
     }
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
         return tm_cpiofs_read(badge, want, out_got);
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_SYSFS_CHID) {
+        return tm_sysfs_read(badge, want, out_got);
     }
     return -ENOSYS;
 }
@@ -228,6 +245,12 @@ int tm_fstat(pid_t caller, seL4_Word badge, unsigned *out_bytes)
         *out_bytes = (unsigned)sizeof *out;
         return 0;
     }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_SYSFS_CHID) {
+        int rc = tm_sysfs_fstat(badge, out);
+        if (rc) return rc;
+        *out_bytes = (unsigned)sizeof *out;
+        return 0;
+    }
     /* External resmgrs: route a stat probe over the connection
      * once their wire protocol exists.  Not wired yet. */
     return -ENOSYS;
@@ -286,6 +309,9 @@ int tm_lseek(pid_t caller, seL4_Word badge, int whence, long offset,
     if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
         return tm_cpiofs_lseek(badge, whence, offset, out_off);
     }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_SYSFS_CHID) {
+        return tm_sysfs_lseek(badge, whence, offset, out_off);
+    }
     return -ESPIPE;
 }
 
@@ -322,6 +348,19 @@ int tm_readdir(pid_t caller, seL4_Word badge, unsigned *out_bytes)
         unsigned namelen = 0;
         int d_type = 0;
         int rc = tm_pmdir_readdir(badge, name, &namelen, &d_type);
+        if (rc) return rc;
+        p[0] = (unsigned char)d_type;
+        for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];
+        p[1 + namelen] = 0;
+        *out_bytes = 1 + namelen + 1;
+        return 0;
+    }
+    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_SYSFS_CHID) {
+        unsigned char *p = (unsigned char *)&qsoe_ipcbuf->msg[4];
+        char name[256];
+        unsigned namelen = 0;
+        int d_type = 0;
+        int rc = tm_sysfs_readdir(badge, name, &namelen, &d_type);
         if (rc) return rc;
         p[0] = (unsigned char)d_type;
         for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];

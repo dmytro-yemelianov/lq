@@ -62,7 +62,8 @@ int tm_thread_alloc(pid_t caller_pid,
                     unsigned prio, unsigned affinity,
                     int *out_tid,
                     seL4_CPtr *out_tcb_slot,
-                    seL4_CPtr *out_ntfn_slot)
+                    seL4_CPtr *out_ntfn_slot,
+                    seL4_CPtr *out_reply_slot)
 {
     if (caller_pid == QSOE_PID_TASKMAN) {
         return -ENOSYS;
@@ -102,21 +103,36 @@ int tm_thread_alloc(pid_t caller_pid,
         if (err) return -ENOMEM;
     }
 
-    err = qsoe_tcb_configure(tcb, 0 /*fault_ep*/,
+    err = qsoe_tcb_configure(tcb,
                               p->cnode, 52UL,
                               p->vspace, 0,
                               ipc_vaddr, ipc_frame);
     if (err) return -ENOMEM;
 
-    err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB, prio);
-    if (err) return -ENOMEM;
-
-    err = qsoe_tcb_set_affinity(tcb, affinity);
+    /* MCS: bind a scheduling context (placed on the requested core —
+     * that placement is how MCS expresses affinity, TCB_SetAffinity
+     * being retired) so the worker can run, and set its priority in the
+     * same SetSchedParams invocation. */
+    seL4_CPtr sc = tm_sched_context_create(affinity);
+    if (!sc) return -ENOMEM;
+    err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
+                                    /*mcp=*/prio, /*prio=*/prio,
+                                    sc, /*fault_ep=*/0);
     if (err) return -ENOMEM;
 
     seL4_CPtr child_tcb_slot  = tm_process_alloc_slot(caller_pid);
     seL4_CPtr child_ntfn_slot = tm_process_alloc_slot(caller_pid);
     seL4_Uint8 ddepth = cnode_depth_for(caller_pid);
+
+    /* MCS: give the worker its own reply object (a reply object binds
+     * one caller at a time, so threads cannot share one).  Retype it
+     * straight into the worker's CSpace and hand the slot back so the
+     * thread's libc startup can record it for MsgReceive/MsgReply. */
+    seL4_CPtr child_reply_slot = tm_process_alloc_slot(caller_pid);
+    if (qsoe_untyped_retype(s_untyped, seL4_ReplyObject, 0,
+                            p->cnode, 0, 0, child_reply_slot, 1) != 0) {
+        return -ENOMEM;
+    }
 
     if (qsoe_cnode_copy(p->cnode, child_tcb_slot, ddepth,
                         s_cnode_root, tcb, TM_DEPTH_TASKMAN,
@@ -133,8 +149,9 @@ int tm_thread_alloc(pid_t caller_pid,
     g_threads[gidx].tcb_in_caller  = child_tcb_slot;
     g_threads[gidx].ntfn_in_caller = child_ntfn_slot;
 
-    *out_tid       = new_tid;
-    *out_tcb_slot  = child_tcb_slot;
-    *out_ntfn_slot = child_ntfn_slot;
+    *out_tid        = new_tid;
+    *out_tcb_slot   = child_tcb_slot;
+    *out_ntfn_slot  = child_ntfn_slot;
+    *out_reply_slot = child_reply_slot;
     return 0;
 }

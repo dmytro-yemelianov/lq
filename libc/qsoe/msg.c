@@ -186,7 +186,14 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
 
     seL4_Word badge;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
-    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge,
+    /* MCS: the receive carries this thread's reply object (register a6),
+     * which the kernel binds to the incoming Call so MsgReply can answer
+     * it.  The main thread uses the well-known QSOE_CAP_REPLY slot
+     * taskman provisioned at spawn.  (Worker-thread receive needs a
+     * per-thread reply object — deferred until the signal thread and
+     * multi-threaded resmgr pools land; see proc/thread.c which already
+     * provisions one per worker.) */
+    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge, QSOE_CAP_REPLY,
                                             &mr0, &mr1, &mr2, &mr3);
 
     /* v0.4.3: bound-Notification pulse wake. If the receive resolved
@@ -275,11 +282,27 @@ int MsgSavereply(int rcvid)
 
     unsigned long slot = qsoe_state_alloc_empty_slot();
     if (!slot) { qsoe_errno = EAGAIN; return -1; }
-    seL4_Word err = qsoe_cnode_save_caller(QSOE_CAP_CNODE_SELF, slot,
-                                            QSOE_CAP_CNODE_DEPTH);
-    if (err) {
+    /* MCS: stash this thread's reply object (bound to the client by the
+     * preceding MsgReceive) into `slot`, then replenish QSOE_CAP_REPLY
+     * with a fresh reply object retyped from our own untyped budget so
+     * the next MsgReceive has one.  Replaces the non-MCS SaveCaller. */
+    if (qsoe_cnode_move(QSOE_CAP_CNODE_SELF, slot, QSOE_CAP_CNODE_DEPTH,
+                        QSOE_CAP_CNODE_SELF, QSOE_CAP_REPLY,
+                        QSOE_CAP_CNODE_DEPTH) != 0) {
         qsoe_state_free_empty_slot(slot);
-        qsoe_errno = (int)err;
+        qsoe_errno = ENOMEM;
+        return -1;
+    }
+    if (qsoe_untyped_retype(QSOE_CAP_OWN_UNTYPED, seL4_ReplyObject, 0,
+                            QSOE_CAP_CNODE_SELF, 0, 0,
+                            QSOE_CAP_REPLY, 1) != 0) {
+        /* Replenish failed — move the client's reply back so it isn't
+         * stranded, and fail the save. */
+        qsoe_cnode_move(QSOE_CAP_CNODE_SELF, QSOE_CAP_REPLY,
+                        QSOE_CAP_CNODE_DEPTH,
+                        QSOE_CAP_CNODE_SELF, slot, QSOE_CAP_CNODE_DEPTH);
+        qsoe_state_free_empty_slot(slot);
+        qsoe_errno = ENOMEM;
         return -1;
     }
     return (int)(QSOE_RCVID_SAVED | (unsigned)slot);
@@ -299,15 +322,18 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes)
     seL4_MessageInfo_t tag = seL4_MessageInfo_new((unsigned)status,
                                                    0, 0, nwords);
     if ((unsigned)rcvid & QSOE_RCVID_SAVED) {
-        /* Deferred reply via SaveCaller'd slot: Send on the slot and
-         * recycle it.  The kernel auto-clears the slot when the Send
-         * consumes the reply cap on non-MCS. */
+        /* Deferred reply: Send to the stashed reply object (unblocks the
+         * client), then delete it and recycle the slot.  An MCS reply
+         * object is not self-cleared by the Send, so delete it. */
         unsigned long slot = (unsigned long)((unsigned)rcvid & ~QSOE_RCVID_SAVED);
         qsoe_sys_send((seL4_CPtr)slot, tag, mr0, mr1, mr2, mr3);
+        qsoe_cnode_delete(QSOE_CAP_CNODE_SELF, slot, QSOE_CAP_CNODE_DEPTH);
         qsoe_state_free_empty_slot(slot);
     } else {
-        /* Normal reply via the implicit per-thread reply cap. */
-        qsoe_sys_reply(tag, mr0, mr1, mr2, mr3);
+        /* Normal reply: Send to this thread's reply object, which the
+         * matching MsgReceive bound to the client.  The object is reused
+         * (re-armed) by the next MsgReceive. */
+        qsoe_sys_send(QSOE_CAP_REPLY, tag, mr0, mr1, mr2, mr3);
     }
     return 0;
 }

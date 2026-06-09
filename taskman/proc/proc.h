@@ -163,6 +163,34 @@ void      taskman_free_slot(seL4_CPtr slot);
  * allocated taskman-CSpace slot.  Returns the slot, or 0 on failure. */
 seL4_CPtr taskman_alloc_and_retype(seL4_Word type, seL4_Word size_bits);
 
+/* ----------- MCS scheduling + reply objects (v0.10, process.c) ----------- */
+
+/* SchedControl base + node count (from bootinfo.schedcontrol), set by
+ * main().  tm_sched_control_for_core() picks the cap for a core — that
+ * placement is how MCS expresses thread affinity. */
+void      tm_set_sched_control(seL4_CPtr base, seL4_Word num_nodes);
+seL4_CPtr tm_sched_control_for_core(unsigned core);
+
+/* Create + configure a round-robin scheduling context on `core`.
+ * Every spawned/created TCB needs one bound (SetSchedParams) to run. */
+seL4_CPtr tm_sched_context_create(unsigned core);
+
+/* Retype a bare reply object into a fresh taskman slot. */
+seL4_CPtr tm_reply_object_create(void);
+
+/* Dispatcher reply object: tm_reply_init() allocates it once (before the
+ * first Recv); tm_active_reply() returns it for the Recv/ReplyRecv calls;
+ * tm_reply_park() stashes the current caller's reply + replenishes, and
+ * tm_reply_deliver() answers a parked reply later (MCS replacement for
+ * the SaveCaller + Send deferred-reply pattern). */
+int       tm_reply_init(void);
+seL4_CPtr tm_active_reply(void);
+seL4_CPtr tm_reply_park(void);
+void      tm_reply_deliver(seL4_CPtr slot, seL4_MessageInfo_t tag,
+                           seL4_Word mr0, seL4_Word mr1,
+                           seL4_Word mr2, seL4_Word mr3);
+void      tm_reply_drop(seL4_CPtr slot);
+
 /* ----------- process: init + registry + lifecycle ----------- */
 
 void          tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free);
@@ -311,7 +339,8 @@ int tm_thread_alloc(pid_t caller_pid,
                     unsigned prio, unsigned affinity,
                     int *out_tid,
                     seL4_CPtr *out_tcb_slot,
-                    seL4_CPtr *out_ntfn_slot);
+                    seL4_CPtr *out_ntfn_slot,
+                    seL4_CPtr *out_reply_slot);
 
 /* ----------- pulses ----------- */
 

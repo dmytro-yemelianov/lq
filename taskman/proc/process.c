@@ -27,6 +27,33 @@ seL4_CPtr s_untyped;
 seL4_CPtr s_cnode_root;
 seL4_CPtr s_next_slot;
 
+/* ----------- MCS scheduling + reply-object state (v0.10) ----------- */
+
+/* Base of the per-core SchedControl cap region (bootinfo.schedcontrol.
+ * start) and the node count, set by main() via tm_set_sched_control().
+ * Configuring a scheduling context on core N invokes s_sched_control +
+ * N; that placement replaces the retired non-MCS TCB_SetAffinity. */
+static seL4_CPtr s_sched_control;
+static seL4_Word s_num_nodes = 1;
+
+/* The dispatcher's "active" reply object — bound to the current caller
+ * by every Recv/ReplyRecv (see main.c's loop).  Deferred-reply handlers
+ * move this cap aside (tm_reply_park) and a fresh reply object replaces
+ * it for the next receive. */
+static seL4_CPtr s_active_reply;
+
+void tm_set_sched_control(seL4_CPtr base, seL4_Word num_nodes)
+{
+    s_sched_control = base;
+    s_num_nodes     = num_nodes ? num_nodes : 1;
+}
+
+seL4_CPtr tm_sched_control_for_core(unsigned core)
+{
+    if (core >= s_num_nodes) core = 0;
+    return s_sched_control + core;
+}
+
 /* v0.4.1 pid allocator.  pid 1 is reserved for taskman; child pids
  * start at 2 and are bump-allocated.  Freed pids land on a LIFO. */
 static pid_t s_next_pid       = 2;
@@ -291,6 +318,101 @@ seL4_CPtr taskman_alloc_and_retype(seL4_Word type, seL4_Word size_bits)
     return slot;
 }
 
+/* ----------- MCS scheduling contexts + reply objects (v0.10) ----------- */
+
+/* Round-robin / best-effort budget: budget == period makes a thread
+ * simply runnable whenever it is the highest-priority ready thread —
+ * the closest MCS analogue to the non-MCS scheduler QSOE/L ran before
+ * v0.10.  1 ms quantum. */
+#define TM_SC_PERIOD_US  1000u
+#define TM_SC_BUDGET_US  TM_SC_PERIOD_US
+
+/* Retype a scheduling context and program it (budget==period) on the
+ * given core's SchedControl.  Returns the SC cap, or 0 on failure.
+ * SchedContext is variable-size, so the retype size_bits MUST be
+ * >= seL4_MinSchedContextBits. */
+seL4_CPtr tm_sched_context_create(unsigned core)
+{
+    seL4_CPtr sc = taskman_alloc_and_retype(seL4_SchedContextObject,
+                                            seL4_MinSchedContextBits);
+    if (!sc) return 0;
+    seL4_Word err = qsoe_sched_control_configure(tm_sched_control_for_core(core),
+                                                 sc,
+                                                 TM_SC_BUDGET_US, TM_SC_PERIOD_US,
+                                                 0, 0, 0);
+    if (err != 0) {
+        qsoe_cnode_delete(s_cnode_root, sc, TM_DEPTH_TASKMAN);
+        taskman_free_slot(sc);
+        return 0;
+    }
+    return sc;
+}
+
+/* Retype a fresh reply object into a freshly-allocated taskman slot. */
+seL4_CPtr tm_reply_object_create(void)
+{
+    return taskman_alloc_and_retype(seL4_ReplyObject, 0);
+}
+
+/* One-time: hand the dispatcher its active reply object.  Must run
+ * before the first Recv (see main.c). */
+int tm_reply_init(void)
+{
+    s_active_reply = tm_reply_object_create();
+    return s_active_reply ? 0 : -ENOMEM;
+}
+
+seL4_CPtr tm_active_reply(void) { return s_active_reply; }
+
+/* Park the current caller's reply: move the dispatcher's active reply
+ * cap into a stash slot (the caller stays blocked, tracked by that
+ * cap), then replenish a fresh reply object for the next Recv.  Returns
+ * the stash slot, or 0 on failure.  MCS replacement for the retired
+ * qsoe_cnode_save_caller. */
+seL4_CPtr tm_reply_park(void)
+{
+    seL4_CPtr slot = taskman_alloc_empty_slot();
+    if (!slot) return 0;
+    if (qsoe_cnode_move(s_cnode_root, slot, TM_DEPTH_TASKMAN,
+                        s_cnode_root, s_active_reply, TM_DEPTH_TASKMAN) != 0) {
+        taskman_free_slot(slot);
+        return 0;
+    }
+    /* s_active_reply is now empty; retype a new reply object into it. */
+    if (qsoe_untyped_retype(s_untyped, seL4_ReplyObject, 0,
+                            s_cnode_root, 0, 0, s_active_reply, 1) != 0) {
+        /* Move the caller's reply back so it isn't stranded, then fail. */
+        qsoe_cnode_move(s_cnode_root, s_active_reply, TM_DEPTH_TASKMAN,
+                        s_cnode_root, slot, TM_DEPTH_TASKMAN);
+        taskman_free_slot(slot);
+        return 0;
+    }
+    return slot;
+}
+
+/* Deliver a deferred reply parked in `slot`: Send to the stashed reply
+ * object (unblocks the original caller), then delete the reply object
+ * and recycle the slot.  An MCS reply object is not self-cleared by the
+ * Send, so the delete keeps the cap-leak smoke test flat. */
+void tm_reply_deliver(seL4_CPtr slot, seL4_MessageInfo_t tag,
+                      seL4_Word mr0, seL4_Word mr1, seL4_Word mr2, seL4_Word mr3)
+{
+    if (slot == 0) return;
+    qsoe_sys_send(slot, tag, mr0, mr1, mr2, mr3);
+    qsoe_cnode_delete(s_cnode_root, slot, TM_DEPTH_TASKMAN);
+    taskman_free_slot(slot);
+}
+
+/* Discard a parked reply WITHOUT answering it — for cleanup when the
+ * blocked caller is gone (e.g. its process was terminated).  Deletes
+ * the stashed reply object and recycles the slot. */
+void tm_reply_drop(seL4_CPtr slot)
+{
+    if (slot == 0) return;
+    qsoe_cnode_delete(s_cnode_root, slot, TM_DEPTH_TASKMAN);
+    taskman_free_slot(slot);
+}
+
 /* ----------- v0.6.1 procmgr_detach / waitpid plumbing ----------- */
 
 int tm_process_set_parent(pid_t child, pid_t parent)
@@ -316,8 +438,7 @@ int tm_process_set_parent(pid_t child, pid_t parent)
 static void deliver_waiter_reply(seL4_CPtr slot, seL4_Word label, int status)
 {
     seL4_MessageInfo_t tag = seL4_MessageInfo_new(label, 0, 0, 1);
-    qsoe_sys_send(slot, tag, (seL4_Word)(unsigned)status, 0, 0, 0);
-    taskman_free_slot(slot);
+    tm_reply_deliver(slot, tag, (seL4_Word)(unsigned)status, 0, 0, 0);
 }
 
 int tm_process_detach(pid_t pid, int status)
@@ -352,9 +473,8 @@ int tm_process_waitpid(pid_t waiter, pid_t child,
         return 0;
     }
 
-    seL4_CPtr slot = taskman_alloc_empty_slot();
-    if (qsoe_cnode_save_caller(s_cnode_root, slot, TM_DEPTH_TASKMAN) != 0) {
-        taskman_free_slot(slot);
+    seL4_CPtr slot = tm_reply_park();
+    if (slot == 0) {
         return -ENOMEM;
     }
     c->waiter_reply_slot = slot;

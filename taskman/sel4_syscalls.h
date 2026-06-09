@@ -14,7 +14,13 @@
 #ifndef QSOE_SEL4_SYSCALLS_H
 #define QSOE_SEL4_SYSCALLS_H
 
-#define SEL4_SYS_DEBUG_PUTCHAR (-9)
+/* The debug-build console putchar syscall number is config-dependent:
+ * it sits just past the IPC syscalls, so enabling MCS (which adds
+ * Wait/NBWait) shifts it (-9 non-MCS -> -12 under MCS; -9 is now
+ * SysWait!).  Derive it from the kernel's generated enum instead of
+ * hardcoding — sel4_types.h pulls in <arch/api/syscall.h>. */
+#include "sel4_types.h"
+#define SEL4_SYS_DEBUG_PUTCHAR ((long)SysDebugPutChar)
 
 static inline void sel4_debug_putchar(char c)
 {

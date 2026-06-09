@@ -132,7 +132,11 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
 
     seL4_Word badge;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
-    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge,
+    /* MCS: receive with this thread's reply object (register a6).  See
+     * the LQ libc seam's msg.c for the full rationale; this taskman-
+     * private copy is currently unused (taskman's resmgrs dispatch
+     * inline in main.c), kept MCS-correct for completeness. */
+    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge, QSOE_CAP_REPLY,
                                             &mr0, &mr1, &mr2, &mr3);
 
 
@@ -174,11 +178,23 @@ int MsgSavereply(int rcvid)
 
     unsigned long slot = qsoe_state_alloc_empty_slot();
     if (!slot) { qsoe_errno = EAGAIN; return -1; }
-    seL4_Word err = qsoe_cnode_save_caller(QSOE_CAP_CNODE_SELF, slot,
-                                            QSOE_CAP_CNODE_DEPTH);
-    if (err) {
+    /* MCS: stash this thread's reply object and replenish QSOE_CAP_REPLY
+     * (see the LQ libc seam's msg.c).  Replaces the non-MCS SaveCaller. */
+    if (qsoe_cnode_move(QSOE_CAP_CNODE_SELF, slot, QSOE_CAP_CNODE_DEPTH,
+                        QSOE_CAP_CNODE_SELF, QSOE_CAP_REPLY,
+                        QSOE_CAP_CNODE_DEPTH) != 0) {
         qsoe_state_free_empty_slot(slot);
-        qsoe_errno = (int)err;
+        qsoe_errno = ENOMEM;
+        return -1;
+    }
+    if (qsoe_untyped_retype(QSOE_CAP_OWN_UNTYPED, seL4_ReplyObject, 0,
+                            QSOE_CAP_CNODE_SELF, 0, 0,
+                            QSOE_CAP_REPLY, 1) != 0) {
+        qsoe_cnode_move(QSOE_CAP_CNODE_SELF, QSOE_CAP_REPLY,
+                        QSOE_CAP_CNODE_DEPTH,
+                        QSOE_CAP_CNODE_SELF, slot, QSOE_CAP_CNODE_DEPTH);
+        qsoe_state_free_empty_slot(slot);
+        qsoe_errno = ENOMEM;
         return -1;
     }
     return (int)(QSOE_RCVID_SAVED | (unsigned)slot);
@@ -198,15 +214,16 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes)
     seL4_MessageInfo_t tag = seL4_MessageInfo_new((unsigned)status,
                                                    0, 0, nwords);
     if ((unsigned)rcvid & QSOE_RCVID_SAVED) {
-        /* Deferred reply via SaveCaller'd slot: Send on the slot and
-         * recycle it.  The kernel auto-clears the slot when the Send
-         * consumes the reply cap on non-MCS. */
+        /* Deferred reply: Send to the stashed reply object, delete it,
+         * recycle the slot. */
         unsigned long slot = (unsigned long)((unsigned)rcvid & ~QSOE_RCVID_SAVED);
         qsoe_sys_send((seL4_CPtr)slot, tag, mr0, mr1, mr2, mr3);
+        qsoe_cnode_delete(QSOE_CAP_CNODE_SELF, slot, QSOE_CAP_CNODE_DEPTH);
         qsoe_state_free_empty_slot(slot);
     } else {
-        /* Normal reply via the implicit per-thread reply cap. */
-        qsoe_sys_reply(tag, mr0, mr1, mr2, mr3);
+        /* Normal reply: Send to this thread's reply object (bound by the
+         * matching MsgReceive). */
+        qsoe_sys_send(QSOE_CAP_REPLY, tag, mr0, mr1, mr2, mr3);
     }
     return 0;
 }
