@@ -11,7 +11,7 @@
 #include <sys/qsoe.h>
 #include <sys/rsrcdbmgr.h>
 #include <qsoe/slots.h>
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 #include <qsoe/tls.h>
 
 #include "sel4_types.h"

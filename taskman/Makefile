@@ -42,7 +42,7 @@ CROSS      ?= riscv64-linux-gnu-
 CC         := $(CROSS)gcc
 
 TASKMAN_DIR := $(TOP)/taskman
-# Public QSOE/libc headers (sys/qsoe.h, qsoe/slots.h, ...) live in
+# Public QSOE/libc headers (sys/qsoe.h, qsoe/tm_msgs.h, ...) live in
 # the umbrella-level shared libc tree.  Taskman doesn't link libc but
 # needs the public header surface for wire shapes and slot constants.
 LIBC_INCLUDE := $(abspath $(TOP)/..)/libc/include
@@ -106,10 +106,10 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/path/cpiofs.h \
     $(TASKMAN_DIR)/sys/console.h \
     $(TASKMAN_DIR)/qsoe/state.h \
+    $(TASKMAN_DIR)/qsoe/slots.h \
     $(LIBC_INCLUDE)/sys/qsoe.h \
-    $(LIBC_INCLUDE)/qsoe/slots.h \
     $(LIBC_INCLUDE)/qsoe/tls.h \
-    $(LIBC_INCLUDE)/qsoe/wire.h \
+    $(LIBC_INCLUDE)/qsoe/tm_msgs.h \
     $(GEN)/qsoe/sys_version.h
 
 .PHONY: all clean

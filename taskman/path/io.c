@@ -18,7 +18,7 @@
 #include "../sys/devzero.h"
 #include "../proc/proc.h"
 #include "../qsoe_invoke.h"
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 
 /* TM_REQ_OPEN body.  Walks the path manager, picks the right resmgr,
  * mints a badged Send-cap into the caller's CSpace, attaches per-fd

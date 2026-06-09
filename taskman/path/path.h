@@ -15,6 +15,7 @@
 
 #include "../sel4_types.h"
 #include <sys/qsoe.h>
+#include <qsoe/slots.h>     /* TM_REQ_DETACH_CAP (LQ-only close(2) op) */
 
 /* `tm_stat_t` + TM_S_IF* now live in <sys/qsoe.h> so external
  * resmgrs (devc-ser8250 etc.) can answer TM_REQ_FSTAT without

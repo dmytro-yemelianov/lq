@@ -15,7 +15,7 @@
 
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 
 #include "sel4_types.h"
 #include "qsoe_invoke.h"

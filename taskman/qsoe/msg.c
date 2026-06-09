@@ -21,7 +21,7 @@
 
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 #include "state.h"
 
 /* Pull in just the types and ecall wrappers we need from taskman's

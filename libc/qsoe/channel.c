@@ -3,12 +3,12 @@
  *
  * IN_TASKMAN build  : direct call into the local tm_* handler.
  * Standalone build  : seL4_Call to taskman via QSOE_CAP_TASKMAN_EP,
- *                     with the wire protocol defined in <qsoe/wire.h>.
+ *                     with the wire protocol defined in <qsoe/tm_msgs.h>.
  */
 
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 #include "state.h"
 
 #include "sel4_types.h"

@@ -21,7 +21,7 @@
 
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 #include <stddef.h>
 #include "state.h"
 #include "libc.h"           /* musl-style struct __libc + the `libc` alias */

@@ -24,7 +24,7 @@
 
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 #include <spawn.h>
 #include <sys/mman.h>
 #include <errno.h>

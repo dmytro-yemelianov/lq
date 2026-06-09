@@ -525,7 +525,7 @@ qsoe_riscv_asidpool_assign(seL4_CPtr asid_pool, seL4_CPtr vspace)
 
 /*
  * LQ-private continuation of retired wire opcode 0x114.  The shared
- * <qsoe/wire.h> dropped TM_REQ_DUP_CAP in favor of the
+ * <qsoe/tm_msgs.h> dropped TM_REQ_DUP_CAP in favor of the
  * ConnectServerInfo + ConnectAttach(index_hint) + _IO_DUP idiom (the
  * shape NQ implements); LQ's dup2 / fcntl(F_DUPFD) seam and the
  * taskman dispatcher still ride the cap-copy form.  The value stays

@@ -397,9 +397,9 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/sys/console.h \
     $(TASKMAN_DIR)/sys/platform.h \
     $(LIBC_INCLUDE)/sys/qsoe.h \
-    $(LIBC_INCLUDE)/qsoe/slots.h \
+    $(TASKMAN_DIR)/qsoe/slots.h \
     $(LIBC_INCLUDE)/qsoe/tls.h \
-    $(LIBC_INCLUDE)/qsoe/wire.h \
+    $(LIBC_INCLUDE)/qsoe/tm_msgs.h \
     $(GEN)/qsoe/sys_version.h
 
 # Auto-generated version header. Pulls the latest git tag (vMAJOR.MINOR[.PATCH])

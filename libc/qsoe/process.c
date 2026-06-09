@@ -20,7 +20,7 @@
 
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
-#include <qsoe/wire.h>
+#include <qsoe/tm_msgs.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <stdlib.h>
