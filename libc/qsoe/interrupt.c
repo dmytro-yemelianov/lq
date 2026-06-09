@@ -16,7 +16,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <qsoe/tls.h>

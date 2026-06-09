@@ -47,7 +47,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <qsoe-system.h>            /* uint{32,64}_t in the libqsoe style */
+#include <sys/qsoe.h>            /* uint{32,64}_t in the libqsoe style */
 
 #include "../sel4_types.h"
 #include "../qsoe_invoke.h"

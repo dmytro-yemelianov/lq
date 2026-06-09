@@ -3,7 +3,7 @@
 #define QSOE_TASKMAN_IRQ_H
 
 #include "../sel4_types.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 
 int tm_irq_attach(pid_t caller, unsigned plic_irq, unsigned trigger,
                   seL4_CPtr *out_handler, seL4_CPtr *out_ntfn);

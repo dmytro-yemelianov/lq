@@ -16,7 +16,7 @@
 #define QSOE_TASKMAN_SYSFS_H
 
 #include "../sel4_types.h"
-#include <qsoe-system.h>     /* tm_stat_t */
+#include <sys/qsoe.h>     /* tm_stat_t */
 
 /* Gather board/cmdline/version/builddate from syscfg + the version
  * header and hand them to the shared core (tm_sysfs_init).  Call after

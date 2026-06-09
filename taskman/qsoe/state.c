@@ -227,13 +227,12 @@ int qsoe_state_alloc_coid_ge(int start)
     return out;
 }
 
-/* v0.6.4: empty-CSpace-slot allocator.  Returns a fresh CPtr in the
- * caller's own CSpace, suitable as a destination for
- * seL4_CNode_SaveCaller (and any future cap-receive paths from
- * inside the process).  Range starts at 0x800 — well past the
- * chid/coid pools, well inside the child's 4096-slot CNode.
- * Send-on-slot semantics (non-MCS seL4) consume the saved reply cap
- * exactly once; the slot is then handed back via _free_ for reuse. */
+/* Empty-CSpace-slot allocator.  Returns a fresh CPtr in the caller's
+ * own CSpace, suitable as a destination for a stashed reply object
+ * (deferred reply) or other cap-receive paths from inside the process.
+ * Range starts at 0x800 — well past the chid/coid pools, well inside
+ * the child's 4096-slot CNode.  A Send on the stashed reply object
+ * consumes it once; the slot is then handed back via _free_ for reuse. */
 #define QSOE_EMPTY_SLOT_BASE  0x800UL
 #define QSOE_EMPTY_SLOT_MAX   0x1000UL
 #define QSOE_EMPTY_SLOT_FREE_MAX 16

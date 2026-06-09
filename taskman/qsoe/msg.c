@@ -7,10 +7,10 @@
  * connection capabilities — peer-to-peer between server and client,
  * with taskman uninvolved.
  *
- * On non-MCS seL4 the reply capability is per-thread (tcbCaller slot),
- * not per-message, so MsgReply takes the rcvid only for QNX API
- * compatibility — internally it's the implicit reply cap. See <qsoe-system.h>
- * for the caveat.
+ * Under MCS the reply capability is a per-message reply object, not the
+ * per-thread tcbCaller slot: MsgReply consumes this thread's active
+ * reply object (or a stashed one for a deferred reply), and the rcvid is
+ * the QNX-API token identifying the receive. See <sys/qsoe.h>.
  *
  * Byte ↔ word marshalling: we treat the IPC buffer's msg[] array as
  * a flat byte buffer. msg[0..3] is reserved for the kernel's
@@ -19,7 +19,7 @@
  * into msg[0..3] so unpack_bytes can find them.
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include "state.h"
@@ -163,10 +163,10 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
     }
 
     /* rcvid: in QNX it's a token identifying this specific receive.
-     * On non-MCS seL4 the reply cap is implicit (one per server
-     * thread), so the rcvid is purely for the client→server protocol's
-     * benefit. We return the badge: it identifies the sender, and the
-     * MsgReply that consumes the rcvid uses the implicit reply cap. */
+     * Under MCS the reply travels via this thread's reply object, so the
+     * rcvid is for the client→server protocol's benefit. We return the
+     * badge: it identifies the sender, and the MsgReply that consumes the
+     * rcvid replies on the active reply object. */
     return (int)badge;
 }
 

@@ -8,7 +8,7 @@
 #define QSOE_TASKMAN_SPAWN_H
 
 #include "../sel4_types.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 
 /*
  * tm_spawn — spawn a new user-space process from an in-memory ELF.

@@ -19,7 +19,7 @@
 #define QSOE_TASKMAN_SYS_SYNC_H
 
 #include "../sel4_types.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 
 /* WAIT mode constants — must match libqsoe's sync.c. */
 #define TM_SYNC_WAIT_CREDIT   0   /* mutex/sem: absorb pending wakes */
@@ -29,7 +29,7 @@
 #define TM_SYNC_WAKE_ABSORB   0   /* deposit credit if no waiter */
 #define TM_SYNC_WAKE_DISCARD  1   /* drop if no waiter */
 
-/* TM_REQ_SYNC_WAIT — defers reply via SaveCaller when parking.
+/* TM_REQ_SYNC_WAIT — stashes the reply object (deferred reply) on park.
  * Returns 0 on immediate return (gen mismatched / credit consumed),
  * 1 when parked (caller sets out_no_reply), or a negative errno on
  * failure. */

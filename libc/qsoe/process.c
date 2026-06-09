@@ -18,7 +18,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <sys/wait.h>
@@ -94,7 +94,7 @@ _Noreturn void _Exit(int status)
 }
 
 /* wait4 -- shared waitpid() bottoms out here.  rusage is currently
- * unused (Stage-A taskman doesn't track per-process resource counters
+ * unused (taskman doesn't track per-process resource counters
  * separately from the global hwi blob). */
 pid_t wait4(pid_t pid, int *status, int options, struct rusage *rusage)
 {

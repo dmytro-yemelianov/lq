@@ -15,7 +15,7 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 
 static void announce_once(void)
 {

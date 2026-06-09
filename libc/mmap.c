@@ -18,21 +18,35 @@
  */
 #include <sys/mman.h>
 #include <stdint.h>
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
 
+/* Taskman's wire flag for a raw physical mapping (mirrors
+ * lq/taskman/mem/mem.h TM_MMAP_FLAG_PHYS).  Distinct from the POSIX
+ * MAP_PHYS flag the caller passes (<sys/mman.h>, 0x10000): the libc
+ * seam translates one to the other.  Mismatching them is exactly why
+ * every MAP_PHYS request fell through to the anonymous (zero-RAM) path. */
+#define TM_MMAP_FLAG_PHYS  0x1u
+
 void *__mmap(void *start, size_t length, int prot, int flags, int fd, off_t off)
 {
-    (void) start; (void) prot; (void) flags; (void) fd; (void) off;
+    (void) start; (void) prot; (void) fd;
     if (length == 0) { qsoe_errno = EINVAL; return MAP_FAILED; }
 
     seL4_Word mr0 = (seL4_Word) length;
-    seL4_Word mr1 = 0;                          /* anonymous (not MAP_PHYS) */
-    seL4_Word mr2 = 0;
+    seL4_Word mr1 = 0;                          /* wire flags            */
+    seL4_Word mr2 = 0;                          /* phys base on MAP_PHYS */
     seL4_Word mr3 = 0;
+    if (flags & MAP_PHYS) {
+        /* Driver raw device mapping: name the physical base in mr2 and
+         * set taskman's phys wire flag so the request routes to
+         * mmap_phys instead of the anonymous allocator. */
+        mr1 = TM_MMAP_FLAG_PHYS;
+        mr2 = (seL4_Word) off;
+    }
     seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_MMAP, 0, 0, 3);
     seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
                                               &mr0, &mr1, &mr2, &mr3);

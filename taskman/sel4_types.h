@@ -233,7 +233,7 @@ typedef struct {
 } seL4_BootInfo;
 
 /* Constructs a MessageInfo word from its components.
- * Layout (per RISC-V 64, non-MCS):
+ * Layout (per RISC-V 64; MCS-invariant):
  *   bits  0.. 6 : length (7 bits)
  *   bits  7.. 8 : extraCaps (2)
  *   bits  9..11 : capsUnwrapped (3)

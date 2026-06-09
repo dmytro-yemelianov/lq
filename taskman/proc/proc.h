@@ -15,7 +15,7 @@
 #define QSOE_TASKMAN_PROC_H
 
 #include "../sel4_types.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <tm_limits.h>
 
@@ -100,6 +100,10 @@ typedef struct {
      * channel (see signal_chid above). */
     unsigned long itimer_expiry_ticks;
     unsigned long itimer_interval_ticks;
+
+    /* v0.10 process name (basename of the spawned ELF), for /proc.
+     * Captured at spawn from elf_name; NUL-terminated, truncated. */
+    char      name[32];
 } tm_process_t;
 
 typedef struct {
@@ -199,6 +203,7 @@ int           tm_process_register(pid_t pid, seL4_CPtr cnode,
                                    seL4_CPtr tcb, seL4_CPtr vspace,
                                    seL4_CPtr first_free_slot);
 tm_process_t *tm_process_lookup(pid_t pid);
+tm_process_t *tm_process_by_index(int idx);   /* /proc enumeration */
 seL4_CPtr     tm_process_alloc_slot(pid_t pid);
 
 pid_t         tm_pid_alloc(void);

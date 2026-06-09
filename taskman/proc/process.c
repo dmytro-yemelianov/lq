@@ -177,6 +177,10 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     g_processes[0].workers_l0_pt  = 0;
     g_processes[0].next_tid       = 2;
     g_processes[0].parent_pid     = QSOE_PID_TASKMAN;  /* self-parent */
+    g_processes[0].name[0] = 't'; g_processes[0].name[1] = 'a';
+    g_processes[0].name[2] = 's'; g_processes[0].name[3] = 'k';
+    g_processes[0].name[4] = 'm'; g_processes[0].name[5] = 'a';
+    g_processes[0].name[6] = 'n'; g_processes[0].name[7] = '\0';
     g_processes[0].exit_state     = 0;
     g_processes[0].exit_status    = 0;
     g_processes[0].waiter_reply_slot = 0;
@@ -252,6 +256,14 @@ tm_process_t *tm_process_lookup(pid_t pid)
         }
     }
     return 0;
+}
+
+/* Process table slot at `idx` (0..TM_MAX_PROCESSES-1), or NULL when out
+ * of range.  Lets /proc enumerate the table without exposing the array. */
+tm_process_t *tm_process_by_index(int idx)
+{
+    if (idx < 0 || idx >= TM_MAX_PROCESSES) return 0;
+    return &g_processes[idx];
 }
 
 seL4_CPtr tm_process_find_frame(const tm_process_t *proc, unsigned long va)

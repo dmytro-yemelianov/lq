@@ -4,14 +4,14 @@
  * One fixed-size table of entries, each keyed by (pid, vaddr).  An
  * entry is allocated lazily on the first WAIT or absorbing WAKE that
  * misses, and freed when its wait list empties AND its credit goes
- * to zero.  No hashing in v0.8 — a linear scan of a 64-entry table
- * is fine for the contention rates we see.  Bump TM_SYNC_MAX_ENTRIES
- * (and the matching QSOE_SYNC_MAX_WAITERS for waiters per entry) when
- * profiling says so.
+ * to zero.  No hashing — a linear scan of a 64-entry table is fine for
+ * the contention rates we see.  Bump TM_SYNC_MAX_ENTRIES (and the
+ * matching QSOE_SYNC_MAX_WAITERS for waiters per entry) when profiling
+ * says so.
  *
- * Parked replies use the standard taskman SaveCaller pattern: each
- * waiter consumes one CSpace slot in taskman, which gets returned to
- * the pool when WAKE replies on it.
+ * Parked replies use taskman's deferred-reply pattern: each waiter's
+ * reply object is stashed in a CSpace slot, which is returned to the
+ * pool when WAKE replies on it.
  *
  * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0

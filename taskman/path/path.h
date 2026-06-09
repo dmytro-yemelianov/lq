@@ -14,9 +14,9 @@
 #define QSOE_TASKMAN_PATH_H
 
 #include "../sel4_types.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 
-/* `tm_stat_t` + TM_S_IF* now live in <qsoe-system.h> so external
+/* `tm_stat_t` + TM_S_IF* now live in <sys/qsoe.h> so external
  * resmgrs (devc-ser8250 etc.) can answer TM_REQ_FSTAT without
  * pulling in taskman-internal headers. */
 

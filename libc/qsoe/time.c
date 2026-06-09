@@ -13,7 +13,7 @@
  * time at 10 MHz.  All other arithmetic is plain 64-bit.
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 

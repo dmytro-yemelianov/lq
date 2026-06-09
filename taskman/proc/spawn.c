@@ -586,21 +586,6 @@ static int load_elf_segments(seL4_CPtr vspace, const void *elf_blob,
     return 0;
 }
 
-/* Match the basename of `a` (everything after the last '/') against
- * the literal `b`.  Lets us key special cases like the devc-ser8250
- * cap-grant on the program name regardless of how it was looked up
- * (bare "devc-ser8250" vs. "/sbin/devc-ser8250"). */
-static int spawn_name_eq(const char *a, const char *b)
-{
-    if (!a || !b) return 0;
-    const char *base = a;
-    for (const char *p = a; *p; ++p) if (*p == '/') base = p + 1;
-    for (unsigned i = 0;; ++i) {
-        if (base[i] != b[i]) return 0;
-        if (base[i] == 0) return 1;
-    }
-}
-
 int tm_spawn(const void *elf_blob, unsigned long elf_len,
              pid_t pid, seL4_CPtr primary_ep,
              int argc, const char *const *argv,
@@ -740,7 +725,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     /* 3. Walk PT_LOAD segments of the main image at link VA.
      *    For ET_EXEC like our current binaries, p_vaddr is the final
      *    address; for ET_DYN PIE we'd pass a non-zero load_offset.
-     *    Stage-A only spawns ET_EXEC main images, so 0 is correct. */
+     *    We only spawn ET_EXEC main images, so 0 is correct. */
     const struct elf64_phdr *ph = (const struct elf64_phdr *)
                                   ((const u8 *)elf_blob + eh->e_phoff);
     int load_rc = load_elf_segments(vspace, elf_blob, /*load_offset=*/0);
@@ -1054,11 +1039,10 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                           QSOE_RIGHTS_ALL);
     if (err) { tm_err("spawn: copy OWN_UNTYPED failed"); return -ENOMEM; }
 
-    /* 5b'. v0.6.4: copy the child's own CNode cap into its slot
-     *      QSOE_CAP_CNODE_SELF so the child can invoke
-     *      seL4_CNode_SaveCaller on its own CSpace from inside —
-     *      required for resmgr park-the-caller patterns
-     *      (devc-ser8250 RX). */
+    /* 5b'. Copy the child's own CNode cap into its slot
+     *      QSOE_CAP_CNODE_SELF so the child can move a reply object
+     *      within its own CSpace from inside — required for resmgr
+     *      park-the-caller patterns (devc-ser8250 RX). */
     err = qsoe_cnode_copy(cnode, QSOE_CAP_CNODE_SELF, 12,
                           s_cnode_root, cnode, 64,
                           QSOE_RIGHTS_ALL);
@@ -1112,81 +1096,15 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
     }
 
-    /* 5d. v0.6.1: driver-cap inheritance. If this child is the
-     *     16550 UART driver, grant it (a) an IRQHandler for PLIC
-     *     line 10 minted into child slot QSOE_CAP_IRQ_HANDLER,
-     *     (b) a 4 KiB device-untyped covering 0x10000000 copied
-     *     into QSOE_CAP_UART_FRAME, (c) a fresh Notification minted
-     *     into QSOE_CAP_IRQ_NTFN that the IRQHandler will signal
-     *     on each rising edge. Manifest-driven cap granting is
-     *     v0.7+; for v0.6.1 the special case is gated by ELF name. */
-    if (spawn_name_eq(elf_name, "devc-ser8250")) {
-        const seL4_Word PLIC_UART_IRQ = 10;
-        const seL4_Word TRIGGER_LEVEL = 0;
-        const unsigned long UART_VADDR  = 0xA00000UL;  /* L1 slot 5 */
-        if (!s_uart_dev_ut) {
-            tm_err("spawn: no UART device untyped registered");
-            return -ENODEV;
-        }
-        /* (1) Allocate an L0 PT for the 2 MiB region containing
-         *     the UART vaddr, then attach it under the child's L1. */
-        seL4_CPtr uart_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
-        if (!uart_l0) return -ENOMEM;
-        err = qsoe_riscv_pagetable_map(uart_l0, vspace, UART_VADDR,
-                                        QSOE_VM_ATTR_DEFAULT);
-        if (err) {
-            tm_err("spawn: UART L0 PageTable_Map failed");
-            return -ENOMEM;
-        }
-        /* (2) Retype the UART device-untyped into a 4 KiB frame in
-         *     taskman's CSpace. We need the cap here to invoke
-         *     Page_Map (the frame must be in our CSpace to be the
-         *     invocation target, with the *child's* vspace as the
-         *     map target). After mapping we'll mint a copy into the
-         *     child's CSpace. */
-        seL4_CPtr uart_dev_frame = s_next_slot++;
-        err = qsoe_untyped_retype(s_uart_dev_ut, seL4_RISCV_4K_Page, 0,
-                                    s_cnode_root, 0, 0,
-                                    uart_dev_frame, 1);
-        if (err) {
-            tm_err("spawn: UART device retype failed");
-            return -ENOMEM;
-        }
-        /* (3) Map the device frame at UART_VADDR in the child. */
-        err = qsoe_riscv_page_map(uart_dev_frame, vspace, UART_VADDR,
-                                   QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-        if (err) {
-            tm_err("spawn: UART Page_Map failed");
-            return -ENOMEM;
-        }
-        /* (4) Mint a copy of the frame cap into the child's CSpace
-         *     (handy for future revoke / re-map). */
-        err = qsoe_cnode_copy(cnode, QSOE_CAP_UART_FRAME, 12,
-                               s_cnode_root, uart_dev_frame, 64,
-                               QSOE_RIGHTS_ALL);
-        if (err) {
-            tm_err("spawn: UART frame copy failed");
-            return -ENOMEM;
-        }
-        /* Steps (5)/(6) — the spawn-time pre-mint of an IRQHandler +
-         * Notification into QSOE_CAP_IRQ_HANDLER / QSOE_CAP_IRQ_NTFN —
-         * were removed (v0.10).  They are the leftover v0.7 "magic-named"
-         * IRQ wiring that sys/irq.c's comment says v0.8 superseded:
-         * devc-ser8250 now claims its line at runtime via
-         * InterruptAttachThread -> TM_REQ_IRQ_ATTACH (tm_irq_attach),
-         * which mints a fresh (IRQHandler, Notification) pair into the
-         * caller's CSpace.  Pre-minting the IRQHandler here claimed PLIC
-         * line 10 first, so the driver's runtime attach failed with
-         * "Rejecting request for IRQ 10. Already active." (errno=EBUSY)
-         * and the UART never became interrupt-driven.
-         *
-         * NOTE (for review): the UART-MMIO mapping in steps (1)-(4)
-         * above is now ALSO dead — devc-ser8250 maps the 16550 itself
-         * via mmap(MAP_PHYS, UART_PHYS) (quser/dev/ser8250/uart.c), so
-         * QSOE_CAP_UART_FRAME at 0xA00000 is never read.  Left in place
-         * pending confirmation; a follow-up can drop this whole
-         * spawn_name_eq("devc-ser8250") block. */
-    }
+    /* (No spawn-time UART cap granting.)  devc-ser8250 maps the 16550
+     * itself via mmap(MAP_PHYS, UART_PHYS) and claims PLIC line 10 at
+     * runtime via InterruptAttachThread.  The old v0.6.1 ELF-name-gated
+     * block that pre-mapped the UART MMIO + pre-minted the IRQHandler
+     * was removed (v0.10): besides being dead, its retype of a 4 KiB
+     * frame from the UART device-untyped advanced that untyped's
+     * watermark, so devc's own mmap_phys then landed one frame past the
+     * UART (phys 0x10001000, the virtio window) -- the driver mapped the
+     * wrong device and uart_tx spun forever on a bogus LSR. */
 
     /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
      *    12) and guard value 0; the CNode is 2^12 slots so addresses
@@ -1244,9 +1162,21 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         tm_err("spawn: tm_process_register failed");
         return reg_err;
     }
-    /* Record the child's untyped budget master for cleanup on terminate. */
+    /* Record the child's untyped budget master for cleanup on terminate,
+     * and capture the ELF basename as the process name for /proc. */
     tm_process_t *prec = tm_process_lookup(pid);
-    if (prec) prec->untyped_budget = child_untyped;
+    if (prec) {
+        prec->untyped_budget = child_untyped;
+        const char *base = elf_name ? elf_name : "?";
+        for (const char *s = base; *s; ++s)
+            if (*s == '/') base = s + 1;
+        unsigned ni = 0;
+        while (base[ni] != '\0' && ni < sizeof prec->name - 1) {
+            prec->name[ni] = base[ni];
+            ++ni;
+        }
+        prec->name[ni] = '\0';
+    }
     /* Hand the dyn-link L1 PT to the worker-region allocator (same
      * L2[1] slot covers libc.so/rtld AND the worker region at 0x40000000). */
     if (prec && workers_l1_cap) prec->workers_l1_pt = workers_l1_cap;

@@ -12,7 +12,7 @@
  */
 
 #include "devnull.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 
 unsigned tm_devnull_write(unsigned nbytes)
 {

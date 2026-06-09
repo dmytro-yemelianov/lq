@@ -17,7 +17,7 @@
 
 #include <sys/time.h>
 #include <stddef.h>
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <sel4_types.h>

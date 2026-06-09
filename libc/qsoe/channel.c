@@ -6,7 +6,7 @@
  *                     with the wire protocol defined in <qsoe/wire.h>.
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include "state.h"

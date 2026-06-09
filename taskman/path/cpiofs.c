@@ -7,7 +7,7 @@
 #include "pathmgr.h"
 #include "../sel4_syscalls.h"
 #include "../proc/proc.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <cpio.h>
 
 /* Set at boot from main.c — same CPIO blob taskman uses for spawn. */

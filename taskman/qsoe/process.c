@@ -10,7 +10,7 @@
  * is a small follow-up (v0.4.1 polish or 0.5).
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include "state.h"

@@ -114,14 +114,18 @@ static unsigned ctz_ul(unsigned long x)
     return n;
 }
 
-/* MAP_PHYS — find the device-UT containing `phys`, advance its
- * watermark to the offset (by burning intermediate retypes), then
- * retype Mega_Page (2 MiB) frames for the actual mapping and slot
- * them into the client's VSpace.  Returns the base VA.
+/* MAP_PHYS — map a device's MMIO into the caller's VSpace at 4 KiB
+ * granularity.  Find the device-UT containing `phys`, advance its
+ * watermark to the sub-region offset (by burning intermediate
+ * retypes), then retype 4 KiB device Pages and map them as L0 leaves.
+ * Returns the base VA.
  *
- * v0.8-rc2: requires `phys` and `len` to be 2 MiB-aligned.  Smaller
- * 4 KiB mappings (e.g. single-page MMIO registers) land in rc3
- * when the first device-driver port needs them. */
+ * Why 4 KiB and not Mega_Pages: device MMIO regions are page-sized,
+ * and a 2 MiB device superpage store-access-faults on QEMU virt (the
+ * first store to the mapped UART faulted with RISC-V scause 7).  So
+ * each 2 MiB span of the chosen VA range gets a fresh L0 page table
+ * hung under the child's (already installed) L1, and the device frames
+ * map as 4 KiB L0 leaves. */
 static int mmap_phys(tm_process_t *proc, unsigned long phys,
                      unsigned long len, unsigned long *out_vaddr)
 {
@@ -134,27 +138,23 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
         return -ENODEV;
     }
 
-    /* Require Mega_Page alignment for both base and length. */
-    if (phys & (QSOE_MEGA_PAGE - 1)) {
-        tm_err("tm_mmap_serve(PHYS): phys not Mega-aligned");
+    /* Require 4 KiB-page alignment for base; round length up to pages. */
+    if (phys & (QSOE_PAGE_4K - 1)) {
+        tm_err("tm_mmap_serve(PHYS): phys not page-aligned");
         return -EINVAL;
     }
-    if (len & (QSOE_MEGA_PAGE - 1)) {
-        /* Round up to next Mega_Page. */
-        len = (len + QSOE_MEGA_PAGE - 1) & ~(QSOE_MEGA_PAGE - 1);
-    }
-    unsigned long pages_2m = len / QSOE_MEGA_PAGE;
-    unsigned long ut_size  = 1UL << ut_sizebits;
+    len = (len + QSOE_PAGE_4K - 1) & ~(QSOE_PAGE_4K - 1);
+    unsigned long npages  = len / QSOE_PAGE_4K;
+    unsigned long ut_size = 1UL << ut_sizebits;
     if (ut_offset + len > ut_size) return -EINVAL;
 
     /* Advance the kernel's watermark past `ut_offset` by retyping
      * power-of-2 chunks (as throw-away child UTs) until we land at
-     * exactly `ut_offset`.  Greedy biggest-chunk-first.             */
+     * exactly `ut_offset`.  Greedy biggest-aligned-chunk first; since
+     * `phys` and the UT base are page-aligned, chunks are >= 4 KiB.    */
     unsigned long advanced = 0;
     while (advanced < ut_offset) {
         unsigned long rem = ut_offset - advanced;
-        /* Biggest chunk we can carve: limited by remaining offset AND
-         * by alignment of (UT base + advanced). */
         unsigned chunk_sb = ctz_ul(rem);
         unsigned align_sb = ctz_ul(advanced ? advanced : ut_size);
         if (chunk_sb > align_sb) chunk_sb = align_sb;
@@ -170,35 +170,51 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
         advanced += 1UL << chunk_sb;
     }
 
-    /* Pick a fresh VA range — Mega-aligned.  No L0 PTs needed: each
-     * Mega_Page is a L1-level leaf in SV39, and the L1 PTs covering
-     * mmap_top are already installed at process startup (same as the
-     * anonymous-mmap path). */
+    /* Pick a fresh Mega-aligned VA base so each 2 MiB span lines up
+     * with an L1 slot we can hang an L0 PT under. */
     unsigned long base_va = (proc->mmap_top + QSOE_MEGA_PAGE - 1) &
                             ~(QSOE_MEGA_PAGE - 1);
-    unsigned long end_va  = base_va + len;
 
-    /* Retype Mega_Pages from the device-UT and map them in. */
-    for (unsigned long i = 0; i < pages_2m; ++i) {
+    for (unsigned long i = 0; i < npages; ++i) {
+        unsigned long va = base_va + i * QSOE_PAGE_4K;
+
+        /* At each 2 MiB boundary, hang a fresh RAM-backed L0 PT (from
+         * taskman's own untyped pool) under the child's already-present
+         * L1, so the 4 KiB device frames below have a leaf level. */
+        if ((va & (QSOE_MEGA_PAGE - 1)) == 0) {
+            seL4_CPtr l0 = taskman_alloc_and_retype(
+                               seL4_RISCV_PageTableObject, 0);
+            if (!l0) {
+                tm_err("tm_mmap_serve(PHYS): L0 PT alloc failed");
+                return -ENOMEM;
+            }
+            seL4_Word e = qsoe_riscv_pagetable_map(l0, proc->vspace, va,
+                                                   QSOE_VM_ATTR_DEFAULT);
+            if (e) {
+                tm_err("tm_mmap_serve(PHYS): L0 PageTable_Map failed");
+                return -ENOMEM;
+            }
+        }
+
+        /* Retype the next 4 KiB device frame from the device-UT and map
+         * it as an L0 leaf at `va`. */
         seL4_CPtr page = taskman_alloc_empty_slot();
         if (!page) return -ENOMEM;
-        seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_Mega_Page, 0,
+        seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_4K_Page, 0,
                                              s_cnode_root, 0, 0, page, 1);
         if (err) {
-            tm_err("tm_mmap_serve(PHYS): Mega_Page retype failed");
+            tm_err("tm_mmap_serve(PHYS): 4K device retype failed");
             return -ENOMEM;
         }
-        err = qsoe_riscv_page_map(page, proc->vspace,
-                                   base_va + i * QSOE_MEGA_PAGE,
-                                   QSOE_RIGHTS_ALL,
-                                   QSOE_VM_ATTR_DEFAULT);
+        err = qsoe_riscv_page_map(page, proc->vspace, va,
+                                   QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
         if (err) {
-            tm_err("tm_mmap_serve(PHYS): Mega_Page_Map failed");
+            tm_err("tm_mmap_serve(PHYS): 4K device Page_Map failed");
             return -ENOMEM;
         }
     }
 
-    proc->mmap_top = end_va;
+    proc->mmap_top = base_va + len;
     *out_vaddr = base_va;
     return 0;
 }

@@ -7,10 +7,10 @@
  * connection capabilities — peer-to-peer between server and client,
  * with taskman uninvolved.
  *
- * On non-MCS seL4 the reply capability is per-thread (tcbCaller slot),
- * not per-message, so MsgReply takes the rcvid only for QNX API
- * compatibility — internally it's the implicit reply cap. See <qsoe-system.h>
- * for the caveat.
+ * Under MCS the reply capability is a per-message reply object, not the
+ * per-thread tcbCaller slot: MsgReply consumes this thread's active
+ * reply object (or a stashed one for a deferred reply), and the rcvid is
+ * the QNX-API token identifying the receive. See <sys/qsoe.h>.
  *
  * Byte ↔ word marshalling: we treat the IPC buffer's msg[] array as
  * a flat byte buffer. msg[0..3] is reserved for the kernel's
@@ -19,7 +19,7 @@
  * into msg[0..3] so unpack_bytes can find them.
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <stddef.h>
@@ -135,6 +135,25 @@ static void unpack_bytes(void *dst, unsigned avail, unsigned want)
     for (unsigned i = 0; i < n; ++i) d[i] = s[i];
 }
 
+/* ---- The Msg* contract (kernel-agnostic, app-facing) ------------------
+ *
+ * Applications pass their OWN message structs; the IPC layer moves
+ * opaque bytes and carries the type/status as call metadata, never as a
+ * field the app pokes into a shared buffer:
+ *
+ *   - A REQUEST's first word is the message TYPE -- the application's
+ *     own protocol field (QNX `msg.type`), NOT a transport "tag".  On
+ *     LQ it rides in seL4's MessageInfo label internally; the seam puts
+ *     it at word 0 of the receiver's buffer and lifts it from word 0 of
+ *     the sender's, so neither side ever names the label.
+ *   - A REPLY is pure payload.  Its status is an ARGUMENT to MsgReply
+ *     and the RETURN VALUE of MsgSend -- it is never in the buffer.
+ *
+ * The legacy in-place mode (smsg/rmsg == NULL or == qsoe_ipcbuf) serves
+ * only the OS-independent libc's own pre-pack callers (pathmgr client,
+ * procmgr_detach); application code always supplies its own buffer and
+ * never touches qsoe_ipcbuf. */
+
 int MsgSend(int coid, const void *smsg, int sbytes,
             void *rmsg, int rbytes)
 {
@@ -143,38 +162,39 @@ int MsgSend(int coid, const void *smsg, int sbytes,
     seL4_CPtr send = qsoe_state_coid_to_slot(coid);
     if (!send) { qsoe_errno = EBADF; return -1; }
 
-    unsigned nwords = pack_bytes(smsg, (unsigned)sbytes);
+    /* Request word 0 = type -> seL4 label; words 1+ = body -> MRs. */
+    unsigned label;
+    unsigned nwords;
+    if (!smsg || smsg == (const void *)qsoe_ipcbuf) {
+        label  = (unsigned)qsoe_ipcbuf->tag;          /* legacy pre-pack */
+        nwords = pack_bytes(NULL, (unsigned)sbytes);
+    } else {
+        const unsigned long *req = smsg;
+        label  = (unsigned)req[0];
+        unsigned body = (sbytes >= 8) ? (unsigned)sbytes - 8 : 0;
+        nwords = pack_bytes(&req[1], body);
+    }
     seL4_Word mr0 = qsoe_ipcbuf->msg[0];
     seL4_Word mr1 = qsoe_ipcbuf->msg[1];
     seL4_Word mr2 = qsoe_ipcbuf->msg[2];
     seL4_Word mr3 = qsoe_ipcbuf->msg[3];
 
-    /* QRV-style callers (procmgr_detach, tm_call_path, the pathmgr
-     * client) stage their TM_REQ_* opcode in `qsoe_ipcbuf->tag` and
-     * call MsgSend(coid, NULL, sbytes, 0, 0).  That opcode rides
-     * through here as the seL4 MessageInfo label; without this, the
-     * label arrives at taskman as 0 and the dispatcher's default
-     * branch silently echoes "success", masking the no-op.  Symptoms
-     * before this fix: pathmgr_register/procmgr_detach return 0 but
-     * taskman never sees the request -- daemons hang waiting on a
-     * waitpid reply that nothing will ever deliver. */
-    unsigned send_label = (unsigned)qsoe_ipcbuf->tag;
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(send_label, 0, 0, nwords);
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(label, 0, 0, nwords);
     seL4_MessageInfo_t reply = qsoe_sys_call(send, tag, &mr0, &mr1, &mr2, &mr3);
 
-    /* Stage reply MRs back into msg[0..3] for unpack_bytes, and the
-     * reply's label into msg.tag so QRV-style pre-packed callers (the
-     * pathmgr client, tm_call_*) can read errno without re-decoding the
-     * MessageInfo themselves. */
-    qsoe_ipcbuf->tag    = (unsigned long)seL4_MessageInfo_get_label(reply);
+    /* Reply status = the seL4 label = MsgSend's return value (QNX
+     * semantics); the reply body (MRs) is pure payload for the caller. */
+    int status = (int)seL4_MessageInfo_get_label(reply);
     qsoe_ipcbuf->msg[0] = mr0;
     qsoe_ipcbuf->msg[1] = mr1;
     qsoe_ipcbuf->msg[2] = mr2;
     qsoe_ipcbuf->msg[3] = mr3;
-
     unsigned reply_bytes = (unsigned)seL4_MessageInfo_get_length(reply) * 8;
-    if (rmsg) unpack_bytes(rmsg, reply_bytes, (unsigned)rbytes);
-    return 0;
+    if (rmsg && rmsg != (void *)qsoe_ipcbuf)
+        unpack_bytes(rmsg, reply_bytes, (unsigned)rbytes);
+    else
+        qsoe_ipcbuf->tag = (unsigned long)status;     /* legacy readers */
+    return status;
 }
 
 int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
@@ -244,13 +264,31 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
          * spurious; MRs are zero so callers see an empty EP message. */
     }
 
+    /* The request TYPE travels in seL4's MessageInfo label; the body is
+     * in the MRs (MRs 4+ already in qsoe_ipcbuf == the seL4 IPC buffer).
+     * Hand the application its message: word 0 = type, words 1+ = body.
+     * The app reads its own struct's `type` field -- it never sees the
+     * label or qsoe_ipcbuf. */
+    unsigned label = (unsigned)seL4_MessageInfo_get_label(tag);
     qsoe_ipcbuf->msg[0] = mr0;
     qsoe_ipcbuf->msg[1] = mr1;
     qsoe_ipcbuf->msg[2] = mr2;
     qsoe_ipcbuf->msg[3] = mr3;
 
     unsigned in_bytes = (unsigned)seL4_MessageInfo_get_length(tag) * 8;
-    if (msg) unpack_bytes(msg, in_bytes, (unsigned)bytes);
+    if (msg && msg != (void *)qsoe_ipcbuf) {
+        unsigned long *m = msg;
+        m[0] = label;                            /* word 0 = type */
+        unsigned cap = (bytes >= 8) ? (unsigned)bytes - 8 : 0;
+        /* body words 1+ come from the MRs (now in qsoe_ipcbuf->msg) */
+        unsigned n = in_bytes < cap ? in_bytes : cap;
+        if (n > QSOE_MSG_MAX_BYTES) n = QSOE_MSG_MAX_BYTES;
+        const unsigned char *s = (const unsigned char *)qsoe_ipcbuf->msg;
+        unsigned char *d = (unsigned char *)&m[1];
+        for (unsigned i = 0; i < n; ++i) d[i] = s[i];
+    } else {
+        qsoe_ipcbuf->tag = label;                /* legacy in-place */
+    }
 
     if (info) {
         info->nd        = ND_LOCAL_NODE;
@@ -263,14 +301,14 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
         info->dstmsglen = bytes;
         info->priority  = 0;
         info->flags     = 0;
-        info->label     = (unsigned)seL4_MessageInfo_get_label(tag);
+        info->label     = label;
     }
 
     /* rcvid: in QNX it's a token identifying this specific receive.
-     * On non-MCS seL4 the reply cap is implicit (one per server
-     * thread), so the rcvid is purely for the client→server protocol's
-     * benefit. We return the badge: it identifies the sender, and the
-     * MsgReply that consumes the rcvid uses the implicit reply cap. */
+     * Under MCS the reply travels via this thread's reply object, so the
+     * rcvid is for the client→server protocol's benefit. We return the
+     * badge: it identifies the sender, and the MsgReply that consumes the
+     * rcvid replies on the active reply object. */
     return (int)badge;
 }
 
@@ -313,7 +351,12 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes)
     qsoe_cancel_point();
     if (bytes < 0) { qsoe_errno = EINVAL; return -1; }
 
-    unsigned nwords = pack_bytes(msg, (unsigned)bytes);
+    /* The reply is PURE PAYLOAD: the whole caller buffer (from word 0)
+     * becomes the reply body MRs.  `status` is the reply metadata -> the
+     * seL4 label -> the client's MsgSend return value.  No tag slot. */
+    unsigned nwords = (msg && msg != (const void *)qsoe_ipcbuf)
+                      ? pack_bytes(msg, (unsigned)bytes)
+                      : pack_bytes(NULL, (unsigned)bytes);
     seL4_Word mr0 = qsoe_ipcbuf->msg[0];
     seL4_Word mr1 = qsoe_ipcbuf->msg[1];
     seL4_Word mr2 = qsoe_ipcbuf->msg[2];

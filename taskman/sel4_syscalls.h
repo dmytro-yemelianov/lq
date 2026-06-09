@@ -7,7 +7,7 @@
  * expand with the real IPC syscalls (Send, Recv, Call, ReplyRecv, ...).
  *
  * RISC-V seL4 syscall ABI:
- *   a7 = syscall number   (SysDebugPutChar = -9 when CONFIG_PRINTING)
+ *   a7 = syscall number   (SysDebugPutChar = -12 under MCS+CONFIG_PRINTING)
  *   a0 = first argument
  *   ecall
  */
@@ -21,6 +21,13 @@
  * hardcoding — sel4_types.h pulls in <arch/api/syscall.h>. */
 #include "sel4_types.h"
 #define SEL4_SYS_DEBUG_PUTCHAR ((long)SysDebugPutChar)
+
+/* SchedYield's syscall number, same story: it sits among the IPC
+ * syscalls, so MCS's inserted Wait/NBWait/NBSendWait/NBSendRecv shift
+ * it (stock -7 -> -11 under MCS, where -7 is now SysRecv).  Derive it
+ * from the generated enum so the LQ libc seam (qsoe/timer.c) can't
+ * drift from the kernel ABI. */
+#define SEL4_SYS_YIELD ((long)SysYield)
 
 static inline void sel4_debug_putchar(char c)
 {

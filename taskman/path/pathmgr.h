@@ -32,5 +32,6 @@
 #define TM_DEVZERO_CHID  5
 #define TM_PMDIR_CHID    6   /* synthetic pathmgr dirs (/dev) */
 #define TM_SYSFS_CHID    7   /* synthetic read-only /sys */
+#define TM_PROCFS_CHID   8   /* synthetic read-only /proc */
 
 #endif /* QSOE_TASKMAN_PATHMGR_H */

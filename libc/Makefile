@@ -12,7 +12,7 @@
 #     libqsoe, so the seam carries only POSIX entry-point .c files plus an
 #     empty `syscall.h` shim so musl-internal headers (`stdio_impl.h`, ...)
 #     that `#include "syscall.h"` resolve to something innocuous.
-#   * Seam .c files reach into libqsoe (`<qsoe-system.h>`, `qsoe_invoke()`)
+#   * Seam .c files reach into libqsoe (`<sys/qsoe.h>`, `qsoe_invoke()`)
 #     and taskman headers (`sel4_types.h`, `qsoe_invoke.h`) for the IPC
 #     glue.  SEAM_INC plumbs those paths in.
 #
@@ -50,7 +50,7 @@ SEAM_SRC := $(wildcard $(SEAM)/*.c) $(wildcard $(SEAM)/qsoe/*.c)
 #                                   produced by the seL4 kernel build
 #
 # libqsoe/include/ is intentionally NOT here -- its public surface
-# (qsoe-system.h, qsoe/{tls,slots,wire,...}.h, sys/{sync,slog,...}.h)
+# (sys/qsoe.h, qsoe/{tls,slots,wire,...}.h, sys/{sync,slog,...}.h)
 # is now sourced from the shared libc/include/ that NQ already uses.
 LQ_TOP         := $(abspath $(CURDIR)/..)
 SEL4_BOOTSTRAP := $(abspath $(LQ_TOP)/..)/sel4-bootstrap

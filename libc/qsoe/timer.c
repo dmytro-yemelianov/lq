@@ -6,12 +6,13 @@
  * at the tail of its priority -- the QNX SchedYield contract.
  *
  * The Timer* family is announcing ENOSYS stubs: kernel-tracked
- * timers need a tick + expiry-pulse story that LQ doesn't have yet
- * (stock seL4 has no user timer surface; the MCS switch planned for
- * v1.0 brings sched contexts + timeouts).  The symbols must still
- * exist so the SHARED userspace -- one suite binary for both
- * kernels -- links and runs; the timer tests then FAIL loudly at
- * runtime instead of the build dying or, worse, a silent no-op.
+ * timers need a tick + expiry-pulse story that LQ doesn't have yet.
+ * LQ runs on MCS now, so sched contexts + Wait-with-timeout exist,
+ * but the user timer surface built on top of them is not wired up.
+ * The symbols must still exist so the SHARED userspace -- one suite
+ * binary for both kernels -- links and runs; the timer tests then
+ * FAIL loudly at runtime instead of the build dying or, worse, a
+ * silent no-op.
  * NQ's kernel-side implementation (nq/kernel/timer.c) is the shape
  * to mirror when this lands.
  *
@@ -20,14 +21,11 @@
  */
 #include <errno.h>
 #include <sys/qsoe.h>
-
-/* seL4 RISC-V syscall ABI: a7 = syscall number.  SysYield is -7 --
- * keep in step with the generated arch/api/syscall.h. */
-#define LQ_SEL4_SYS_YIELD  (-7)
+#include "sel4_syscalls.h"   /* SEL4_SYS_YIELD, derived from the seL4 enum */
 
 long SchedYield_r(void)
 {
-    register long _a7 __asm__("a7") = LQ_SEL4_SYS_YIELD;
+    register long _a7 __asm__("a7") = SEL4_SYS_YIELD;
     __asm__ volatile ("ecall" :: "r"(_a7) : "memory");
     return 0;
 }

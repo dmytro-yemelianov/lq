@@ -19,7 +19,7 @@
 #define QSOE_TASKMAN_PATH_PMDIR_H
 
 #include "../sel4_types.h"
-#include <qsoe-system.h>     /* tm_stat_t */
+#include <sys/qsoe.h>     /* tm_stat_t */
 
 /* Open a synthetic pathmgr directory at `path` (already known to
  * resolve to PATHMGR_HANDLER_TASKMAN_PMDIR).  Allocates a per-badge

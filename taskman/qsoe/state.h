@@ -18,7 +18,7 @@
 #ifndef QSOE_LIBQSOE_STATE_H
 #define QSOE_LIBQSOE_STATE_H
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/tls.h>      /* qsoe_spinlock_t, qsoe_main_tcb, qsoe_curthr */
 
 #define QSOE_MAX_FD_CHANNELS     64
@@ -60,9 +60,9 @@ qsoe_tcb_t   *qsoe_worker_alloc(void);
 
 extern qsoe_tcb_t qsoe_worker_tcbs[31];
 
-/* v0.6.4: empty-CSpace-slot allocator for cap-receive paths from
- * inside the process (currently: SaveCaller in resmgr park
- * patterns). Returns 0 on exhaustion. */
+/* Empty-CSpace-slot allocator for cap-receive paths from inside the
+ * process (e.g. stashing a reply object when a resmgr parks a deferred
+ * reply). Returns 0 on exhaustion. */
 unsigned long qsoe_state_alloc_empty_slot(void);
 void          qsoe_state_free_empty_slot(unsigned long slot);
 

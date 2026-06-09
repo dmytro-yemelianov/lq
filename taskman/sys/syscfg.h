@@ -31,7 +31,7 @@ int tm_syscfg_find_u64(unsigned tag_id, uint64_t *out);
 int tm_syscfg_find_u32(unsigned tag_id, uint32_t *out);
 
 /* Find the first occurrence of `tag_id` and return its payload via
- * *out_ptr/*out_len.  Returns 0 on success, -1 on not-found. */
+ * *out_ptr and *out_len.  Returns 0 on success, -1 on not-found. */
 int tm_syscfg_find(unsigned tag_id, const void **out_ptr,
                    unsigned *out_len);
 

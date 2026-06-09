@@ -26,7 +26,7 @@
 #ifndef QSOE_TASKMAN_FDT_H
 #define QSOE_TASKMAN_FDT_H
 
-#include <qsoe-system.h>     /* uint{16,32,64}_t */
+#include <sys/qsoe.h>     /* uint{16,32,64}_t */
 
 /* Magic identifier at offset 0 of every FDT (stored big-endian). */
 #define TM_FDT_MAGIC  0xd00dfeedU

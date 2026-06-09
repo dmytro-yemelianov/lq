@@ -24,6 +24,7 @@
 #include "path/pathmgr.h"
 #include "path/cpiofs.h"
 #include "path/sysfs.h"
+#include "path/procfs.h"
 #include "sys/console.h"
 #include "sys/irq.h"
 #include "sys/platform.h"
@@ -31,7 +32,7 @@
 #include "sys/syscfg.h"
 #include "sys/sync.h"
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <qsoe/sys_version.h>
@@ -73,7 +74,7 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     tm_timer_sweep();
 
     switch (label) {
-    /* ---------- sysmgr ---------- */
+    /* ---------- system management ---------- */
     case TM_REQ_DEBUG_SLOT_COUNT:
         *out_mr0 = (seL4_Word)s_next_slot;
         reply_len = 1;
@@ -448,8 +449,8 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_NANOSLEEP: {
-        /* MR0 = total nanoseconds.  Block via SaveCaller until the
-         * timer sweep wakes us. */
+        /* MR0 = total nanoseconds.  Park (stash the reply object) until
+         * the timer sweep wakes us. */
         int parked = 0;
         int rc = tm_nanosleep(caller, (unsigned long)mr0, &parked);
         if (rc) { err = (seL4_Word)(-rc); break; }
@@ -913,6 +914,10 @@ int main(seL4_BootInfo *bi)
                                       primary_ep, primary_ep) != 0) {
         tm_crash("failed to register sysfs channel");
     }
+    if (tm_channel_register_existing(QSOE_PID_TASKMAN, TM_PROCFS_CHID,
+                                      primary_ep, primary_ep) != 0) {
+        tm_crash("failed to register procfs channel");
+    }
 
     tm_pathmgr_init();
     {
@@ -1004,6 +1009,22 @@ int main(seL4_BootInfo *bi)
         };
         if (tm_pathmgr_register("/sys", &obj) != 0) {
             tm_crash("pathmgr register /sys failed");
+        }
+    }
+
+    /* Synthetic read-only /proc (one dir per live pid; ps reads it).
+     * The model is the shared libtaskman core; tm_procfs_populate()
+     * registers LQ's process-table accessors with it. */
+    tm_procfs_populate();
+    {
+        tm_pathmgr_obj_t obj = {
+            .server_pid   = QSOE_PID_TASKMAN,
+            .server_chid  = TM_PROCFS_CHID,
+            .flags        = 0,
+            .handler_kind = PATHMGR_HANDLER_TASKMAN_PROCFS,
+        };
+        if (tm_pathmgr_register("/proc", &obj) != 0) {
+            tm_crash("pathmgr register /proc failed");
         }
     }
 

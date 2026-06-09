@@ -29,7 +29,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <qsoe/tls.h>
@@ -246,9 +246,13 @@ int SyncSemPost(sync_t *s)
     return 0;
 }
 
-int SyncSemWait(sync_t *s, int try_only)
+/* Raw form: returns 0 on success or a negated errno, the QNX/QSOE `_r`
+ * convention (the shared suite checks `SyncSemWait_r(...) == -EAGAIN`
+ * for a non-blocking empty semaphore).  SyncSemWait wraps it into the
+ * errno/-1 shape.  Mirrors nq/libc/api/sync.c's _r split. */
+long SyncSemWait_r(sync_t *s, int try_only)
 {
-    if (!s) { qsoe_errno = EINVAL; return -1; }
+    if (!s) return -EINVAL;
     for (;;) {
         long c = __atomic_load_n(&s->count, __ATOMIC_ACQUIRE);
         if (c > 0) {
@@ -258,11 +262,18 @@ int SyncSemWait(sync_t *s, int try_only)
                 return 0;
             continue;       /* race; retry */
         }
-        if (try_only) {
-            qsoe_errno = EAGAIN;
-            return -1;
+        if (try_only) return -EAGAIN;
+        if (sync_wait_credit(&s->count) != 0) {
+            int e = qsoe_errno;
+            return e ? -(long)e : -EINTR;
         }
-        if (sync_wait_credit(&s->count) != 0) return -1;
         /* Loop; re-attempt to claim. */
     }
+}
+
+int SyncSemWait(sync_t *s, int try_only)
+{
+    long r = SyncSemWait_r(s, try_only);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
+    return (int)r;
 }

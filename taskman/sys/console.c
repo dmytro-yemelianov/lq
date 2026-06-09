@@ -15,7 +15,7 @@
 #include "console.h"
 #include "../sel4_types.h"
 #include "../tm_log.h"
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 
 /* Bound by the IPC buffer payload area (msg[4..119] = 116 words =
  * 928 bytes). Larger writes are chunked client-side in qsoe_write. */

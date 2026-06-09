@@ -12,9 +12,9 @@
  * enough for a single short path but not for a real argv/envp.  One
  * 4 KiB page is the smallest unit the LQ memory manager hands out
  * (TM_REQ_MMAP rounds up to 2 MiB Mega_Pages, so we waste 2 MiB - 4
- * KiB once per spawn -- acceptable for v0.8; pooling lands later).
+ * KiB once per spawn -- acceptable for now; pooling lands later).
  *
- * file_actions and attrp are not yet honoured (Stage-A inherits stdio
+ * file_actions and attrp are not yet honoured (we inherit stdio
  * unconditionally; the future fd-actions replay happens taskman-side
  * once TM_REQ_SPAWN gains a file-actions list parameter).
  *
@@ -22,7 +22,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <spawn.h>

@@ -1,20 +1,20 @@
 /*
  * nanosleep.c — POSIX nanosleep().
  *
- * Asks taskman to park us until a deadline.  taskman SaveCaller's
- * our reply slot and replies from its timer-sweep when rdtime
- * crosses the expiry.  The sweep runs at every TM_REQ_* dispatch
- * entry — granularity therefore depends on IPC load.  A future
- * tick-Notification (v0.8) or option-3 yield-poll thread tightens
- * the bound without changing this code.
+ * Asks taskman to park us until a deadline.  taskman stashes our
+ * reply object and replies from its timer-sweep when rdtime crosses
+ * the expiry.  The sweep runs at every TM_REQ_* dispatch entry —
+ * granularity therefore depends on IPC load.  A future
+ * tick-Notification or yield-poll thread tightens the bound without
+ * changing this code.
  *
- * v0.7 simplification: the `rmtp` (remaining-time) outparam is
- * always zeroed.  Real signal-interrupt semantics arrive once the
- * signal thread is fully wired and EINTR can propagate back here.
+ * The `rmtp` (remaining-time) outparam is always zeroed.  Real
+ * signal-interrupt semantics arrive once the signal thread is fully
+ * wired and EINTR can propagate back here.
  */
 
 #include <time.h>
-#include <qsoe-system.h>
+#include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/wire.h>
 #include <sel4_types.h>

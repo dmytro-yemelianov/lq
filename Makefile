@@ -396,7 +396,7 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/path/cpiofs.h \
     $(TASKMAN_DIR)/sys/console.h \
     $(TASKMAN_DIR)/sys/platform.h \
-    $(LIBC_INCLUDE)/qsoe-system.h \
+    $(LIBC_INCLUDE)/sys/qsoe.h \
     $(LIBC_INCLUDE)/qsoe/slots.h \
     $(LIBC_INCLUDE)/qsoe/tls.h \
     $(LIBC_INCLUDE)/qsoe/wire.h \
@@ -454,7 +454,7 @@ rtld: $(RTLD_SO)
 
 # Build ld-qsoe.so.1 from the shared libc/rtld/ tree.  Pure userland
 # shared object -- no taskman/seL4 dependency at build time.  LIBC_INC
-# plumbs <qsoe-system.h>.
+# plumbs <sys/qsoe.h>.
 $(RTLD_SO):
 	@mkdir -p $(RTLD_BUILD)
 	+$(MAKE) -C $(RTLD_DIR) \
@@ -469,7 +469,7 @@ libtaskman: $(LIBTASKMAN_A)
 
 # Build libtaskman.a from the umbrella-root tree.  Taskman is a freestanding
 # static-link client, so override PICFLAG to -fno-pic to match the rest of
-# taskman.  LIBC_INC plumbs <qsoe-system.h> in.
+# taskman.  LIBC_INC plumbs <sys/qsoe.h> in.
 $(LIBTASKMAN_A):
 	@mkdir -p $(LIBTASKMAN_BUILD)
 	+$(MAKE) -C $(LIBTASKMAN_DIR) \
