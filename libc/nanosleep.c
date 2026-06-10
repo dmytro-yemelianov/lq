@@ -1,24 +1,38 @@
 /*
- * nanosleep.c — POSIX nanosleep().
+ * nanosleep.c — POSIX nanosleep() (QSOE/L).
  *
- * Asks taskman to park us until a deadline.  taskman stashes our
- * reply object and replies from its timer-sweep when rdtime crosses
- * the expiry.  The sweep runs at every TM_REQ_* dispatch entry —
- * granularity therefore depends on IPC load.  A future
- * tick-Notification or yield-poll thread tightens the bound without
- * changing this code.
+ * Client-side timed spin against the RISC-V `time` CSR.
+ *
+ * The earlier design parked the caller in taskman (TM_REQ_NANOSLEEP) and
+ * relied on taskman's timer sweep to reply when rdtime crossed the
+ * expiry.  But that sweep only runs when *something* pokes taskman, so a
+ * sleeper on an otherwise-idle system (e.g. sysinfo measuring load while
+ * the shell waits on it) never woke -- a deadlock.  On RISC-V MCS the
+ * kernel owns the timer for scheduling, so user-level has no timer IRQ
+ * to drive a wake; until a budget-throttled tick thread or a
+ * tick-Notification lands in taskman, sleep by polling rdtime here and
+ * yielding each turn so equal-priority threads still make progress.
+ *
+ * rdtime is U-mode readable per the RISC-V spec; qsoe_time_freq_hz was
+ * cached from TM_REQ_CLOCK_FREQ at process startup.
  *
  * The `rmtp` (remaining-time) outparam is always zeroed.  Real
- * signal-interrupt semantics arrive once the signal thread is fully
- * wired and EINTR can propagate back here.
+ * signal-interrupt (EINTR) semantics arrive once the signal thread can
+ * unblock a spinning sleeper.
  */
 
 #include <time.h>
 #include <sys/qsoe.h>
-#include <qsoe/slots.h>
-#include <qsoe/tm_msgs.h>
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
+
+/* RISC-V `time` CSR — current tick count (U-mode allowed by spec). */
+static inline unsigned long nsleep_rdtime(void)
+{
+    unsigned long t;
+    __asm__ volatile ("rdtime %0" : "=r"(t));
+    return t;
+}
 
 int nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
 {
@@ -30,17 +44,24 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
         return -1;
     }
 
-    /* Pack into a single 64-bit nanosecond count.  Caps at ~584
-     * years (UINT64_MAX/1e9) — comfortable. */
+    /* Pack into a single 64-bit nanosecond count.  Caps at ~584 years
+     * (UINT64_MAX/1e9) -- comfortable. */
     unsigned long total_ns = (unsigned long)rqtp->tv_sec * 1000000000UL
                            + (unsigned long)rqtp->tv_nsec;
     if (total_ns == 0) return 0;
 
-    seL4_Word mr0 = (seL4_Word)total_ns, mr1 = 0, mr2 = 0, mr3 = 0;
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_NANOSLEEP, 0, 0, 1);
-    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
-                                              &mr0, &mr1, &mr2, &mr3);
-    seL4_Word err = seL4_MessageInfo_get_label(reply);
-    if (err != 0) { qsoe_errno = (int)err; return -1; }
+    /* No clock frequency -> can't time the wait; best-effort no-op
+     * rather than spin forever. */
+    if (qsoe_time_freq_hz == 0) return 0;
+
+    /* ns -> ticks, split to avoid a 128-bit multiply. */
+    unsigned long freq  = qsoe_time_freq_hz;
+    unsigned long whole = (total_ns / 1000000000UL) * freq;
+    unsigned long part  = ((total_ns % 1000000000UL) * freq) / 1000000000UL;
+    unsigned long target = nsleep_rdtime() + whole + part;
+
+    while ((long)(nsleep_rdtime() - target) < 0)
+        qsoe_sys_yield();
+
     return 0;
 }

@@ -35,6 +35,7 @@
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/tm_msgs.h>
+#include <qsoe/sysinfo.h>
 #include <qsoe/sys_version.h>
 #include <cpio.h>
 
@@ -186,6 +187,74 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
          * round up to whole words.  Without this, the client sees only
          * mr0 and reads stale data from its own IPC buffer. */
         reply_len = 4 + (want + 7) / 8;
+        break;
+    }
+    case TM_REQ_SYSINFO: {
+        /* Live system-state snapshots for sysinfo(1).  Populated from
+         * taskman's own tables + syscfg.  Groups taskman cannot yet
+         * source (per-hart idle ticks, IRQ fire counts, RAM accounting)
+         * report empty rather than the default echo's garbage.
+         *   Request: mr0 = group, mr1 = max records this window,
+         *            mr2 = records to skip first.
+         *   Reply:   mr0 = records available, mr1 = records returned,
+         *            payload (the records) at msg[4..]. */
+        unsigned group = (unsigned)mr0;
+        unsigned want  = (unsigned)mr1;
+        unsigned skip  = (unsigned)mr2;
+        unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+        unsigned avail = 0, got = 0, recsz = 0;
+
+        if (group == QSOE_SYSINFO_CPUS) {
+            recsz = sizeof(qsoe_sysinfo_cpu_t);
+            uint32_t ncpus = 0, boot = 0;
+            if (tm_syscfg_find_u32(TM_SYSCFG_TAG_NUM_CPUS, &ncpus) != 0 ||
+                ncpus == 0)
+                ncpus = 1;
+            (void)tm_syscfg_find_u32(TM_SYSCFG_TAG_BOOT_HART, &boot);
+            avail = ncpus;
+            for (unsigned i = skip; i < avail && got < want; ++i) {
+                qsoe_sysinfo_cpu_t c;
+                c.hartid      = boot + i;
+                c.online      = 1;
+                c.timer_ticks = 0;   /* seL4 owns the timer; no idle split */
+                c.idle_ticks  = 0;
+                const unsigned char *s = (const unsigned char *)&c;
+                for (unsigned b = 0; b < recsz; ++b)
+                    dst[got * recsz + b] = s[b];
+                ++got;
+            }
+        } else if (group == QSOE_SYSINFO_THREADS) {
+            recsz = sizeof(qsoe_sysinfo_thread_t);
+            for (int i = 0; i < TM_MAX_PROCESSES; ++i) {
+                tm_process_t *p = tm_process_by_index(i);
+                if (p && p->in_use) ++avail;
+            }
+            unsigned idx = 0;
+            for (int i = 0; i < TM_MAX_PROCESSES && got < want; ++i) {
+                tm_process_t *p = tm_process_by_index(i);
+                if (!p || !p->in_use) continue;
+                if (idx++ < skip) continue;
+                qsoe_sysinfo_thread_t t;
+                unsigned char *tb = (unsigned char *)&t;
+                for (unsigned b = 0; b < recsz; ++b) tb[b] = 0;
+                t.tid    = (int32_t)p->pid;
+                t.pid    = (int32_t)p->pid;
+                t.hartid = 0;
+                t.state  = (char)(p->exit_state ? QSOE_TSTATE_ZOMBIE
+                                                : QSOE_TSTATE_RUNNING);
+                for (unsigned n = 0; n < QSOE_SYSINFO_NAME_LEN - 1 &&
+                                     p->name[n] != '\0'; ++n)
+                    t.name[n] = p->name[n];
+                for (unsigned b = 0; b < recsz; ++b)
+                    dst[got * recsz + b] = tb[b];
+                ++got;
+            }
+        }
+        /* MEM / IRQS / TIMERS: not yet sourced on LQ -> empty (avail 0). */
+
+        *out_mr0  = (seL4_Word)avail;
+        *out_mr1  = (seL4_Word)got;
+        reply_len = 4 + (got * recsz + 7) / 8;
         break;
     }
     case TM_REQ_PING_CLIENTINFO: {
