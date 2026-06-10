@@ -48,6 +48,34 @@
 #define TM_PP_UT_FREE_MAX   64
 #define TM_RAM_UT_MAX       32
 
+/* Per-process object CNode (v0.10 slot reclamation).
+ *
+ * taskman holds a cap to every object it retypes for a process; in a
+ * flat root CNode (4096 slots) the ~150 image-frame caps per spawn never
+ * came back, capping the system at ~30 launches.  Each process instead
+ * gets its own object CNode; the bulk write-once frame caps are MOVED
+ * into it at the end of spawn (their root slots return to the free list
+ * at once), and on exit the whole objcnode -- a pp_ut child -- is
+ * destroyed by Revoke(pput), so all those slots vanish together.  The
+ * default root CNode's guard fills all 64 address bits, so a cap in a
+ * 2nd-level CNode cannot be INVOKED (page_map can't reach it); that is
+ * why frames are mapped while still in a root slot and only then moved.
+ *
+ * Radix 2^9 = 512 slots, comfortably above SPAWN_MAX_FRAMES. */
+#define TM_OBJCNODE_RADIX   9
+
+/* Graceful crash (v0.10).  A child's fault handler is a badged
+ * Send+GrantReply cap to taskman's primary endpoint; on a fatal U-mode
+ * fault seL4 delivers a fault IPC there instead of wedging the thread
+ * with "no fault handler".  The badge carries the faulter's pid OR'd
+ * with TM_FAULT_BADGE_FLAG so the dispatcher tells a fault from a normal
+ * request -- pids are < TM_MAX_PROCESSES (128), so bit 16 never collides
+ * with a pid badge.  TM_SIG_SEGV is the terminating signal reported to
+ * the parent's waitpid (musl WTERMSIG = status & 0x7f). */
+#define TM_FAULT_BADGE_FLAG   0x10000UL
+#define TM_FAULT_PID_MASK     (TM_FAULT_BADGE_FLAG - 1)
+#define TM_SIG_SEGV           11
+
 /* Per-process credentials (v0.7).  Same six fields as QNX/QRV's
  * _cred_info — ruid/euid/suid + rgid/egid/sgid.  Inherited from
  * parent at posix_spawn; pid 1 (taskman) starts as root (all zero). */
@@ -134,6 +162,19 @@ typedef struct {
      * which is how this process's RAM is actually reclaimed. */
     seL4_CPtr pput[TM_PP_UT_PER_PROC];
     int       pput_count;
+
+    /* v0.10 per-process object CNode (see TM_OBJCNODE_RADIX above): holds
+     * the image-frame caps moved out of the root CNode at spawn.  A
+     * pp_ut child, so Revoke(pput) destroys it on exit; only its single
+     * root-CNode slot is freed back to the slot free-list. */
+    seL4_CPtr objcnode;
+    int       objcnode_next;
+
+    /* v0.10 fault handler: the badged Send+GrantReply cap to taskman's
+     * primary EP installed as the main thread's fault endpoint.  Stays
+     * in taskman's CSpace (the TCB references it); its slot is freed in
+     * teardown once the TCB is gone. */
+    seL4_CPtr fault_ep;
 } tm_process_t;
 
 typedef struct {
@@ -276,6 +317,12 @@ int           tm_process_create_by_name(const char *path, unsigned path_len,
                                          int envc, const char *const *envp,
                                          pid_t *out_pid);
 int           tm_process_terminate(pid_t target, int status);
+
+/* Handle a fault IPC delivered to the primary EP (badge carried
+ * TM_FAULT_BADGE_FLAG): log it and terminate the faulting process so a
+ * U-mode crash never wedges the kernel.  fault_type is the seL4 fault
+ * label from the IPC's MessageInfo. */
+void          tm_handle_fault(pid_t pid, unsigned fault_type);
 
 int           tm_process_set_parent(pid_t child, pid_t parent);
 int           tm_process_detach(pid_t pid, int status);

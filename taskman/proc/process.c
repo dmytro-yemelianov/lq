@@ -220,9 +220,12 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     /* ITIMER_REAL disarmed by default. */
     g_processes[0].itimer_expiry_ticks   = 0;
     g_processes[0].itimer_interval_ticks = 0;
-    /* taskman itself owns no pp_ut blocks -- it retypes from the master
-     * pool directly and is never torn down. */
+    /* taskman itself owns no pp_ut blocks or object CNode -- it retypes
+     * from the master pool directly and is never torn down. */
     g_processes[0].pput_count = 0;
+    g_processes[0].objcnode = 0;
+    g_processes[0].objcnode_next = 0;
+    g_processes[0].fault_ep = 0;
 }
 
 int tm_process_register(pid_t pid, seL4_CPtr cnode,
@@ -267,6 +270,9 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].itimer_expiry_ticks   = 0;
         g_processes[i].itimer_interval_ticks = 0;
         g_processes[i].pput_count = 0;
+        g_processes[i].objcnode = 0;
+        g_processes[i].objcnode_next = 0;
+        g_processes[i].fault_ep = 0;
         return 0;
     }
     return -ENOMEM;
@@ -765,8 +771,10 @@ int tm_process_terminate(pid_t target, int status)
         if (gthreads[i].in_use && gthreads[i].pid == target) {
             qsoe_cnode_revoke(s_cnode_root, gthreads[i].tcb_master, TM_DEPTH_TASKMAN);
             qsoe_cnode_delete(s_cnode_root, gthreads[i].tcb_master, TM_DEPTH_TASKMAN);
+            taskman_free_slot(gthreads[i].tcb_master);
             qsoe_cnode_revoke(s_cnode_root, gthreads[i].ntfn_master, TM_DEPTH_TASKMAN);
             qsoe_cnode_delete(s_cnode_root, gthreads[i].ntfn_master, TM_DEPTH_TASKMAN);
+            taskman_free_slot(gthreads[i].ntfn_master);
             gthreads[i].in_use = 0;
         }
     }
@@ -777,11 +785,13 @@ int tm_process_terminate(pid_t target, int status)
             if (gchannels[i].ntfn_master) {
                 qsoe_cnode_revoke(s_cnode_root, gchannels[i].ntfn_master, TM_DEPTH_TASKMAN);
                 qsoe_cnode_delete(s_cnode_root, gchannels[i].ntfn_master, TM_DEPTH_TASKMAN);
+                taskman_free_slot(gchannels[i].ntfn_master);
                 gchannels[i].ntfn_master = 0;
                 gchannels[i].ntfn_sig = 0;
             }
             qsoe_cnode_revoke(s_cnode_root, gchannels[i].master, TM_DEPTH_TASKMAN);
             qsoe_cnode_delete(s_cnode_root, gchannels[i].master, TM_DEPTH_TASKMAN);
+            taskman_free_slot(gchannels[i].master);
             gchannels[i].in_use = 0;
         }
     }
@@ -804,28 +814,48 @@ int tm_process_terminate(pid_t target, int status)
     /* 4. Main TCB. */
     qsoe_cnode_revoke(s_cnode_root, p->tcb, TM_DEPTH_TASKMAN);
     qsoe_cnode_delete(s_cnode_root, p->tcb, TM_DEPTH_TASKMAN);
+    taskman_free_slot(p->tcb);
+
+    /* 4b. Fault-handler cap -- the TCB referenced it; safe to drop now. */
+    if (p->fault_ep) {
+        qsoe_cnode_delete(s_cnode_root, p->fault_ep, TM_DEPTH_TASKMAN);
+        taskman_free_slot(p->fault_ep);
+        p->fault_ep = 0;
+    }
 
     /* 5. VSpace. */
     qsoe_cnode_revoke(s_cnode_root, p->vspace, TM_DEPTH_TASKMAN);
     qsoe_cnode_delete(s_cnode_root, p->vspace, TM_DEPTH_TASKMAN);
+    taskman_free_slot(p->vspace);
 
     /* 6. CNode. */
     qsoe_cnode_revoke(s_cnode_root, p->cnode, TM_DEPTH_TASKMAN);
     qsoe_cnode_delete(s_cnode_root, p->cnode, TM_DEPTH_TASKMAN);
+    taskman_free_slot(p->cnode);
 
     /* 7. Workers L0/L1 PTs if allocated. */
     if (p->workers_l0_pt) {
         qsoe_cnode_delete(s_cnode_root, p->workers_l0_pt, TM_DEPTH_TASKMAN);
+        taskman_free_slot(p->workers_l0_pt);
     }
     if (p->workers_l1_pt) {
         qsoe_cnode_delete(s_cnode_root, p->workers_l1_pt, TM_DEPTH_TASKMAN);
+        taskman_free_slot(p->workers_l1_pt);
     }
 
     /* 8. Untyped budget. */
     if (p->untyped_budget) {
         qsoe_cnode_revoke(s_cnode_root, p->untyped_budget, TM_DEPTH_TASKMAN);
         qsoe_cnode_delete(s_cnode_root, p->untyped_budget, TM_DEPTH_TASKMAN);
+        taskman_free_slot(p->untyped_budget);
     }
+
+    /* 8b. mmap megapage frame caps.  Their objects die with Revoke(pput)
+     *     below; recycle the root-CNode slots they occupied. */
+    for (int i = 0; i < p->mmap_count; ++i) {
+        if (p->mmap[i].frame) taskman_free_slot(p->mmap[i].frame);
+    }
+    p->mmap_count = 0;
 
     /* 9. Per-process untyped blocks.  Revoke each (destroying every
      *    object still retyped from it -- image frames, page tables,
@@ -835,7 +865,28 @@ int tm_process_terminate(pid_t target, int status)
     tm_pput_release_list(p->pput, p->pput_count);
     p->pput_count = 0;
 
+    /* 10. The object CNode itself is a pp_ut child, so Revoke above
+     *     already destroyed it (and every image-frame cap it held);
+     *     just recycle its root-CNode slot. */
+    if (p->objcnode) {
+        taskman_free_slot(p->objcnode);
+        p->objcnode = 0;
+        p->objcnode_next = 0;
+    }
+
     p->in_use = 0;
     tm_pid_free(target);
     return 0;
+}
+
+void tm_handle_fault(pid_t pid, unsigned fault_type)
+{
+    tm_process_t *p = tm_process_lookup(pid);
+    const char *name = (p && p->name[0]) ? p->name : "?";
+    /* Every fatal U-mode fault terminates the process; SIGSEGV covers
+     * the common bad/NULL-pointer VM fault.  (A finer fault-type ->
+     * signal mapping -- SIGILL, SIGBUS -- can refine this later.) */
+    tm_warn("pid %d (%s) faulted (seL4 fault type %u) -- terminating (SIGSEGV)",
+            (int)pid, name, fault_type);
+    (void) tm_process_terminate(pid, TM_SIG_SEGV);
 }

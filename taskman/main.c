@@ -1099,6 +1099,20 @@ int main(seL4_BootInfo *bi)
                                              tm_active_reply(),
                                              &mr0, &mr1, &mr2, &mr3);
     for (;;) {
+        /* A fault IPC (badge carries TM_FAULT_BADGE_FLAG) arrives on the
+         * same primary EP as normal requests: the faulting thread is
+         * blocked waiting for us.  Terminate it gracefully and Recv the
+         * next message -- no reply, the faulter is gone. */
+        if (badge & TM_FAULT_BADGE_FLAG) {
+            tm_handle_fault((pid_t)(badge & TM_FAULT_PID_MASK),
+                            (unsigned)seL4_MessageInfo_get_label(info));
+            mr0 = 0; mr1 = 0; mr2 = 0; mr3 = 0;
+            info = qsoe_sys_recv(primary_ep, &badge,
+                                  tm_active_reply(),
+                                  &mr0, &mr1, &mr2, &mr3);
+            continue;
+        }
+
         seL4_Word r0, r1, r2, r3;
         int no_reply = 0;
         seL4_MessageInfo_t reply_info = tm_dispatch(info, badge,

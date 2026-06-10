@@ -357,7 +357,7 @@ void tm_set_uart_untyped(seL4_CPtr ut_slot)
  * write callback to find the frame backing a given target VA, scratch-
  * map it, write 8 bytes, and unmap.  Capacity covers qsh + libc.so +
  * rtld (≈122 pages) with headroom. */
-#define SPAWN_MAX_FRAMES 192
+#define SPAWN_MAX_FRAMES 256
 
 typedef struct {
     unsigned long va_page;      /* 4 KiB-aligned child VA */
@@ -938,6 +938,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_riscv_page_map(ipc_frame, vspace, CHILD_IPC_BUFFER,
                               QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
     if (err) { tm_err("spawn: ipc_frame Page_Map failed"); return -ENOMEM; }
+    if (spawn_record_frame(CHILD_IPC_BUFFER, ipc_frame) != 0) return -ENOMEM;
 
     /* 4b. TCB page -- one zeroed 4 KiB page at CHILD_TCB_BASE that the
      *     thread's tp register will point at.  libc.so / rtld use
@@ -960,6 +961,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_riscv_page_map(tcb_frame, vspace, CHILD_TCB_BASE,
                               QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
     if (err) { tm_err("spawn: tcb_frame Page_Map failed"); return -ENOMEM; }
+    if (spawn_record_frame(CHILD_TCB_BASE, tcb_frame) != 0) return -ENOMEM;
 
     /* v0.4.4: allocate the stack region below the IPC buffer.
      * CHILD_STACK_PAGES pages cover [CHILD_STACK_BASE, CHILD_STACK_TOP).
@@ -1011,6 +1013,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             tm_err("spawn: stack Page_Map failed");
             return -ENOMEM;
         }
+        if (spawn_record_frame(va, stack_frames[i]) != 0) return -ENOMEM;
     }
 
     /* 5. Populate the child's CSpace. Slot 1 = Send cap to taskman's
@@ -1124,10 +1127,26 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * threads always get the CPU. */
     seL4_CPtr sc = tm_sched_context_create(/*core=*/0);
     if (!sc) { tm_err("spawn: sched-context create failed"); return -ENOMEM; }
+    /* Graceful crash: give the main thread a fault handler -- a badged
+     * Send+GrantReply cap to taskman's primary EP (QSOE_RIGHTS_SEND
+     * already grants reply).  On a fatal U-mode fault seL4 delivers a
+     * fault IPC here (badge = pid | TM_FAULT_BADGE_FLAG) instead of
+     * wedging the thread; the dispatcher then terminates the process.
+     * The TCB derives its own copy of the cap, so our temp slot is
+     * reclaimed right after. */
+    seL4_CPtr fault_ep = taskman_alloc_empty_slot();
+    err = qsoe_cnode_mint(s_cnode_root, fault_ep, TM_DEPTH_TASKMAN,
+                          s_cnode_root, primary_ep, TM_DEPTH_TASKMAN,
+                          QSOE_RIGHTS_SEND,
+                          TM_FAULT_BADGE_FLAG | (seL4_Word)pid);
+    if (err) { tm_err("spawn: fault-ep mint failed"); return -ENOMEM; }
     err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
                                     /*mcp=*/TM_PRIO_USER, /*prio=*/TM_PRIO_USER,
-                                    sc, /*fault_ep=*/0);
+                                    sc, fault_ep);
     if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return -ENOMEM; }
+    /* The minted fault cap must stay in our CSpace -- the TCB references
+     * it (deleting it strips the handler).  Stashed in the record below
+     * and freed in teardown once the TCB is gone. */
 
     /* MCS: provision the child's reply object at the well-known slot its
      * libc MsgReceive/MsgReply ride (register a6 / Send target).  Retype
@@ -1167,6 +1186,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     tm_process_t *prec = tm_process_lookup(pid);
     if (prec) {
         prec->untyped_budget = child_untyped;
+        prec->fault_ep       = fault_ep;
         const char *base = elf_name ? elf_name : "?";
         for (const char *s = base; *s; ++s)
             if (*s == '/') base = s + 1;
@@ -1203,6 +1223,38 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     if (cnreg) {
         tm_err("spawn: tm_connection_register_existing failed");
         return cnreg;
+    }
+
+    /* Slot reclamation: move the image-frame caps (the bulk of this
+     * process's cap count) out of the flat root CNode into its own
+     * object CNode.  Their root slots return to the free list right
+     * away; on exit the objcnode -- a pp_ut child -- is destroyed by
+     * Revoke(pput), freeing all of them together.  The page mapping
+     * lives in the frame cap, so it survives the move; safe now that the
+     * loads and the relocation pass have finished touching the frames. */
+    {
+        tm_process_t *op = tm_process_lookup(pid);
+        if (op) {
+            seL4_CPtr objc = alloc_object(seL4_CapTableObject, TM_OBJCNODE_RADIX);
+            if (!objc) { tm_err("spawn: objcnode alloc failed"); return -ENOMEM; }
+            op->objcnode      = objc;
+            op->objcnode_next = 0;
+            for (int i = 0; i < s_frame_count; ++i) {
+                seL4_CPtr src  = s_frames[i].frame;
+                seL4_Word merr = qsoe_cnode_move(objc,
+                                                 (seL4_Word)op->objcnode_next,
+                                                 TM_OBJCNODE_RADIX,
+                                                 s_cnode_root, src,
+                                                 TM_DEPTH_TASKMAN);
+                if (merr) {
+                    tm_err("spawn: objcnode move failed err=%u",
+                           (unsigned long)merr);
+                    return -ENOMEM;
+                }
+                op->objcnode_next++;
+                taskman_free_slot(src);
+            }
+        }
     }
 
     /* 9. Liftoff. */

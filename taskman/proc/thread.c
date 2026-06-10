@@ -115,9 +115,12 @@ int tm_thread_alloc(pid_t caller_pid,
      * same SetSchedParams invocation. */
     seL4_CPtr sc = tm_sched_context_create(affinity);
     if (!sc) return -ENOMEM;
+    /* Worker shares the process's fault handler (the badge identifies the
+     * process, so a worker fault terminates the whole process -- correct).
+     * No extra cap: reuse p->fault_ep minted at spawn. */
     err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
                                     /*mcp=*/prio, /*prio=*/prio,
-                                    sc, /*fault_ep=*/0);
+                                    sc, p->fault_ep);
     if (err) return -ENOMEM;
 
     seL4_CPtr child_tcb_slot  = tm_process_alloc_slot(caller_pid);
