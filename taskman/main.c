@@ -257,6 +257,20 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         reply_len = 4 + (got * recsz + 7) / 8;
         break;
     }
+    case TM_REQ_SHUTDOWN:
+    case TM_REQ_REBOOT: {
+        /* Power the machine off.  Cred-gated (euid 0; today every process
+         * runs root, so the gate always passes).  On success there is NO
+         * reply -- sel4_debug_halt() -> kernel halt() -> sbi_shutdown()
+         * and the board is gone.  (SBI legacy has no reboot, so REBOOT
+         * halts the same way for now.) */
+        tm_process_t *p = tm_process_lookup(caller);
+        if (p && p->cred.euid != 0) { err = EPERM; break; }
+        tm_info("shutdown: powering off (requested by pid %d)", (int)caller);
+        sel4_debug_halt();   /* never returns */
+        err = EIO;           /* unreachable */
+        break;
+    }
     case TM_REQ_PING_CLIENTINFO: {
         /* Demo: exercise ConnectClientInfo from inside the dispatch
          * loop.  The badge IS the scoid of the calling connection. */

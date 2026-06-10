@@ -41,6 +41,10 @@
 #ifndef CONFIG_PRINTING
 # define CONFIG_PRINTING 1
 #endif
+/* NB: we deliberately do NOT define CONFIG_DEBUG_BUILD -- the generated
+ * syscall.h's debug section references seL4-internal macros (UNUSED) we
+ * don't carry.  sel4_syscalls.h derives SysDebugHalt's number directly
+ * instead (it's a fixed offset past the CONFIG_PRINTING ones). */
 
 typedef unsigned long       seL4_Word;
 
