@@ -229,7 +229,14 @@ int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long flags,
     if (flags & TM_MMAP_FLAG_PHYS) {
         return mmap_phys(proc, phys, len, out_vaddr);
     }
-    return mmap_anonymous(proc, len, out_vaddr);
+    /* Anonymous megapages are per-process RAM: retype them from the
+     * caller's own untyped (growing it on demand) so they are reclaimed
+     * when the process exits.  Processes with no pp_ut block (taskman
+     * itself, boot init) fall back to the master pool. */
+    tm_pput_proc_begin(proc);
+    int rc = mmap_anonymous(proc, len, out_vaddr);
+    tm_pput_end();
+    return rc;
 }
 
 /* Walk proc->mmap[] for an entry whose va_page == va.  Returns index

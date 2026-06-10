@@ -25,6 +25,29 @@
 #define TM_DEPTH_TASKMAN 64
 #define TM_DEPTH_CHILD   12
 
+/* Per-process untyped (pp_ut) reclamation (v0.10).
+ *
+ * Every process retypes its image frames, page tables and mmap
+ * megapages from its OWN untyped rather than the shared master pool.
+ * On seL4 an untyped's free watermark only rewinds when it becomes
+ * child-free (src/object/untyped.c) -- the master pool never does
+ * (taskman's own objects keep it populated), so per-spawn allocations
+ * leaked it permanently.  A per-process untyped, by contrast, is
+ * child-free the moment its process exits, so `Revoke` resets it and
+ * it returns to a reuse free-list.  s_untyped then only ever hands out
+ * pp_ut blocks, bounded by peak concurrent demand.
+ *
+ * TM_PP_UT_BITS sizes one block (2^24 = 16 MiB -- eight 2 MiB megapages,
+ * so a typical whole process image+heap fits in one block without
+ * overflowing); a process needing more grows by acquiring further
+ * blocks, up to TM_PP_UT_PER_PROC.  Blocks are carved across every RAM
+ * untyped (TM_RAM_UT_MAX of them); TM_PP_UT_FREE_MAX caps the reuse
+ * free-list. */
+#define TM_PP_UT_BITS       24
+#define TM_PP_UT_PER_PROC   32
+#define TM_PP_UT_FREE_MAX   64
+#define TM_RAM_UT_MAX       32
+
 /* Per-process credentials (v0.7).  Same six fields as QNX/QRV's
  * _cred_info — ruid/euid/suid + rgid/egid/sgid.  Inherited from
  * parent at posix_spawn; pid 1 (taskman) starts as root (all zero). */
@@ -104,6 +127,13 @@ typedef struct {
     /* v0.10 process name (basename of the spawned ELF), for /proc.
      * Captured at spawn from elf_name; NUL-terminated, truncated. */
     char      name[32];
+
+    /* v0.10 per-process untyped blocks (see TM_PP_UT_* above).  Every
+     * image frame / page table / mmap megapage is retyped from one of
+     * these; on exit each is Revoked + returned to the reuse free-list,
+     * which is how this process's RAM is actually reclaimed. */
+    seL4_CPtr pput[TM_PP_UT_PER_PROC];
+    int       pput_count;
 } tm_process_t;
 
 typedef struct {
@@ -164,8 +194,36 @@ seL4_CPtr taskman_alloc_empty_slot(void);
 void      taskman_free_slot(seL4_CPtr slot);
 
 /* Retype an untyped of the given seL4 object type into a freshly-
- * allocated taskman-CSpace slot.  Returns the slot, or 0 on failure. */
+ * allocated taskman-CSpace slot.  Returns the slot, or 0 on failure.
+ * Draws from the active per-process untyped context (see tm_pput_*)
+ * when one is set -- otherwise from the shared master pool. */
 seL4_CPtr taskman_alloc_and_retype(seL4_Word type, seL4_Word size_bits);
+
+/* ----------- per-process untyped (pp_ut) context (v0.10) -----------
+ *
+ * Bracket the per-process retypes of a spawn or an mmap so they draw
+ * from a per-process untyped that can be reclaimed wholesale on exit.
+ *
+ *   tm_pput_spawn_begin  acquire the first pp_ut into staging[0] and
+ *                        make subsequent taskman_alloc_and_retype calls
+ *                        draw from it (growing into staging[] on
+ *                        overflow).  Returns 0 on success, -ENOMEM if
+ *                        the master pool is exhausted.  The caller
+ *                        transfers staging[] into the new record on
+ *                        success, or releases it on failure.
+ *   tm_pput_proc_begin   same, but for a process that already owns
+ *                        pp_ut blocks (mmap): grows p->pput[] directly.
+ *   tm_pput_end          clear the context (back to the master pool).
+ *   tm_pput_release_list Revoke each block + return it to the reuse
+ *                        free-list (teardown). */
+int  tm_pput_spawn_begin(seL4_CPtr *staging, int *staging_n);
+void tm_pput_proc_begin(tm_process_t *p);
+void tm_pput_end(void);
+void tm_pput_release_list(seL4_CPtr *list, int n);
+
+/* Register the RAM untypeds pp_ut blocks are carved from (called once
+ * at boot with every RAM untyped >= one block wide). */
+void tm_pput_pool_init(const seL4_CPtr *uts, int n);
 
 /* ----------- MCS scheduling + reply objects (v0.10, process.c) ----------- */
 

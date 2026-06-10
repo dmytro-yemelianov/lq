@@ -214,10 +214,10 @@ static int scratch_unmap(seL4_CPtr frame)
  * slot on success, 0 on failure. */
 static seL4_CPtr alloc_object(seL4_Word type, seL4_Word size_bits)
 {
-    seL4_CPtr slot = s_next_slot++;
-    seL4_Word err = qsoe_untyped_retype(s_untyped, type, size_bits,
-                                         s_cnode_root, 0, 0, slot, 1);
-    return (err == 0) ? slot : 0;
+    /* Route through the shared retype helper so every spawn object draws
+     * from the active per-process untyped (set by tm_pput_spawn_begin in
+     * the spawn handler) and is reclaimed wholesale on exit. */
+    return taskman_alloc_and_retype(type, size_bits);
 }
 
 static unsigned long qstrlen(const char *s)

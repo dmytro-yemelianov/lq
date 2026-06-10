@@ -149,11 +149,31 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
     const char *basename = name;
     for (const char *p = name; *p; ++p) if (*p == '/') basename = p + 1;
 
+    /* Bracket the spawn's object retypes with a per-process untyped so
+     * the whole image is reclaimable on exit (see tm_pput_*).  Staged
+     * locally because the process record does not exist until tm_spawn
+     * registers it mid-flight. */
+    seL4_CPtr staging[TM_PP_UT_PER_PROC];
+    int       staging_n = 0;
+    if (tm_pput_spawn_begin(staging, &staging_n) != 0) {
+        tm_pid_free(new_pid);
+        return -ENOMEM;
+    }
+
     int sr = tm_spawn(elf, elf_size, new_pid, s_primary_ep,
                        argc, argv, envc, envp, basename);
+    tm_pput_end();
     if (sr) {
+        tm_pput_release_list(staging, staging_n);
         tm_pid_free(new_pid);
         return sr;
+    }
+    /* Hand the staged block(s) to the now-registered record so teardown
+     * reclaims them. */
+    tm_process_t *prec = tm_process_lookup(new_pid);
+    if (prec) {
+        for (int i = 0; i < staging_n; ++i) prec->pput[i] = staging[i];
+        prec->pput_count = staging_n;
     }
     *out_pid = new_pid;
     return 0;
@@ -200,6 +220,9 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     /* ITIMER_REAL disarmed by default. */
     g_processes[0].itimer_expiry_ticks   = 0;
     g_processes[0].itimer_interval_ticks = 0;
+    /* taskman itself owns no pp_ut blocks -- it retypes from the master
+     * pool directly and is never torn down. */
+    g_processes[0].pput_count = 0;
 }
 
 int tm_process_register(pid_t pid, seL4_CPtr cnode,
@@ -243,6 +266,7 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].umask  = 022;
         g_processes[i].itimer_expiry_ticks   = 0;
         g_processes[i].itimer_interval_ticks = 0;
+        g_processes[i].pput_count = 0;
         return 0;
     }
     return -ENOMEM;
@@ -318,11 +342,126 @@ seL4_CPtr taskman_alloc_empty_slot(void)
     return s_next_slot++;
 }
 
+/* ----------- per-process untyped (pp_ut) reclamation (v0.10) ----------- */
+
+/* Reuse free-list of child-free pp_ut blocks. */
+static seL4_CPtr s_pput_free[TM_PP_UT_FREE_MAX];
+static int       s_pput_free_count;
+
+/* RAM untypeds blocks are carved from, with a cursor that advances as
+ * each fills.  Spans every RAM untyped (not just the largest), so the
+ * whole board's memory is reachable. */
+static seL4_CPtr s_ram_ut[TM_RAM_UT_MAX];
+static int       s_ram_ut_count;
+static int       s_ram_ut_cursor;
+
+void tm_pput_pool_init(const seL4_CPtr *uts, int n)
+{
+    if (n > TM_RAM_UT_MAX) n = TM_RAM_UT_MAX;
+    for (int i = 0; i < n; ++i) s_ram_ut[i] = uts[i];
+    s_ram_ut_count  = n;
+    s_ram_ut_cursor = 0;
+}
+
+/* Active per-process allocation context.  s_cur_pput == 0 means "draw
+ * from the master pool" (the dispatcher's own reply churn + taskman-self
+ * allocations).  When set, taskman_alloc_and_retype retypes from it and,
+ * on exhaustion, grows by appending a fresh block to s_cur_pput_list. */
+static seL4_CPtr  s_cur_pput;
+static seL4_CPtr *s_cur_pput_list;
+static int       *s_cur_pput_list_n;
+
+/* Acquire a child-free pp_ut: reuse one from the free-list, else carve a
+ * fresh TM_PP_UT_BITS block out of the master pool.  Returns 0 only if
+ * the master pool itself is exhausted. */
+static seL4_CPtr pp_ut_acquire(void)
+{
+    if (s_pput_free_count > 0)
+        return s_pput_free[--s_pput_free_count];
+    /* Carve a fresh block from the RAM pool, advancing past untypeds
+     * that no longer have a full block left. */
+    while (s_ram_ut_cursor < s_ram_ut_count) {
+        seL4_CPtr slot = taskman_alloc_empty_slot();
+        if (!slot) return 0;
+        seL4_Word err = qsoe_untyped_retype(s_ram_ut[s_ram_ut_cursor],
+                                            seL4_UntypedObject, TM_PP_UT_BITS,
+                                            s_cnode_root, 0, 0, slot, 1);
+        if (err == 0) return slot;
+        taskman_free_slot(slot);
+        s_ram_ut_cursor++;            /* this untyped is full -> next */
+    }
+    return 0;                         /* whole board exhausted */
+}
+
+/* Return a pp_ut for reuse: Revoke it (destroying every object still
+ * retyped from it, leaving it child-free so seL4 auto-resets its free
+ * index on the next retype) and push it onto the free-list.  If the
+ * free-list is full, drop the block (delete cap + recycle slot); its RAM
+ * stays carved from the master pool, but that is bounded by
+ * TM_PP_UT_FREE_MAX. */
+static void pp_ut_release(seL4_CPtr ut)
+{
+    if (!ut) return;
+    qsoe_cnode_revoke(s_cnode_root, ut, TM_DEPTH_TASKMAN);
+    if (s_pput_free_count < TM_PP_UT_FREE_MAX) {
+        s_pput_free[s_pput_free_count++] = ut;
+    } else {
+        qsoe_cnode_delete(s_cnode_root, ut, TM_DEPTH_TASKMAN);
+        taskman_free_slot(ut);
+    }
+}
+
+int tm_pput_spawn_begin(seL4_CPtr *staging, int *staging_n)
+{
+    seL4_CPtr first = pp_ut_acquire();
+    if (!first) return -ENOMEM;
+    staging[0]        = first;
+    *staging_n        = 1;
+    s_cur_pput        = first;
+    s_cur_pput_list   = staging;
+    s_cur_pput_list_n = staging_n;
+    return 0;
+}
+
+void tm_pput_proc_begin(tm_process_t *p)
+{
+    if (!p || p->pput_count <= 0) return;   /* no blocks -> master pool */
+    s_cur_pput        = p->pput[p->pput_count - 1];
+    s_cur_pput_list   = p->pput;
+    s_cur_pput_list_n = &p->pput_count;
+}
+
+void tm_pput_end(void)
+{
+    s_cur_pput        = 0;
+    s_cur_pput_list   = 0;
+    s_cur_pput_list_n = 0;
+}
+
+void tm_pput_release_list(seL4_CPtr *list, int n)
+{
+    for (int i = 0; i < n; ++i)
+        pp_ut_release(list[i]);
+}
+
 seL4_CPtr taskman_alloc_and_retype(seL4_Word type, seL4_Word size_bits)
 {
     seL4_CPtr slot = taskman_alloc_empty_slot();
-    seL4_Word err = qsoe_untyped_retype(s_untyped, type, size_bits,
-                                         s_cnode_root, 0, 0, slot, 1);
+    if (!slot) return 0;
+    seL4_CPtr ut  = s_cur_pput ? s_cur_pput : s_untyped;
+    seL4_Word err = qsoe_untyped_retype(ut, type, size_bits,
+                                        s_cnode_root, 0, 0, slot, 1);
+    /* pp_ut exhausted mid-spawn/mmap: grow by another block and retry. */
+    if (err != 0 && s_cur_pput && s_cur_pput_list &&
+        *s_cur_pput_list_n < TM_PP_UT_PER_PROC) {
+        seL4_CPtr nut = pp_ut_acquire();
+        if (nut) {
+            s_cur_pput_list[(*s_cur_pput_list_n)++] = nut;
+            s_cur_pput = nut;
+            err = qsoe_untyped_retype(nut, type, size_bits,
+                                      s_cnode_root, 0, 0, slot, 1);
+        }
+    }
     if (err != 0) {
         taskman_free_slot(slot);
         return 0;
@@ -687,6 +826,14 @@ int tm_process_terminate(pid_t target, int status)
         qsoe_cnode_revoke(s_cnode_root, p->untyped_budget, TM_DEPTH_TASKMAN);
         qsoe_cnode_delete(s_cnode_root, p->untyped_budget, TM_DEPTH_TASKMAN);
     }
+
+    /* 9. Per-process untyped blocks.  Revoke each (destroying every
+     *    object still retyped from it -- image frames, page tables,
+     *    mmap megapages, the child untyped above) and return it to the
+     *    reuse free-list.  This is what actually hands the process's RAM
+     *    back; the individual deletes above only drop taskman's caps. */
+    tm_pput_release_list(p->pput, p->pput_count);
+    p->pput_count = 0;
 
     p->in_use = 0;
     tm_pid_free(target);

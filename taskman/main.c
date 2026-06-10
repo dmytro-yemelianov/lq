@@ -859,6 +859,23 @@ int main(seL4_BootInfo *bi)
         tm_crash("no RAM untyped");
     }
 
+    /* Per-process untyped pool: every RAM untyped at least one pp_ut
+     * block wide.  Without this taskman would only ever touch the single
+     * largest untyped (here 128 MiB of a 512 MiB board), exhausting it
+     * after a handful of spawns while the rest sat idle.  pp_ut_acquire
+     * carves blocks across the whole list. */
+    {
+        seL4_CPtr pool[TM_RAM_UT_MAX];
+        int       pool_n = 0;
+        unsigned  dn = bi->untyped.end - bi->untyped.start;
+        for (unsigned i = 0; i < dn && pool_n < TM_RAM_UT_MAX; ++i) {
+            if (bi->untypedList[i].isDevice) continue;
+            if (bi->untypedList[i].sizeBits < TM_PP_UT_BITS) continue;
+            pool[pool_n++] = bi->untyped.start + i;
+        }
+        tm_pput_pool_init(pool, pool_n);
+    }
+
     seL4_CPtr uart_ut = find_device_untyped_for_paddr(bi, 0x10000000UL);
     tm_set_uart_untyped(uart_ut);
     tm_mem_set_bootinfo(bi);  /* needed by MAP_PHYS to walk device-UTs */
