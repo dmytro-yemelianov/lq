@@ -14,6 +14,7 @@
 
 #include "devzero.h"
 #include <sys/qsoe.h>
+#include <qsoe/ipcbuf.h>
 
 /* Bound by the IPC buffer payload area (msg[4..119] = 928 bytes).
  * Larger reads are chunked client-side by libc/qsoe's read.c. */

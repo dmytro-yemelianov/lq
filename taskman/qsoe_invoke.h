@@ -6,7 +6,7 @@
  *   UntypedRetype, CNodeRevoke, CNodeDelete, CNodeCopy, CNodeMint).
  *
  * The IPC buffer pointer lives in the current thread's qsoe_tcb_t
- * (see <qsoe/tls.h>) — the crt0 plants &qsoe_main_tcb in tp before
+ * (see <sys/qsoe.h>) — the crt0 plants &qsoe_main_tcb in tp before
  * any call below, and qsoe_libc_init() then writes the buffer
  * address into that struct.
  */
@@ -14,7 +14,7 @@
 #define QSOE_INVOKE_H
 
 #include "sel4_types.h"
-#include <qsoe/tls.h>   /* qsoe_ipcbuf macro */
+#include <qsoe/ipcbuf.h>   /* qsoe_ipcbuf_t + qsoe_ipcbuf macro (LQ-private) */
 
 /* Low-level ecall: dest in a0, info in a1, first four MRs in a2-a5,
  * syscall number in a7. Returns the reply MessageInfo word. */

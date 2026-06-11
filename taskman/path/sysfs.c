@@ -15,6 +15,7 @@
 #include "../sys/syscfg.h"
 #include "../proc/proc.h"         /* tm_connection_{set,get}_ctx */
 #include <tm_sysfs.h>
+#include <qsoe/ipcbuf.h>
 #include <qsoe/syscfg.h>          /* TM_SYSCFG_TAG_COMPATIBLE / _MODEL */
 #include <qsoe/sys_version.h>     /* QSOE_VERSION_STRING / QSOE_BUILD_DATE */
 

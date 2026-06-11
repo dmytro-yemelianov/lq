@@ -13,6 +13,7 @@
 #include "procfs.h"
 #include "../proc/proc.h"         /* tm_process_*, tm_connection_*_ctx */
 #include <tm_procfs.h>
+#include <qsoe/ipcbuf.h>
 #include <errno.h>
 
 /* ---- LQ process-table accessors handed to the shared core --------- */
