@@ -492,7 +492,7 @@ $(TASKMAN_ELF): | taskman
 # that travels via modpkg.cpio and runs on both NQ and LQ.
 
 # ----------------------------------------------------------------------------
-# Spawnable userland (init.sh, qsh, devc-ser8250, sbin/{pipe,repath,slogger,
+# Spawnable userland (init.sh, qsh, devc-ser8250, sbin/{pipe,slogger,
 # pci-server}, sloginfo, libpci, utils) lives in the umbrella-level
 # quser/ tree.  Its CPIO archive (modpkg.cpio, QRV-style name) is built
 # by `make -C ../quser cpio` and embedded into taskman.elf via .incbin

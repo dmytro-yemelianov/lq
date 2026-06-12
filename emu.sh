@@ -32,7 +32,20 @@ TESTDIR=$TOP/test
 
 CPUS=4
 MEM=512M
-QEMU=qemu-system-riscv64
+QEMU=${QEMU:-qemu-system-riscv64}
+
+# QSOE requires QEMU >= 11.0.1.  Up to 11.0.0, rmw_mip64() OR's mvip into
+# mip.SEIP even though OpenSBI sets mvien[9] (delegating the S-external
+# signal to the interrupt controller), so a message-signaled interrupt
+# never reaches the trap and an MSI-driven device hangs.  Fixed in the
+# v11.0.1 tag (qemu 175afdb0d1).  LQ runs on plain `virt` today, but its
+# MSI-only PCIe path (devb-nvme) needs this once it comes up.
+qver=$("$QEMU" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [[ $(printf '%s\n11.0.1\n' "$qver" | sort -V | head -1) != "11.0.1" ]]; then
+    echo "error: QEMU $qver is too old — 11.0.1 or newer required." >&2
+    echo "       set QEMU=/path/to/newer/qemu-system-riscv64." >&2
+    exit 1
+fi
 
 # Default device set.  Each toggle below appends to QEMUOPTS.
 ATTACH_NVME=1
