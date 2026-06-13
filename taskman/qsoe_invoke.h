@@ -15,6 +15,7 @@
 
 #include "sel4_types.h"
 #include <qsoe/ipcbuf.h>   /* qsoe_ipcbuf_t + qsoe_ipcbuf macro (LQ-private) */
+#include <qsoe/tm_msgs.h>  /* TM_REQ_VARIANT_BASE (variant-private opcodes) */
 
 /* Low-level ecall: dest in a0, info in a1, first four MRs in a2-a5,
  * syscall number in a7. Returns the reply MessageInfo word. */
@@ -524,14 +525,14 @@ qsoe_riscv_asidpool_assign(seL4_CPtr asid_pool, seL4_CPtr vspace)
 }
 
 /*
- * LQ-private continuation of retired wire opcode 0x114.  The shared
- * <qsoe/tm_msgs.h> dropped TM_REQ_DUP_CAP in favor of the
- * ConnectServerInfo + ConnectAttach(index_hint) + _IO_DUP idiom (the
- * shape NQ implements); LQ's dup2 / fcntl(F_DUPFD) seam and the
- * taskman dispatcher still ride the cap-copy form.  The value stays
- * 0x114 -- the slot is documented as reserved in wire.h, so nothing
- * else can claim it.  Delete together with the migration.
+ * LQ-private wire opcode: the cap-copy form of dup2 / fcntl(F_DUPFD).
+ * The shared <qsoe/tm_msgs.h> uses the ConnectServerInfo +
+ * ConnectAttach(index_hint) + _IO_DUP idiom (the shape NQ implements);
+ * LQ's dup2 / fcntl seam and the taskman dispatcher still ride the
+ * cap-copy form.  Lives in the variant-private opcode space
+ * (>= TM_REQ_VARIANT_BASE) so it can never collide with a future shared
+ * opcode.  Delete together with the migration to the shared idiom.
  */
-#define TM_REQ_DUP_CAP  0x114
+#define TM_REQ_DUP_CAP  (TM_REQ_VARIANT_BASE + 0u)  /* LQ variant op 0 */
 
 #endif /* QSOE_INVOKE_H */

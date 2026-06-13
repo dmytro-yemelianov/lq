@@ -40,6 +40,13 @@
 #include <qsoe/sys_version.h>
 #include <cpio.h>
 
+/* LQ's variant-private wire opcodes must live in the variant space
+ * (>= TM_REQ_VARIANT_BASE) so they can never collide with a shared
+ * opcode -- see the rule in <qsoe/tm_msgs.h>. */
+_Static_assert(TM_REQ_DUP_CAP    >= TM_REQ_VARIANT_BASE &&
+               TM_REQ_DETACH_CAP >= TM_REQ_VARIANT_BASE,
+               "LQ variant opcode defined below TM_REQ_VARIANT_BASE");
+
 #ifdef TM_USE_INITRD_LOADER
 /* Vestigial FDT-driven initrd loader.  See sys/initrd.c top-of-file
  * note and taskman/Makefile.  Default build path embeds the

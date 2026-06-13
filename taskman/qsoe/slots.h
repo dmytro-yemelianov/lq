@@ -13,6 +13,8 @@
 #ifndef QSOE_SLOTS_H
 #define QSOE_SLOTS_H
 
+#include <qsoe/tm_msgs.h>   /* TM_REQ_VARIANT_BASE (variant-private opcodes) */
+
 #define QSOE_CAP_NULL          0
 #define QSOE_CAP_TASKMAN_EP    1   /* Send cap to taskman's primary endpoint */
 #define QSOE_CAP_OWN_UNTYPED   2   /* This process's untyped budget */
@@ -48,13 +50,14 @@
 
 #define QSOE_CAP_WELL_KNOWN_END 16 /* slots [2..15] reserved; dynamics start at 16 */
 
-/* LQ-only taskman opcode (occupies 0x118 in the shared <qsoe/tm_msgs.h>
- * opcode space).  Second half of POSIX close(2): after libc has sent
- * TM_REQ_CLOSE on the fd's bound cap (the resmgr notifies on it), libc
- * sends this to ask taskman to delete the cap from the caller's CSpace
- * and free the connection-table entry.  Lives here, not in the shared
- * <qsoe/tm_msgs.h>, because deleting a CSpace cap is a seL4 concept.
+/* LQ-private taskman opcode, in the variant opcode space (see
+ * TM_REQ_VARIANT_BASE in <qsoe/tm_msgs.h>).  Second half of POSIX
+ * close(2): after libc has sent TM_REQ_CLOSE on the fd's bound cap (the
+ * resmgr notifies on it), libc sends this to ask taskman to delete the
+ * cap from the caller's CSpace and free the connection-table entry.
+ * Lives here, not in the shared opcode table, because deleting a CSpace
+ * cap is a seL4 concept.
  *   MR0 = caller-CSpace slot of the cap being dropped. */
-#define TM_REQ_DETACH_CAP       0x118
+#define TM_REQ_DETACH_CAP       (TM_REQ_VARIANT_BASE + 1u)  /* LQ variant op 1 */
 
 #endif /* QSOE_SLOTS_H */
