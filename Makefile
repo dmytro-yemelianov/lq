@@ -112,8 +112,9 @@ RTLD_SO         := $(RTLD_BUILD)/ld-qsoe.so.1
 # board-specific knobs that differ between QEMU and real hardware.
 #
 #   make                 build for qemu-riscv-virt (default; ./emu.sh)
-#   make PLAT=hifive     build for the SiFive Unmatched / FU740
-#                        (seL4's `hifive` platform); deploy via boot/.
+#   make PLAT=hifive     build for the SiFive Unmatched / FU740 (seL4's
+#                        `hifive` platform); also emits the raw
+#                        build/qsoe-l-fu740.bin for U-Boot / mr-bml.
 #
 # Only two things actually differ per platform at this layer:
 #   * KernelPlatform passed to the seL4 cmake (+ QEMU_MEMORY, which is a
@@ -147,6 +148,15 @@ KERNEL_ELF  := $(BUILD)/kernel.elf
 
 IMAGE         := $(BUILD)/qsoe.elf
 TASKMAN_ELF   := $(BUILD)/taskman.elf
+
+# FU740 / SiFive Unmatched raw boot image.  The `hifive` PLAT links the
+# elfloader (IMAGE) at IMAGE_START_ADDR; objcopy strips the ELF wrapper
+# to a flat binary that U-Boot (`go`) or mr-bml can load + jump to at
+# that address.  The variant is spelled out in the name -- QSOE/L on
+# FU740 -- so a first-time user can tell what they are flashing at a
+# glance (plain "qsoe" is ambiguous between /L and /N).  Produced
+# automatically by the hifive build; see the `image:` rule below.
+FU740_BIN     := $(BUILD)/qsoe-l-fu740.bin
 
 # Userland module package -- the spawnable-binary archive that taskman
 # walks at runtime.  Lives in the sibling quser/ tree (one repo per QRV
@@ -250,6 +260,17 @@ EL_OBJS := \
 # userland CPIO that emu.sh hands to QEMU as initrd.
 all: prepare image modpkg
 image: $(IMAGE)
+
+# Selecting the FU740 platform also yields the raw qsoe-l-fu740.bin
+# (the v0.11 Kconfig will make this a CONFIG_KERNEL_VARIANT_FU740
+# selection; for now it keys off PLAT=hifive).
+ifeq ($(PLAT),hifive)
+image: $(FU740_BIN)
+endif
+
+$(FU740_BIN): $(IMAGE)
+	$(CROSS)objcopy -O binary $< $@
+	@echo "  BIN     $@  (QSOE/L on FU740; U-Boot/mr-bml load + go @ $(IMAGE_START_ADDR))"
 
 # ----------------------------------------------------------------------------
 # Prepare: shallow-clone seL4 + seL4_tools into ../sel4-bootstrap/.

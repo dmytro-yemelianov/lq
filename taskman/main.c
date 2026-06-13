@@ -841,7 +841,7 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
 static void print_banner(void)
 {
     unsigned long i;
-    const char banner_str[] = "QSOE/N Operating System version ";
+    const char banner_str[] = "QSOE/L Operating System version ";
     unsigned long n = sizeof(banner_str) + sizeof(QSOE_VSHORT);
 
     sel4_debug_puts("\n+");
