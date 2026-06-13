@@ -130,43 +130,81 @@ static unsigned ctz_ul(unsigned long x)
     return n;
 }
 
-/* MAP_PHYS — map a device's MMIO into the caller's VSpace at 4 KiB
- * granularity.  Find the device-UT containing `phys`, advance its
- * watermark to the sub-region offset (by burning intermediate
- * retypes), then retype 4 KiB device Pages and map them as L0 leaves.
- * Returns the base VA.
- *
- * Why 4 KiB and not Mega_Pages: device MMIO regions are page-sized,
- * and a 2 MiB device superpage store-access-faults on QEMU virt (the
- * first store to the mapped UART faulted with RISC-V scause 7).  So
- * each 2 MiB span of the chosen VA range gets a fresh L0 page table
- * hung under the child's (already installed) L1, and the device frames
- * map as 4 KiB L0 leaves. */
-static int mmap_phys(tm_process_t *proc, unsigned long phys,
-                     unsigned long len, unsigned long *out_vaddr)
+/* ---- MAP_PHYS device-frame registry (v0.11) ----------------------
+ * A device region is carved from its device-UT exactly ONCE.  A
+ * device-UT's free index only ever advances (and the watermark advance
+ * to reach a region's offset burns that space permanently), so a region
+ * can never be re-carved -- a second consumer of the same PA (e.g.
+ * sysinfo's ECAM walk after pci-server already mapped it) would fail.
+ * Instead we keep the carved frame caps here, UNMAPPED, and hand every
+ * requester -- including the first -- cnode_copy's of them mapped into
+ * its own VSpace (seL4 lets one frame map into many VSpaces via copied
+ * caps).  pci-server and sysinfo thus share the ECAM frames, and the
+ * carve (incl. the throwaway advance) is paid once. */
+#define TM_DEVMAP_MAX          16   /* distinct shared device regions */
+#define TM_DEVMAP_MAX_FRAMES   64   /* frames per region */
+
+typedef struct {
+    int           in_use;
+    unsigned long phys;        /* region base PA (granule-aligned) */
+    unsigned long len;         /* region length, granule-rounded */
+    unsigned long granule;     /* QSOE_MEGA_PAGE or QSOE_PAGE_4K */
+    int           nframes;
+    seL4_CPtr     frames[TM_DEVMAP_MAX_FRAMES];   /* carved, unmapped */
+} tm_devmap_t;
+static tm_devmap_t s_devmaps[TM_DEVMAP_MAX];
+
+/* A registered region that fully covers [phys, phys+len). */
+static tm_devmap_t *devmap_find(unsigned long phys, unsigned long len)
+{
+    for (int i = 0; i < TM_DEVMAP_MAX; ++i) {
+        tm_devmap_t *d = &s_devmaps[i];
+        if (d->in_use && d->phys <= phys && phys + len <= d->phys + d->len)
+            return d;
+    }
+    return 0;
+}
+
+/* Carve [phys, phys+len) from its device-UT into a fresh registry entry.
+ * Frames are retyped UNMAPPED; the watermark advance to the region's
+ * offset is paid here, once.  Granule is 2 MiB when phys + the UT offset
+ * are both 2 MiB-aligned (so a Mega_Page lands at the right PA) and the
+ * region spans at least 2 MiB, else 4 KiB (e.g. the ser8250 UART, which
+ * also store-faulted once as a 2 MiB superpage).  Returns the entry or 0
+ * (logging the specific failure). */
+static tm_devmap_t *devmap_carve(unsigned long phys, unsigned long len)
 {
     unsigned ut_sizebits = 0;
     unsigned long ut_offset = 0;
     seL4_CPtr ut = find_device_ut_containing(phys, len, &ut_sizebits,
                                               &ut_offset);
-    if (!ut) {
-        tm_err("tm_mmap_serve(PHYS): no matching device-UT");
-        return -ENODEV;
-    }
+    if (!ut) { tm_err("tm_mmap_serve(PHYS): no matching device-UT"); return 0; }
 
-    /* Require 4 KiB-page alignment for base; round length up to pages. */
-    if (phys & (QSOE_PAGE_4K - 1)) {
-        tm_err("tm_mmap_serve(PHYS): phys not page-aligned");
-        return -EINVAL;
-    }
-    len = (len + QSOE_PAGE_4K - 1) & ~(QSOE_PAGE_4K - 1);
     unsigned long ut_size = 1UL << ut_sizebits;
-    if (ut_offset + len > ut_size) return -EINVAL;
+    if (ut_offset + len > ut_size) {
+        tm_err("tm_mmap_serve(PHYS): region exceeds device-UT");
+        return 0;
+    }
 
-    /* Advance the kernel's watermark past `ut_offset` by retyping
-     * power-of-2 chunks (as throw-away child UTs) until we land at
-     * exactly `ut_offset`.  Greedy biggest-aligned-chunk first; since
-     * `phys` and the UT base are page-aligned, chunks are >= 4 KiB.    */
+    unsigned long granule =
+        ((phys & (QSOE_MEGA_PAGE - 1)) == 0 &&
+         (ut_offset & (QSOE_MEGA_PAGE - 1)) == 0 &&
+         len >= QSOE_MEGA_PAGE) ? QSOE_MEGA_PAGE : QSOE_PAGE_4K;
+    unsigned long rlen = (len + granule - 1) & ~(granule - 1);
+    int nframes = (int)(rlen / granule);
+    if (nframes > TM_DEVMAP_MAX_FRAMES) {
+        tm_err("tm_mmap_serve(PHYS): region too large (%d frames > %d)",
+               nframes, TM_DEVMAP_MAX_FRAMES);
+        return 0;
+    }
+
+    tm_devmap_t *d = 0;
+    for (int i = 0; i < TM_DEVMAP_MAX; ++i)
+        if (!s_devmaps[i].in_use) { d = &s_devmaps[i]; break; }
+    if (!d) { tm_err("tm_mmap_serve(PHYS): device-map registry full"); return 0; }
+
+    /* Advance the device-UT watermark to ut_offset with throwaway child
+     * untypeds (greedy biggest-aligned chunk; phys + UT base are aligned). */
     unsigned long advanced = 0;
     while (advanced < ut_offset) {
         unsigned long rem = ut_offset - advanced;
@@ -174,94 +212,113 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
         unsigned align_sb = ctz_ul(advanced ? advanced : ut_size);
         if (chunk_sb > align_sb) chunk_sb = align_sb;
         seL4_CPtr dummy = taskman_alloc_empty_slot();
-        if (!dummy) return -ENOMEM;
-        seL4_Word err = qsoe_untyped_retype(ut, seL4_UntypedObject,
-                                             chunk_sb, s_cnode_root,
-                                             0, 0, dummy, 1);
-        if (err) {
+        if (!dummy) return 0;
+        if (qsoe_untyped_retype(ut, seL4_UntypedObject, chunk_sb,
+                                s_cnode_root, 0, 0, dummy, 1) != 0) {
             tm_err("tm_mmap_serve(PHYS): skip-retype failed");
-            return -ENOMEM;
+            taskman_free_slot(dummy);
+            return 0;
         }
         advanced += 1UL << chunk_sb;
     }
 
-    /* Pick a fresh Mega-aligned VA base so each 2 MiB span lines up
-     * with an L1 slot (a Mega_Page leaf, or an L0 PT for 4 KiB frames). */
+    /* Retype the device frames, UNMAPPED, into the registry. */
+    seL4_Word type = (granule == QSOE_MEGA_PAGE) ? seL4_RISCV_Mega_Page
+                                                 : seL4_RISCV_4K_Page;
+    for (int i = 0; i < nframes; ++i) {
+        seL4_CPtr f = taskman_alloc_empty_slot();
+        if (!f) return 0;
+        if (qsoe_untyped_retype(ut, type, 0, s_cnode_root, 0, 0, f, 1) != 0) {
+            tm_err("tm_mmap_serve(PHYS): device frame retype failed");
+            taskman_free_slot(f);
+            return 0;
+        }
+        d->frames[i] = f;
+    }
+    d->phys = phys; d->len = rlen; d->granule = granule;
+    d->nframes = nframes; d->in_use = 1;
+    return d;
+}
+
+/* Map the registry region's frames covering [phys, phys+len) into proc's
+ * VSpace via cnode_copy (shared frame, independent mapping), recording
+ * each copy in proc->devframes[] for slot reclamation on exit.  Sets
+ * *out_vaddr to the VA of `phys` (its offset into the first frame). */
+static int devmap_map_into(tm_process_t *proc, tm_devmap_t *d,
+                           unsigned long phys, unsigned long len,
+                           unsigned long *out_vaddr)
+{
+    unsigned long g = d->granule;
+    int first = (int)((phys - d->phys) / g);
+    int last  = (int)((phys + len - d->phys + g - 1) / g);   /* exclusive */
+    if (last > d->nframes) last = d->nframes;
+
+    /* 2 MiB-aligned VA base: a Mega_Page lands on an L1 slot; a 4 KiB run
+     * hangs a fresh L0 PT per 2 MiB. */
     unsigned long base_va = (proc->mmap_top + QSOE_MEGA_PAGE - 1) &
                             ~(QSOE_MEGA_PAGE - 1);
-    unsigned long off = 0;   /* bytes mapped so far */
 
-    /* Map the 2 MiB-aligned bulk as Mega_Page device leaves -- ONE root
-     * CNode slot per 2 MiB instead of per 4 KiB.  A 16 MiB window (the
-     * PCI ECAM) is 4096 4K frames = 4096 slots, which overflows taskman's
-     * 4096-slot root CNode mid-map (seL4 RangeError); 8 Mega_Pages do not.
-     * Gated on phys AND the UT watermark being 2 MiB-aligned so the frame
-     * lands at the right PA; the megapage VA is 2 MiB-aligned by
-     * construction.  A sub-2 MiB or unaligned device block (e.g. the
-     * ser8250 UART, which once store-faulted as a 2 MiB superpage) keeps
-     * 4 KiB granularity via the tail loop below. */
-    if ((phys & (QSOE_MEGA_PAGE - 1)) == 0 &&
-        (ut_offset & (QSOE_MEGA_PAGE - 1)) == 0) {
-        while (len - off >= QSOE_MEGA_PAGE) {
-            unsigned long va = base_va + off;
-            seL4_CPtr frame = taskman_alloc_empty_slot();
-            if (!frame) return -ENOMEM;
-            seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_Mega_Page, 0,
-                                                 s_cnode_root, 0, 0, frame, 1);
-            if (err) {
-                tm_err("tm_mmap_serve(PHYS): Mega device retype failed");
-                return -ENOMEM;
-            }
-            err = qsoe_riscv_page_map(frame, proc->vspace, va,
-                                      QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-            if (err) {
-                tm_err("tm_mmap_serve(PHYS): Mega device Page_Map failed");
-                return -ENOMEM;
-            }
-            off += QSOE_MEGA_PAGE;
+    for (int f = first; f < last; ++f) {
+        unsigned long va = base_va + (unsigned long)(f - first) * g;
+
+        if (proc->devframe_count >= TM_MAX_DEVFRAMES) {
+            tm_err("tm_mmap_serve(PHYS): pid %d devframe tracker full (cap=%d)",
+                   (long)proc->pid, TM_MAX_DEVFRAMES);
+            return -ENOMEM;
         }
-    }
 
-    /* 4 KiB tail: the unaligned remainder, or the whole region when it is
-     * not 2 MiB-mappable.  Hang a fresh L0 PT under the child's L1 at each
-     * 2 MiB boundary so the device frames have a leaf level. */
-    for (; off < len; off += QSOE_PAGE_4K) {
-        unsigned long va = base_va + off;
-
-        if ((va & (QSOE_MEGA_PAGE - 1)) == 0) {
+        if (g == QSOE_PAGE_4K && (va & (QSOE_MEGA_PAGE - 1)) == 0) {
             seL4_CPtr l0 = taskman_alloc_and_retype(
                                seL4_RISCV_PageTableObject, 0);
-            if (!l0) {
-                tm_err("tm_mmap_serve(PHYS): L0 PT alloc failed");
-                return -ENOMEM;
-            }
-            seL4_Word e = qsoe_riscv_pagetable_map(l0, proc->vspace, va,
-                                                   QSOE_VM_ATTR_DEFAULT);
-            if (e) {
+            if (!l0) { tm_err("tm_mmap_serve(PHYS): L0 PT alloc failed"); return -ENOMEM; }
+            if (qsoe_riscv_pagetable_map(l0, proc->vspace, va,
+                                         QSOE_VM_ATTR_DEFAULT) != 0) {
                 tm_err("tm_mmap_serve(PHYS): L0 PageTable_Map failed");
                 return -ENOMEM;
             }
         }
 
-        seL4_CPtr page = taskman_alloc_empty_slot();
-        if (!page) return -ENOMEM;
-        seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_4K_Page, 0,
-                                             s_cnode_root, 0, 0, page, 1);
-        if (err) {
-            tm_err("tm_mmap_serve(PHYS): 4K device retype failed");
+        seL4_CPtr cp = taskman_alloc_empty_slot();
+        if (!cp) return -ENOMEM;
+        if (qsoe_cnode_copy(s_cnode_root, cp, TM_DEPTH_TASKMAN,
+                            s_cnode_root, d->frames[f], TM_DEPTH_TASKMAN,
+                            QSOE_RIGHTS_ALL) != 0) {
+            tm_err("tm_mmap_serve(PHYS): device frame cnode_copy failed");
+            taskman_free_slot(cp);
             return -ENOMEM;
         }
-        err = qsoe_riscv_page_map(page, proc->vspace, va,
-                                   QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-        if (err) {
-            tm_err("tm_mmap_serve(PHYS): 4K device Page_Map failed");
+        if (qsoe_riscv_page_map(cp, proc->vspace, va,
+                                QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT) != 0) {
+            tm_err("tm_mmap_serve(PHYS): device frame Page_Map failed");
+            qsoe_cnode_delete(s_cnode_root, cp, TM_DEPTH_TASKMAN);
+            taskman_free_slot(cp);
             return -ENOMEM;
         }
+        proc->devframes[proc->devframe_count++] = cp;
     }
 
-    proc->mmap_top = base_va + len;
-    *out_vaddr = base_va;
+    proc->mmap_top = base_va + (unsigned long)(last - first) * g;
+    *out_vaddr = base_va + ((phys - d->phys) - (unsigned long)first * g);
     return 0;
+}
+
+/* MAP_PHYS -- map device MMIO into the caller's VSpace.  Find or carve
+ * the region in the device-frame registry, then map shared copies in. */
+static int mmap_phys(tm_process_t *proc, unsigned long phys,
+                     unsigned long len, unsigned long *out_vaddr)
+{
+    if (phys & (QSOE_PAGE_4K - 1)) {
+        tm_err("tm_mmap_serve(PHYS): phys not page-aligned");
+        return -EINVAL;
+    }
+    len = (len + QSOE_PAGE_4K - 1) & ~(QSOE_PAGE_4K - 1);
+
+    tm_devmap_t *d = devmap_find(phys, len);
+    if (!d) {
+        d = devmap_carve(phys, len);
+        if (!d) return -ENOMEM;   /* carve logged the specific reason */
+    }
+    return devmap_map_into(proc, d, phys, len, out_vaddr);
 }
 
 int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long flags,

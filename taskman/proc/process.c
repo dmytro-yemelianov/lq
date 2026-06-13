@@ -258,6 +258,7 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
          * this slot parked were destroyed with its pp_ut blocks, so
          * those caps are stale -- never carry them across a reuse. */
         g_processes[i].mmap_free_count = 0;
+        g_processes[i].devframe_count  = 0;
         /* Inherit parent's cred at spawn.  main.c's PROCESS_CREATE
          * handler calls tm_process_set_parent (and we'd ideally
          * inherit cred from there); until QSOE has multi-user state
@@ -889,6 +890,17 @@ int tm_process_terminate(pid_t target, int status)
         if (p->mmap_free[i]) taskman_free_slot(p->mmap_free[i]);
     }
     p->mmap_free_count = 0;
+
+    /* 8c. MAP_PHYS device-frame copies.  The VSpace revoke above already
+     *     unmapped them; delete the copy cap (the shared frame survives
+     *     in the device-map registry) and recycle the root slot. */
+    for (int i = 0; i < p->devframe_count; ++i) {
+        if (p->devframes[i]) {
+            qsoe_cnode_delete(s_cnode_root, p->devframes[i], TM_DEPTH_TASKMAN);
+            taskman_free_slot(p->devframes[i]);
+        }
+    }
+    p->devframe_count = 0;
 
     /* 9. Per-process untyped blocks.  Revoke each (destroying every
      *    object still retyped from it -- image frames, page tables,

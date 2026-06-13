@@ -55,6 +55,10 @@
  * delete-and-leak fallback kicks in. */
 #define TM_MMAP_FREE_MAX    16
 
+/* Per-process cap on cnode_copy'd device frames (MAP_PHYS shares).  The
+ * PCI ECAM is 8 Mega_Pages; a driver also maps its BAR(s).  32 is ample. */
+#define TM_MAX_DEVFRAMES    32
+
 /* Per-process object CNode (v0.10 slot reclamation).
  *
  * taskman holds a cap to every object it retypes for a process; in a
@@ -156,6 +160,17 @@ typedef struct {
      * process's live+free megapages are bounded by its working set). */
     seL4_CPtr mmap_free[TM_MMAP_FREE_MAX];
     int       mmap_free_count;
+
+    /* v0.11 device-frame copies for MAP_PHYS.  A shared device region
+     * (e.g. the PCI ECAM) is carved ONCE into taskman's device-map
+     * registry; each requester gets cnode_copy's of those frame caps
+     * mapped into its own VSpace.  These copy caps live in taskman's
+     * root CNode and must be deleted on exit (the underlying frame
+     * survives -- it is the registry's, shared with other mappers).
+     * Kept apart from mmap[] so the anon-megapage munmap/recycle path
+     * never mistakes a shared device frame for reclaimable RAM. */
+    seL4_CPtr devframes[TM_MAX_DEVFRAMES];
+    int       devframe_count;
 
     /* v0.7 cred — inherited from parent at spawn, settable via
      * setuid/setgid later. */
