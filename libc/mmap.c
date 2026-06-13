@@ -24,12 +24,9 @@
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
 
-/* Taskman's wire flag for a raw physical mapping (mirrors
- * lq/taskman/mem/mem.h TM_MMAP_FLAG_PHYS).  Distinct from the POSIX
- * MAP_PHYS flag the caller passes (<sys/mman.h>, 0x10000): the libc
- * seam translates one to the other.  Mismatching them is exactly why
- * every MAP_PHYS request fell through to the anonymous (zero-RAM) path. */
-#define TM_MMAP_FLAG_PHYS  0x1u
+/* TM_MMAP_FLAG_PHYS is the shared wire flag from <qsoe/tm_msgs.h> (now
+ * equal to POSIX MAP_PHYS, so this assignment is effectively a pass-
+ * through; kept explicit so the wire flag has a single named source). */
 
 void *__mmap(void *start, size_t length, int prot, int flags, int fd, off_t off)
 {

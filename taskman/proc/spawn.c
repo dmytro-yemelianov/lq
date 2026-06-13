@@ -15,6 +15,8 @@
 #include "../path/pathmgr.h"
 #include "../path/cpiofs.h"
 #include <qsoe/slots.h>
+#include <qsoe/sysmap.h>
+#include "../sys/sysmap.h"
 #include <tm_elf.h>
 #include <tm_reloc.h>
 #include <tm_script.h>
@@ -99,11 +101,12 @@ struct elf64_phdr {
  * (v0.5.1+) gets its own 2 MiB Mega_Page at the next L1 slot, mapped
  * at 0x800000. Worker thread regions sit way out at 0x40000000+. */
 #define CHILD_IMAGE_BASE   0x10000UL   /* matches tester's linker script */
-#define CHILD_TCB_BASE     0x1FB000UL  /* 1 page TLS/TCB block (qsoe_tcb_t) */
-#define CHILD_STACK_BASE   0x1FC000UL  /* 2 stack pages: [0x1FC000, 0x1FE000) */
-#define CHILD_STACK_TOP    0x1FE000UL  /* sp starts here, grows down */
+#define CHILD_STACK_BASE   0x1F9000UL  /* 2 stack pages: [0x1F9000, 0x1FB000) */
+#define CHILD_STACK_TOP    0x1FB000UL  /* sp starts here, grows down */
 #define CHILD_STACK_PAGES  2
-#define CHILD_IPC_BUFFER   0x1FE000UL  /* one page, just above the stack */
+#define CHILD_TCB_BASE     0x1FB000UL  /* 1 page TLS/TCB block (qsoe_tcb_t) */
+#define CHILD_SYSMAP_BASE  QSOE_SYSMAP_VA  /* read-only 'PSYS' page @0x1FC000 */
+#define CHILD_IPC_BUFFER   0x1FE000UL  /* seL4 IPC buffer (fixed; libc seam) */
 
 /* seL4 priority for spawned user processes — one below taskman so the
  * server always preempts.  (seL4 priorities run 0..255; taskman, the
@@ -367,6 +370,29 @@ typedef struct {
 static spawn_frame_t s_frames[SPAWN_MAX_FRAMES];
 static int           s_frame_count;
 
+/* Per-spawn page-table caps (child image L1/L0, and the dl L1 + libc/
+ * rtld L0 for dynamic binaries).  Like the image frames, the PT OBJECTS
+ * die with Revoke(pput) on exit, but their root-CNode SLOTS must be
+ * reclaimed -- moved into the objcnode at the end of spawn alongside
+ * s_frames[].  Kept separate from s_frames[] because the reloc pass
+ * looks those up by VA, whereas PTs have no frame VA.  Without this the
+ * ~4 PT slots per spawn leak and the root CNode fills after a few
+ * hundred spawns. */
+#define SPAWN_MAX_PTS 8
+static seL4_CPtr s_pt_slots[SPAWN_MAX_PTS];
+static int       s_pt_count;
+
+static int spawn_record_pt(seL4_CPtr pt)
+{
+    if (!pt) return 0;
+    if (s_pt_count >= SPAWN_MAX_PTS) {
+        tm_err("spawn: PT slot table overflow (>%d)", SPAWN_MAX_PTS);
+        return -ENOMEM;
+    }
+    s_pt_slots[s_pt_count++] = pt;
+    return 0;
+}
+
 static int spawn_record_frame(unsigned long va_page, seL4_CPtr frame)
 {
     if (s_frame_count >= SPAWN_MAX_FRAMES) {
@@ -513,6 +539,33 @@ int tm_spawn_read_args(tm_process_t *proc, unsigned long args_va,
     return 0;
 }
 
+/* Zero a free (currently-unmapped) Mega_Page frame, so a megapage
+ * recycled by tm_munmap_serve preserves MAP_ANONYMOUS's zero-fill
+ * guarantee (a freshly-retyped frame is zeroed by seL4, a reused one
+ * is not).  The frame is mapped alone into taskman's vspace at the
+ * Mega_Page scratch VA -- no cnode_copy, unlike tm_spawn_read_args,
+ * because a free frame is not mapped in any child vspace -- memset to
+ * zero, then unmapped, leaving it ready to Page_Map into the caller.
+ * Returns 0 on success, negative errno on failure. */
+int tm_zero_megaframe(seL4_CPtr frame)
+{
+    if (!frame) return -EINVAL;
+    if (ensure_scratch_pt() != 0) return -ENOMEM;
+
+    seL4_Word err = qsoe_riscv_page_map(frame, seL4_CapInitThreadVSpace,
+                                        TM_SCRATCH_MEGA_VADDR,
+                                        QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
+    if (err) {
+        tm_err("tm_zero_megaframe: Page_Map failed err=%u",
+               (unsigned long)err);
+        return -ENOMEM;
+    }
+    qmemset((void *)TM_SCRATCH_MEGA_VADDR, 0, QSOE_MEGA_PAGE);
+    __asm__ volatile ("fence rw, rw" ::: "memory");
+    qsoe_riscv_page_unmap(frame);
+    return 0;
+}
+
 /* Walk PT_LOAD segments of `elf_blob` and map each page into the
  * child VSpace at (load_offset + p_vaddr).  Pages allocated from
  * taskman's untyped via alloc_object; bytes copied through
@@ -595,6 +648,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     /* Reset per-spawn state.  Frame table is rebuilt as PT_LOAD pages
      * are mapped; the reloc walker consults it to find write targets. */
     s_frame_count = 0;
+    s_pt_count    = 0;
 
     /* The L1 PT covering [0x40000000, 0x80000000).  In dyn-linked
      * spawns we install it below as `dl_l1` (so libc.so + rtld + the
@@ -714,11 +768,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    intermediate level. The kernel decides the level from vaddr. */
     seL4_CPtr l1_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
     if (!l1_pt) return -ENOMEM;
+    if (spawn_record_pt(l1_pt) != 0) return -ENOMEM;
     err = qsoe_riscv_pagetable_map(l1_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
     if (err) { tm_err("spawn: L1 PageTable_Map failed"); return -ENOMEM; }
 
     seL4_CPtr l0_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
     if (!l0_pt) return -ENOMEM;
+    if (spawn_record_pt(l0_pt) != 0) return -ENOMEM;
     err = qsoe_riscv_pagetable_map(l0_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
     if (err) { tm_err("spawn: L0 PageTable_Map failed"); return -ENOMEM; }
 
@@ -738,7 +794,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *
      *     Layout in the child VSpace:
      *       [0x10000 .. 0x46000)   main image (qsh ET_EXEC link VA)
-     *       [0x1FC000 .. 0x1FE000) stack
+     *       [0x1F9000 .. 0x1FB000) stack
+     *       [0x1FB000 .. 0x1FC000) TLS/TCB page
+     *       [0x1FC000 .. 0x1FD000) sysmap (read-only PSYS, QSOE_SYSMAP_VA)
      *       [0x1FE000 .. 0x1FF000) IPC buffer
      *       [0x60000000 .. +2 MiB) libc.so   -- DL_LIBC_LOAD_VA contract
      *       [0x70000000 .. +2 MiB) rtld      -- private, told via AT_BASE
@@ -796,14 +854,20 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * second L1 PT into the same already-populated L2[1] slot. */
         workers_l1_cap = dl_l1;
 
+        /* dl_l1 above is NOT recorded for objcnode-move: it doubles as
+         * workers_l1_cap -> workers_l1_pt, whose slot teardown step 7
+         * already frees.  The two L0s below have no such alias, so their
+         * slots must be reclaimed here. */
         seL4_CPtr libc_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
         if (!libc_l0) return -ENOMEM;
+        if (spawn_record_pt(libc_l0) != 0) return -ENOMEM;
         err = qsoe_riscv_pagetable_map(libc_l0, vspace, DL_LIBC_LOAD_VA,
                                         QSOE_VM_ATTR_DEFAULT);
         if (err) { tm_err("spawn: libc L0 PT map failed"); return -ENOMEM; }
 
         seL4_CPtr rtld_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
         if (!rtld_l0) return -ENOMEM;
+        if (spawn_record_pt(rtld_l0) != 0) return -ENOMEM;
         err = qsoe_riscv_pagetable_map(rtld_l0, vspace, DL_RTLD_LOAD_VA,
                                         QSOE_VM_ATTR_DEFAULT);
         if (err) { tm_err("spawn: rtld L0 PT map failed"); return -ENOMEM; }
@@ -962,6 +1026,32 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                               QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
     if (err) { tm_err("spawn: tcb_frame Page_Map failed"); return -ENOMEM; }
     if (spawn_record_frame(CHILD_TCB_BASE, tcb_frame) != 0) return -ENOMEM;
+
+    /* 4c. Sysmap page -- one READ-ONLY 'PSYS' page at QSOE_SYSMAP_VA
+     *     carrying the platform catalog (mtime freq, cpu count, PCI
+     *     ECAM + MMIO window).  The shared libc hwi_init() reads it
+     *     with no IPC, exactly as on NQ where the Skimmer kernel maps
+     *     it in the boot PT.  Built once at boot by tm_sysmap_build();
+     *     each child gets its own copy mapped read-only.  Absent only if
+     *     the FDT carried no usable platform info -- then hwi_init falls
+     *     back to its built-in defaults, as before. */
+    {
+        const void *smp = 0;
+        if (tm_sysmap_get(&smp, 0) == 0 && smp) {
+            seL4_CPtr smap_frame = alloc_object(seL4_RISCV_4K_Page, 0);
+            if (!smap_frame) return -ENOMEM;
+            err = scratch_map(smap_frame);
+            if (err) return -ENOMEM;
+            qmemcpy((void *)TM_SCRATCH_VADDR, smp, 0x1000);
+            err = scratch_unmap(smap_frame);
+            if (err) return -ENOMEM;
+            err = qsoe_riscv_page_map(smap_frame, vspace, CHILD_SYSMAP_BASE,
+                                      QSOE_RIGHTS_RO, QSOE_VM_ATTR_DEFAULT);
+            if (err) { tm_err("spawn: sysmap Page_Map failed"); return -ENOMEM; }
+            if (spawn_record_frame(CHILD_SYSMAP_BASE, smap_frame) != 0)
+                return -ENOMEM;
+        }
+    }
 
     /* v0.4.4: allocate the stack region below the IPC buffer.
      * CHILD_STACK_PAGES pages cover [CHILD_STACK_BASE, CHILD_STACK_TOP).
@@ -1235,6 +1325,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     {
         tm_process_t *op = tm_process_lookup(pid);
         if (op) {
+            op->sc = sc;   /* main-thread SC slot, freed in teardown */
             seL4_CPtr objc = alloc_object(seL4_CapTableObject, TM_OBJCNODE_RADIX);
             if (!objc) { tm_err("spawn: objcnode alloc failed"); return -ENOMEM; }
             op->objcnode      = objc;
@@ -1248,6 +1339,24 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                                  TM_DEPTH_TASKMAN);
                 if (merr) {
                     tm_err("spawn: objcnode move failed err=%u",
+                           (unsigned long)merr);
+                    return -ENOMEM;
+                }
+                op->objcnode_next++;
+                taskman_free_slot(src);
+            }
+            /* Same for the per-spawn page-table caps: relocate into the
+             * objcnode (the mapping lives in the parent PT, not the cap,
+             * so the move is transparent) and reclaim their root slots. */
+            for (int i = 0; i < s_pt_count; ++i) {
+                seL4_CPtr src  = s_pt_slots[i];
+                seL4_Word merr = qsoe_cnode_move(objc,
+                                                 (seL4_Word)op->objcnode_next,
+                                                 TM_OBJCNODE_RADIX,
+                                                 s_cnode_root, src,
+                                                 TM_DEPTH_TASKMAN);
+                if (merr) {
+                    tm_err("spawn: objcnode PT move failed err=%u",
                            (unsigned long)merr);
                     return -ENOMEM;
                 }

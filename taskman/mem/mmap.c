@@ -72,7 +72,23 @@ static int mmap_anonymous(tm_process_t *proc, unsigned long len,
     unsigned long pages = bytes / QSOE_MEGA_PAGE;
 
     for (unsigned long i = 0; i < pages; ++i) {
-        seL4_CPtr frame = taskman_alloc_and_retype(seL4_RISCV_Mega_Page, 0);
+        /* Prefer a frame recycled by tm_munmap_serve over carving a
+         * fresh one: deleting a Mega_Page cap never returns its 2 MiB
+         * to the parent pp_ut untyped (only Revoke at exit does), so
+         * without reuse a long-lived mmap/munmap churner leaks the
+         * board.  A recycled frame keeps its old contents, so zero it
+         * to honor MAP_ANONYMOUS. */
+        seL4_CPtr frame;
+        if (proc->mmap_free_count > 0) {
+            frame = proc->mmap_free[--proc->mmap_free_count];
+            if (tm_zero_megaframe(frame) != 0) {
+                proc->mmap_free[proc->mmap_free_count++] = frame;  /* put back */
+                tm_err("tm_mmap_serve: zeroing recycled Mega_Page failed");
+                return -ENOMEM;
+            }
+        } else {
+            frame = taskman_alloc_and_retype(seL4_RISCV_Mega_Page, 0);
+        }
         if (!frame) {
             tm_err("tm_mmap_serve: Mega_Page alloc failed");
             return -ENOMEM;
@@ -144,7 +160,6 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
         return -EINVAL;
     }
     len = (len + QSOE_PAGE_4K - 1) & ~(QSOE_PAGE_4K - 1);
-    unsigned long npages  = len / QSOE_PAGE_4K;
     unsigned long ut_size = 1UL << ut_sizebits;
     if (ut_offset + len > ut_size) return -EINVAL;
 
@@ -171,16 +186,48 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
     }
 
     /* Pick a fresh Mega-aligned VA base so each 2 MiB span lines up
-     * with an L1 slot we can hang an L0 PT under. */
+     * with an L1 slot (a Mega_Page leaf, or an L0 PT for 4 KiB frames). */
     unsigned long base_va = (proc->mmap_top + QSOE_MEGA_PAGE - 1) &
                             ~(QSOE_MEGA_PAGE - 1);
+    unsigned long off = 0;   /* bytes mapped so far */
 
-    for (unsigned long i = 0; i < npages; ++i) {
-        unsigned long va = base_va + i * QSOE_PAGE_4K;
+    /* Map the 2 MiB-aligned bulk as Mega_Page device leaves -- ONE root
+     * CNode slot per 2 MiB instead of per 4 KiB.  A 16 MiB window (the
+     * PCI ECAM) is 4096 4K frames = 4096 slots, which overflows taskman's
+     * 4096-slot root CNode mid-map (seL4 RangeError); 8 Mega_Pages do not.
+     * Gated on phys AND the UT watermark being 2 MiB-aligned so the frame
+     * lands at the right PA; the megapage VA is 2 MiB-aligned by
+     * construction.  A sub-2 MiB or unaligned device block (e.g. the
+     * ser8250 UART, which once store-faulted as a 2 MiB superpage) keeps
+     * 4 KiB granularity via the tail loop below. */
+    if ((phys & (QSOE_MEGA_PAGE - 1)) == 0 &&
+        (ut_offset & (QSOE_MEGA_PAGE - 1)) == 0) {
+        while (len - off >= QSOE_MEGA_PAGE) {
+            unsigned long va = base_va + off;
+            seL4_CPtr frame = taskman_alloc_empty_slot();
+            if (!frame) return -ENOMEM;
+            seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_Mega_Page, 0,
+                                                 s_cnode_root, 0, 0, frame, 1);
+            if (err) {
+                tm_err("tm_mmap_serve(PHYS): Mega device retype failed");
+                return -ENOMEM;
+            }
+            err = qsoe_riscv_page_map(frame, proc->vspace, va,
+                                      QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
+            if (err) {
+                tm_err("tm_mmap_serve(PHYS): Mega device Page_Map failed");
+                return -ENOMEM;
+            }
+            off += QSOE_MEGA_PAGE;
+        }
+    }
 
-        /* At each 2 MiB boundary, hang a fresh RAM-backed L0 PT (from
-         * taskman's own untyped pool) under the child's already-present
-         * L1, so the 4 KiB device frames below have a leaf level. */
+    /* 4 KiB tail: the unaligned remainder, or the whole region when it is
+     * not 2 MiB-mappable.  Hang a fresh L0 PT under the child's L1 at each
+     * 2 MiB boundary so the device frames have a leaf level. */
+    for (; off < len; off += QSOE_PAGE_4K) {
+        unsigned long va = base_va + off;
+
         if ((va & (QSOE_MEGA_PAGE - 1)) == 0) {
             seL4_CPtr l0 = taskman_alloc_and_retype(
                                seL4_RISCV_PageTableObject, 0);
@@ -196,8 +243,6 @@ static int mmap_phys(tm_process_t *proc, unsigned long phys,
             }
         }
 
-        /* Retype the next 4 KiB device frame from the device-UT and map
-         * it as an L0 leaf at `va`. */
         seL4_CPtr page = taskman_alloc_empty_slot();
         if (!page) return -ENOMEM;
         seL4_Word err = qsoe_untyped_retype(ut, seL4_RISCV_4K_Page, 0,
@@ -279,12 +324,35 @@ int tm_munmap_serve(pid_t caller, unsigned long vaddr, unsigned long len)
         seL4_CPtr     frm = proc->mmap[idx].frame;
 
         (void) qsoe_riscv_page_unmap(frm);
-        (void) qsoe_cnode_delete(s_cnode_root, frm, TM_DEPTH_TASKMAN);
-        taskman_free_slot(frm);
+        /* Park the still-valid frame cap for reuse rather than deleting
+         * it: the pp_ut allocator can only return this 2 MiB to its
+         * parent untyped via a whole-block Revoke at process exit, so a
+         * deleted frame's space would be lost until then.  The next mmap
+         * re-maps + zeroes it.  On free-list overflow, fall back to the
+         * old delete path (that one frame's 2 MiB stays charged to the
+         * block until exit -- bounded by TM_MMAP_FREE_MAX, and rare). */
+        if (proc->mmap_free_count < TM_MMAP_FREE_MAX) {
+            proc->mmap_free[proc->mmap_free_count++] = frm;
+        } else {
+            (void) qsoe_cnode_delete(s_cnode_root, frm, TM_DEPTH_TASKMAN);
+            taskman_free_slot(frm);
+        }
 
         int last = proc->mmap_count - 1;
         if (idx != last) proc->mmap[idx] = proc->mmap[last];
         proc->mmap_count = last;
+    }
+
+    /* Rewind the VA cursor when the freed range sat at the top of the
+     * mmap region -- the common LIFO case, notably qsh's args page
+     * (mmap then immediate munmap on every posix_spawn).  Recycling the
+     * frames (above) reclaims the RAM, but mmap_top is bump-only: without
+     * this rewind it marches ~2 MiB per spawn into the workers/libc.so
+     * region (~0x40000000) after a few hundred spawns, and the next
+     * Page_Map there fails.  Non-top frees leave a VA hole (reclaimed at
+     * exit); only the contiguous-top case can rewind safely. */
+    if (vaddr + bytes == proc->mmap_top) {
+        proc->mmap_top = vaddr;
     }
     return 0;
 }

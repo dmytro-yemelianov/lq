@@ -191,6 +191,7 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     g_processes[0].cnode          = cnode_root;
     g_processes[0].next_slot      = first_free;
     g_processes[0].tcb            = seL4_CapInitThreadTCB;
+    g_processes[0].sc             = 0;
     g_processes[0].vspace         = seL4_CapInitThreadVSpace;
     g_processes[0].untyped_budget = 0;
     g_processes[0].workers_l1_pt  = 0;
@@ -240,6 +241,7 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].cnode          = cnode;
         g_processes[i].next_slot      = first_free_slot;
         g_processes[i].tcb            = tcb;
+        g_processes[i].sc             = 0;
         g_processes[i].vspace         = vspace;
         g_processes[i].untyped_budget = 0;
         g_processes[i].workers_l1_pt  = 0;
@@ -251,6 +253,11 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].waiter_reply_slot = 0;
         g_processes[i].signal_chid    = 0;
         g_processes[i].mmap_top       = QSOE_MMAP_BASE;
+        g_processes[i].mmap_count      = 0;
+        /* Recycle list starts empty: any frames the previous owner of
+         * this slot parked were destroyed with its pp_ut blocks, so
+         * those caps are stale -- never carry them across a reuse. */
+        g_processes[i].mmap_free_count = 0;
         /* Inherit parent's cred at spawn.  main.c's PROCESS_CREATE
          * handler calls tm_process_set_parent (and we'd ideally
          * inherit cred from there); until QSOE has multi-user state
@@ -775,6 +782,13 @@ int tm_process_terminate(pid_t target, int status)
             qsoe_cnode_revoke(s_cnode_root, gthreads[i].ntfn_master, TM_DEPTH_TASKMAN);
             qsoe_cnode_delete(s_cnode_root, gthreads[i].ntfn_master, TM_DEPTH_TASKMAN);
             taskman_free_slot(gthreads[i].ntfn_master);
+            /* SC object dies with Revoke(pput); reclaim its root slot.
+             * TCB already deleted above, so the SC is unbound. */
+            if (gthreads[i].sc) {
+                qsoe_cnode_delete(s_cnode_root, gthreads[i].sc, TM_DEPTH_TASKMAN);
+                taskman_free_slot(gthreads[i].sc);
+                gthreads[i].sc = 0;
+            }
             gthreads[i].in_use = 0;
         }
     }
@@ -786,6 +800,12 @@ int tm_process_terminate(pid_t target, int status)
                 qsoe_cnode_revoke(s_cnode_root, gchannels[i].ntfn_master, TM_DEPTH_TASKMAN);
                 qsoe_cnode_delete(s_cnode_root, gchannels[i].ntfn_master, TM_DEPTH_TASKMAN);
                 taskman_free_slot(gchannels[i].ntfn_master);
+                /* ntfn_sig is a minted child of ntfn_master, so the
+                 * revoke above already destroyed its cap -- but its root
+                 * slot must still be returned, else every channel leaks
+                 * one slot. */
+                if (gchannels[i].ntfn_sig)
+                    taskman_free_slot(gchannels[i].ntfn_sig);
                 gchannels[i].ntfn_master = 0;
                 gchannels[i].ntfn_sig = 0;
             }
@@ -815,6 +835,14 @@ int tm_process_terminate(pid_t target, int status)
     qsoe_cnode_revoke(s_cnode_root, p->tcb, TM_DEPTH_TASKMAN);
     qsoe_cnode_delete(s_cnode_root, p->tcb, TM_DEPTH_TASKMAN);
     taskman_free_slot(p->tcb);
+
+    /* 4a. Main-thread SC.  Object dies with Revoke(pput); reclaim its
+     *     root slot now that the TCB it was bound to is gone. */
+    if (p->sc) {
+        qsoe_cnode_delete(s_cnode_root, p->sc, TM_DEPTH_TASKMAN);
+        taskman_free_slot(p->sc);
+        p->sc = 0;
+    }
 
     /* 4b. Fault-handler cap -- the TCB referenced it; safe to drop now. */
     if (p->fault_ep) {
@@ -850,12 +878,17 @@ int tm_process_terminate(pid_t target, int status)
         taskman_free_slot(p->untyped_budget);
     }
 
-    /* 8b. mmap megapage frame caps.  Their objects die with Revoke(pput)
+    /* 8b. mmap megapage frame caps -- both the live mappings and the
+     *     parked recycle list.  Their objects die with Revoke(pput)
      *     below; recycle the root-CNode slots they occupied. */
     for (int i = 0; i < p->mmap_count; ++i) {
         if (p->mmap[i].frame) taskman_free_slot(p->mmap[i].frame);
     }
     p->mmap_count = 0;
+    for (int i = 0; i < p->mmap_free_count; ++i) {
+        if (p->mmap_free[i]) taskman_free_slot(p->mmap_free[i]);
+    }
+    p->mmap_free_count = 0;
 
     /* 9. Per-process untyped blocks.  Revoke each (destroying every
      *    object still retyped from it -- image frames, page tables,

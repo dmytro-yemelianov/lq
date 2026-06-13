@@ -30,6 +30,7 @@
 #include "sys/platform.h"
 #include "sys/rsrcdb.h"
 #include "sys/syscfg.h"
+#include "sys/sysmap.h"
 #include "sys/sync.h"
 
 #include <sys/qsoe.h>
@@ -918,6 +919,11 @@ int main(seL4_BootInfo *bi)
     const void *dtb = find_fdt_in_extra_bi(bi, &dtb_size);
     if (dtb && tm_syscfg_build(dtb) == 0) {
         tm_info("syscfg built from FDT");
+        /* Translate the syscfg data into the 'PSYS' sysmap page that
+         * proc/spawn maps read-only at QSOE_SYSMAP_VA in every child,
+         * so the shared libc hwi_init() works on LQ exactly as on NQ. */
+        if (tm_sysmap_build() == 0)
+            tm_info("sysmap page built");
     } else {
         tm_info("no FDT in extra-BI; syscfg falls back");
     }

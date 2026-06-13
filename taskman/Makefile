@@ -212,6 +212,7 @@ TASKMAN_OBJS := \
     $(OBJDIR)/sys/rsrcdb.o \
     $(OBJDIR)/sys/sync.o \
     $(OBJDIR)/sys/syscfg.o \
+    $(OBJDIR)/sys/sysmap.o \
     $(OBJDIR)/cpio.o \
     $(OBJDIR)/userland_archive.o \
     $(OBJDIR)/qsoe/state.o \

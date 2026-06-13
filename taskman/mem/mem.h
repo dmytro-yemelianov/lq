@@ -11,14 +11,17 @@
 
 #include "../sel4_types.h"
 #include <sys/qsoe.h>
+#include <qsoe/tm_msgs.h>      /* canonical TM_MMAP_FLAG_PHYS (shared wire flag) */
 
 /* mmap region origin + page size used to bump tm_process_t.mmap_top. */
 #define QSOE_MMAP_BASE  0x2000000UL    /* 32 MiB */
 #define QSOE_MEGA_PAGE  0x200000UL     /* 2 MiB  */
 #define QSOE_PAGE_4K    0x1000UL       /* 4 KiB  */
 
-/* flags bits passed to tm_mmap_serve.  Maps to libqsoe's QSOE_MAP_*. */
-#define TM_MMAP_FLAG_PHYS   0x1u       /* phys arg names a physical addr */
+/* TM_MMAP_FLAG_PHYS now lives in <qsoe/tm_msgs.h> (one definition shared
+ * with NQ); it used to be a local 0x1 here, which mismatched the value the
+ * shared qsoe_mmap() put on the wire (0x10000) and routed device mappings
+ * to the anonymous allocator. */
 
 /* mmap allocator.  `flags` distinguishes anonymous (default) from
  * MAP_PHYS (physical-memory window for MMIO).  Anonymous uses

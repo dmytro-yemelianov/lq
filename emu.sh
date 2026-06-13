@@ -34,17 +34,30 @@ CPUS=4
 MEM=512M
 QEMU=${QEMU:-qemu-system-riscv64}
 
-# QSOE requires QEMU >= 11.0.1.  Up to 11.0.0, rmw_mip64() OR's mvip into
-# mip.SEIP even though OpenSBI sets mvien[9] (delegating the S-external
-# signal to the interrupt controller), so a message-signaled interrupt
-# never reaches the trap and an MSI-driven device hangs.  Fixed in the
-# v11.0.1 tag (qemu 175afdb0d1).  LQ runs on plain `virt` today, but its
-# MSI-only PCIe path (devb-nvme) needs this once it comes up.
-qver=$("$QEMU" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-if [[ $(printf '%s\n11.0.1\n' "$qver" | sort -V | head -1) != "11.0.1" ]]; then
-    echo "error: QEMU $qver is too old — 11.0.1 or newer required." >&2
-    echo "       set QEMU=/path/to/newer/qemu-system-riscv64." >&2
-    exit 1
+# Interrupt architecture.  Default PLIC: stock seL4 has no AIA support
+# and hard-requires the PLIC -- on `virt,aia=aplic-imsic` the PLIC is
+# removed and the kernel aborts in its per-hart IRQ init (load access
+# fault on the absent PLIC context registers).  `AIA=1 ./emu.sh` selects
+# the AIA machine anyway -- the path NQ uses for PCIe MSI/MSI-X -- for
+# experiments once seL4 grows IMSIC/APLIC drivers.
+if [[ "${AIA:-0}" == "0" ]]; then
+    MACHINE="virt"
+else
+    MACHINE="virt,aia=aplic-imsic"
+fi
+
+# The AIA machine needs QEMU >= 11.0.1: up to 11.0.0, rmw_mip64() OR's
+# mvip into mip.SEIP even though OpenSBI sets mvien[9] (delegating the
+# S-external signal to the IMSIC), so a message-signaled interrupt never
+# reaches the trap and an MSI-driven device hangs.  Fixed in the v11.0.1
+# tag (qemu 175afdb0d1).  The AIA=0 PLIC machine is unaffected.
+if [[ "$MACHINE" == *aia=aplic-imsic* ]]; then
+    qver=$("$QEMU" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ $(printf '%s\n11.0.1\n' "$qver" | sort -V | head -1) != "11.0.1" ]]; then
+        echo "error: QEMU $qver is too old for AIA — 11.0.1 or newer required." >&2
+        echo "       run 'AIA=0 ./emu.sh' for a PLIC machine, or set QEMU=<newer>." >&2
+        exit 1
+    fi
 fi
 
 # Default device set.  Each toggle below appends to QEMUOPTS.
@@ -79,27 +92,32 @@ if [[ ! -f "$IMAGE" ]]; then
     exit 1
 fi
 
-QEMUOPTS=(-machine virt -nographic -m "$MEM" -smp "$CPUS"
+QEMUOPTS=(-machine "$MACHINE" -nographic -m "$MEM" -smp "$CPUS"
           -bios default -kernel "$IMAGE")
 
 # ---------------------------------------------------------------------
-# NVMe — attach a backing-file disk so /sbin/pci-server enumerates the
-# QEMU NVMe controller (vid:did 1b36:0010, class 0x010802) at boot.
-# Image is just a sparse 64 MiB file at build/nvme.img — actual
-# partition / filesystem layout lands in v0.9 once devb-nvme + a real
-# QSOE filesystem are up.
-#
-# Disk attaches via PCIe even when the OS does not yet use it, which
-# is the v0.8-rc2 goal: prove that the PCI walker sees the device.
+# NVMe — mirror NQ.  Backing store is a GPT-formatted image (8 x 16 MiB,
+# p8 = fs-qrv), laid by host_tools/mkgpt.py; the controller hangs behind
+# a PCIe root port (Type-1 bridge) so the MSI-X path is exercised, like
+# the FU740.  `FLAT=1 ./emu.sh` puts it directly on bus 0 instead.
 # ---------------------------------------------------------------------
 if [[ $ATTACH_NVME -eq 1 ]]; then
     mkdir -p "$BUILD"
-    if [[ ! -s $BUILD/nvme.img ]]; then
-        echo "emu.sh: creating $BUILD/nvme.img (64 MiB, sparse, blank)..."
-        truncate -s 64M "$BUILD/nvme.img"
+    # (Re)lay the GPT if the image is missing or carries no GPT header
+    # ("EFI PART" at byte offset 512).  An existing GPT image survives.
+    if [[ ! -f "$BUILD/nvme.img" ]] || \
+       [[ "$(dd if="$BUILD/nvme.img" bs=8 skip=64 count=1 2>/dev/null)" != "EFI PART" ]]; then
+        truncate -s 192M "$BUILD/nvme.img"
+        echo "emu.sh: creating $BUILD/nvme.img (192 MiB, GPT, 8 x 16 MiB, p8 = fs-qrv)..."
+        "$TOP/host_tools/mkgpt.py" --fsqrv 8 "$BUILD/nvme.img" 16 16 16 16 16 16 16 16
     fi
-    QEMUOPTS+=(-drive   "file=$BUILD/nvme.img,if=none,format=raw,id=nvm0"
-               -device  "nvme,drive=nvm0,serial=qsoe-test")
+    QEMUOPTS+=(-drive "file=$BUILD/nvme.img,if=none,format=raw,id=nvm0")
+    if [[ "${FLAT:-0}" == "1" ]]; then
+        QEMUOPTS+=(-device "nvme,drive=nvm0,serial=qsoe-test")
+    else
+        QEMUOPTS+=(-device "pcie-root-port,id=rp0,bus=pcie.0,chassis=1"
+                   -device "nvme,drive=nvm0,serial=qsoe-test,bus=rp0")
+    fi
 fi
 
 # ---------------------------------------------------------------------

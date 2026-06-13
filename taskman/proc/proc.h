@@ -48,6 +48,13 @@
 #define TM_PP_UT_FREE_MAX   64
 #define TM_RAM_UT_MAX       32
 
+/* Per-process recycle list for munmap'd Mega_Page frames (see the
+ * mmap_free[] field below).  Sized to a process's plausible peak of
+ * concurrently-freed-but-not-yet-remapped megapages; qsh's args-page
+ * churn needs only 1, so 16 is generous headroom before the
+ * delete-and-leak fallback kicks in. */
+#define TM_MMAP_FREE_MAX    16
+
 /* Per-process object CNode (v0.10 slot reclamation).
  *
  * taskman holds a cap to every object it retypes for a process; in a
@@ -102,6 +109,12 @@ typedef struct {
     seL4_CPtr cnode;
     seL4_CPtr next_slot;
     seL4_CPtr tcb;
+    /* v0.10 main-thread MCS scheduling context.  Retyped into taskman's
+     * root CNode at spawn (tm_sched_context_create); its object is a
+     * pp_ut child destroyed by Revoke(pput) on exit, but the root-CNode
+     * SLOT must be returned to the allocator explicitly in teardown --
+     * otherwise every spawn leaks one slot and the root CNode fills. */
+    seL4_CPtr sc;
     seL4_CPtr vspace;
     seL4_CPtr untyped_budget;
     seL4_CPtr workers_l1_pt;
@@ -128,6 +141,21 @@ typedef struct {
      * stubs-announce / silent-truncate ban. */
     tm_mmap_entry_t mmap[TM_MAX_MMAP_PER_PROC];
     int             mmap_count;
+
+    /* v0.10 munmap'd-megapage recycle list.  The pp_ut allocator is
+     * bump-only: deleting a Mega_Page frame cap does NOT return its
+     * 2 MiB to the parent untyped's free index (only Revoke at process
+     * exit does).  So a long-lived process that churns mmap/munmap --
+     * notably qsh, which mmaps + munmaps a fresh 2 MiB args page on
+     * every posix_spawn -- would otherwise leak 2 MiB per cycle and
+     * march the whole RAM pool to exhaustion.  Instead munmap parks the
+     * still-valid frame cap here (unmapped) and the next mmap re-maps it
+     * at the new VA, so the 2 MiB is genuinely reused within the
+     * process.  Bounded; on overflow munmap falls back to delete (that
+     * one frame's space leaks until exit, but overflow is rare since a
+     * process's live+free megapages are bounded by its working set). */
+    seL4_CPtr mmap_free[TM_MMAP_FREE_MAX];
+    int       mmap_free_count;
 
     /* v0.7 cred — inherited from parent at spawn, settable via
      * setuid/setgid later. */
@@ -185,6 +213,10 @@ typedef struct {
     seL4_CPtr ntfn_master;
     seL4_CPtr tcb_in_caller;
     seL4_CPtr ntfn_in_caller;
+    /* v0.10 MCS scheduling context for this worker, in taskman's root
+     * CNode.  Like the main thread's, its slot must be freed in teardown
+     * (the object dies with Revoke(pput); the slot does not). */
+    seL4_CPtr sc;
 } tm_thread_t;
 
 #define TM_PULSE_QUEUE_LEN 8
@@ -345,6 +377,11 @@ seL4_CPtr     tm_process_find_frame(const tm_process_t *proc,
  * read-back of the packed (path/argv/envp) blob. */
 int           tm_spawn_read_args(tm_process_t *proc, unsigned long args_va,
                                   unsigned len, void *out_buf);
+
+/* v0.10 zero a free (unmapped) Mega_Page frame via taskman's scratch
+ * mapping, so tm_munmap_serve can recycle frames while preserving
+ * MAP_ANONYMOUS zero-fill.  Returns 0 on success, negative errno. */
+int           tm_zero_megaframe(seL4_CPtr frame);
 
 /* v0.7 cred + ppid query — backs POSIX getpid/getppid/getuid/etc. */
 int           tm_proc_self_info(pid_t caller_pid,

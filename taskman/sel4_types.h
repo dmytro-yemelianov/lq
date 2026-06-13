@@ -287,5 +287,6 @@ seL4_CapRights_new(seL4_Word grantReply, seL4_Word grant,
 
 #define QSOE_RIGHTS_ALL    seL4_CapRights_new(1, 1, 1, 1)
 #define QSOE_RIGHTS_SEND   seL4_CapRights_new(1, 0, 0, 1) /* write + grantReply */
+#define QSOE_RIGHTS_RO     seL4_CapRights_new(0, 0, 1, 0) /* read-only mapping  */
 
 #endif /* QSOE_SEL4_TYPES_H */

@@ -151,6 +151,7 @@ int tm_thread_alloc(pid_t caller_pid,
     g_threads[gidx].ntfn_master    = ntfn;
     g_threads[gidx].tcb_in_caller  = child_tcb_slot;
     g_threads[gidx].ntfn_in_caller = child_ntfn_slot;
+    g_threads[gidx].sc             = sc;
 
     *out_tid        = new_tid;
     *out_tcb_slot   = child_tcb_slot;
