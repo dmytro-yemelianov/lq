@@ -5,6 +5,73 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.11] — 2026-06-13
+
+**Milestone: first boot on real silicon.** QSOE/L came up on a SiFive
+Unmatched (FU740) — one month after the project began — through
+`bootm` → the seL4 MCS kernel → taskman → an interactive shell.
+Built on the v0.10 MCS switch (scheduling contexts + reply objects);
+this entry also folds in the per-spawn reclamation, PCI, and
+wire-protocol work that made the system robust enough to take to
+hardware.
+
+### Boot on real hardware (FU740)
+- **`make PLAT=hifive`** now also emits **`qsoe-l-fu740.bin`** — the raw
+  elfloader image (objcopy of `qsoe.elf`), linked + entered at
+  `0x84000000`, for mr-bml or a direct load.
+- **`boot/`** ships a `bootm` path: the `.bin` is wrapped in a legacy
+  U-Boot uImage (`qsoe-l-fu740.uImage`), so `bootm` enters it as
+  `kernel(a0=hartid, a1=DTB)` — delivering the device tree the
+  elfloader requires — without the RISC-V Linux Image header that
+  `booti` checks.  `make -C boot deploy` + `run bootlq`.
+- `FirstHartID=1` (hart 0 is the FU740's S7 monitor; the OS runs on the
+  U74 harts 1-4); the elfloader and SMP bring-up come up on real
+  silicon, and taskman builds its syscfg from the live FU740 FDT.
+
+### Per-spawn resource reclamation
+- **RAM** — the per-process untyped (pp_ut) allocator is bump-only;
+  `munmap` now parks the freed Mega_Page on a per-process recycle list
+  and re-maps + zeroes it, instead of leaking it until exit. qsh's
+  per-`posix_spawn` 2 MiB args page no longer drains the RAM pool.
+- **Address space** — `munmap` rewinds the `mmap_top` cursor on a
+  contiguous-top free (the LIFO args case).
+- **CSpace** — scheduling-context slots (main + worker), a channel's
+  `ntfn_sig` slot, and the per-spawn page-table caps are now freed on
+  exit (the page tables ride into the per-process objcnode). The
+  `ps;sysinfo` loop runs unbounded; it previously OOM'd at ~13 spawns.
+
+### PCI ECAM as device MMIO
+- **`MAP_PHYS` fixed and unified.** The shared `qsoe_mmap()` helper
+  framed the wire request with NQ's flag value (`0x10000`), which LQ
+  taskman read as anonymous — so pci-server's ECAM window came back as
+  zeroed RAM and `lspci` saw 32 phantom `0000:0000` devices. The flag
+  (`TM_MMAP_FLAG_PHYS`) now lives once in `<qsoe/tm_msgs.h>`, equal to
+  POSIX `MAP_PHYS`, with a `_Static_assert` guarding the equality.
+- **2 MiB Mega_Page device mapping** — a 16 MiB ECAM window maps as 8
+  Mega_Pages instead of 4096 4 KiB frames (which overflowed the
+  4096-slot root CNode).
+- **Device-frame registry** — a device region is carved from its
+  device-UT once; every mapper gets `cnode_copy`'s mapped into its own
+  VSpace, so pci-server and `sysinfo` share the same ECAM frames (a
+  device-UT's free index only advances, so the region can't be
+  re-carved). `lspci` reports the host bridge (`1b36:0008`).
+
+### Wire protocol
+- **Variant-private opcode space.** TM message codes `>= 0x10000`
+  (`TM_REQ_VARIANT_BASE`) are kernel-private and defined only in the
+  variant tree, never in the shared common code — keeping the shared
+  opcode space collision-free. The LQ-only `TM_REQ_DUP_CAP` /
+  `TM_REQ_DETACH_CAP` moved out of the shared enum's gaps into it.
+- **Sysmap page** — taskman renders the syscfg blob into a read-only
+  `PSYS` page mapped at `QSOE_SYSMAP_VA` in every process, so the shared
+  libc `hwi_init()` works on LQ exactly as on NQ.
+
+### Known issues
+- Serial **input** hangs on the FU740 after the first keystroke
+  (the SiFive UART receive-IRQ path on the real PLIC); output is fine.
+- A multi-second pause before `/sbin/init` on large-RAM boards (scales
+  with RAM size); under investigation.
+
 ## [v0.8] — 2026-05-17
 
 **Milestone: PCI bus, system logger, real synchronisation, and a

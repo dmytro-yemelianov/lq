@@ -59,12 +59,15 @@ over a seL4 endpoint.
   (`TM_REQ_MMAP` / `TM_REQ_MUNMAP`).
 - **Spawn, not fork.** Process creation only via `posix_spawn(3)`.
 
-## Current state — v0.9
+## Current state — v0.11
 
-The first interactive shell on dynamically-linked binaries.
+**First boot on real silicon.** QSOE/L came up on a SiFive Unmatched
+(FU740) — `booti`/`bootm` → seL4 MCS kernel → taskman → an interactive
+shell — one month after the project began. Everything below also runs
+under QEMU `virt`.
 
 ```
-QSOE: Quick & Secure Operating Environment v0.9 booting
+QSOE: Quick & Secure Operating Environment v0.11 booting
 [init] starting slogger...
 [slogger] alive, pid=3
 [init] starting pci-server...
@@ -117,13 +120,30 @@ What's working:
   tagged blob (`_MEMORY`, `_CPUS`, `_PLIC`, `_PCI_ECAM`, …); user-space
   queries via `<qsoe/hwinfo.h>`.
 
+New since v0.9 (the v0.10 MCS line and v0.11):
+
+- **seL4 MCS kernel** — scheduling contexts + reply objects; the basis
+  for native timers and `Wait`-with-timeout.
+- **First FU740 boot** — `make PLAT=hifive` emits `qsoe-l-fu740.bin`
+  (raw, for mr-bml) and a `bootm` uImage; `FirstHartID=1` (hart 0 is the
+  S7 monitor). Booted to a shell on a real Unmatched.
+- **Per-spawn resource reclamation** — RAM (per-process untyped +
+  munmap'd-frame recycle), VA cursor, and CSpace slots (SCs, channel
+  ntfn, page tables) are all reclaimed on exit; the `ps;sysinfo` loop
+  runs unbounded (was OOM at ~13 spawns).
+- **PCI ECAM as device MMIO** — `MAP_PHYS` fixed and unified across the
+  two kernels; large device windows map as 2 MiB Mega_Pages; a device-
+  frame registry lets pci-server and `sysinfo` share the same ECAM
+  frames. `lspci` reports the host bridge.
+- **Variant-private wire opcodes** — kernel-specific TM message codes
+  live at `>= 0x10000`, out of the shared opcode space.
+
 What's deliberately not implemented: `fork()`, `select()`, `brk()`.
 
-Still ahead: shell pipelines (need `pipe()` + `dup2()` on the taskman
-side); a storage stack (`devb-nvme`, `fs-qrv`); first boot on real
-hardware (SiFive Unmatched); migration to MCS for native timers and
-sched_contexts. The shape of the work is sketched in the umbrella's
-top-level documentation.
+Still ahead: serial RX on the FU740 PLIC (the console accepts output but
+hangs on input on real hardware); shell pipelines; a storage stack
+(`devb-nvme`, `fs-qrv`); MCS-native timers. The shape of the work is
+sketched in the umbrella's top-level documentation.
 
 ## Build and run
 
