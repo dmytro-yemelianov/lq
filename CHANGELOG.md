@@ -5,6 +5,66 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.12] — 2026-06-15
+
+**Milestone: PCIe enumeration on real silicon.** QSOE/L's `pci-server`
+walks the full SiFive Unmatched (FU740) DesignWare PCIe topology under
+the seL4 microkernel — 11 devices across buses 0..7, including a Samsung
+NVMe SSD and an NVIDIA GK208 GPU with its HDMI-audio function. Built on
+the v0.11 first-boot; this line also brings the per-process signal
+thread, a unified taskman logger, a Kconfig multi-board build, and a
+build-time seL4 patch mechanism that fixed serial input on the board.
+
+### PCIe on the FU740 (DesignWare)
+- **Device-tree parse** — taskman recognizes `sifive,fu740-pcie`
+  (DesignWare, not flat ECAM), emitting the config (ECAM) + DBI windows
+  and the aggregate MSI PLIC source as `_PCI_ECAM` / `_DW_MSI` syscfg
+  tags. The shared `pci-server`'s DesignWare path (iATU config backend,
+  DW-MSI) takes it from there. Generic ECAM (qemu-virt) unchanged.
+- **MAP_PHYS device-UT offset fix** — the FU740 PCIe windows sit deep
+  inside seL4's coarse, gap-filled device-untypeds (config and DBI
+  share one 32 GiB UT at a ~24 GiB offset). `devmap_carve` now tracks
+  each device-UT's high-water mark, so successive carves skip from where
+  the last one left off rather than from 0 — which double-consumed and
+  overflowed the UT — and advances the free index in largest-aligned
+  blocks (O(log) throwaways instead of O(offset)). This unblocked
+  `lspci` on the board.
+
+### Per-process signal thread (two-thread design)
+- Every process now runs main + a system/signal thread; `kill()` rides
+  a pulse the system thread runs the handler on (matching Skimmer). A
+  variant-private `TM_REQ_CHANNEL_BIND_THREAD` rebinds the channel's
+  pulse Notification to the system thread's TCB on seL4; `MsgReceive`
+  uses per-thread reply objects; the `GET_SIGNAL_CHID` reply word order
+  was corrected. `ps -H` reports the pair.
+
+### Unified taskman logging
+- taskman dropped its own always-on emitter for the shared `libtaskman`
+  logger: leveled, default INFO, `--debug[=N]` read from
+  `/chosen/bootargs` (DBG/TRACE), matching the Skimmer side. The boot
+  command line is echoed under the banner.
+
+### Build: Kconfig multi-board + seL4 patches
+- **Kconfig** board selection (multi-select QEMU-virt / SiFive),
+  board-named ELFs `qsoe-l-{qemu,sifive}.elf`, recursive multi-board
+  Makefile.
+- **Build-time seL4 patches** for the FU740, sed-applied to the vendored
+  tree (idempotent, survives a `make prepare` re-clone): `MAX_IRQ`
+  53 → 128 (the FU540 PLIC ceiling — lifts `PLIC_MAX_IRQ`, `maxIRQ` and
+  the IRQ-cnode size so PCIe MSI fits), and **PLIC complete-on-claiming-
+  hart** (seL4 completed a claim on whichever hart ran the userspace
+  ack, not the one that took the IRQ — on SMP that left the level-
+  triggered line un-rearmed, so serial showed one char then silence;
+  now mirrors the QRV and Skimmer kernels).
+
+### Known gaps (→ v0.13)
+- `devb-nvme` faults on an unresolved `SchedSet` (NULL PLT slot): the
+  NVMe controller is detected (06:00.0, BAR0) but the driver can't pin
+  its IRQ thread yet. Real `Sched*` lands in v0.13.
+- No wall-clock (`CLOCK_REALTIME`); `reboot` halts rather than restarts
+  (seL4 exposes only SBI-legacy shutdown); the device-UT skip is
+  increasing-offset-only.
+
 ## [v0.11] — 2026-06-13
 
 **Milestone: first boot on real silicon.** QSOE/L came up on a SiFive

@@ -59,26 +59,25 @@ over a seL4 endpoint.
   (`TM_REQ_MMAP` / `TM_REQ_MUNMAP`).
 - **Spawn, not fork.** Process creation only via `posix_spawn(3)`.
 
-## Current state — v0.11
+## Current state — v0.12
 
-**First boot on real silicon.** QSOE/L came up on a SiFive Unmatched
-(FU740) — `booti`/`bootm` → seL4 MCS kernel → taskman → an interactive
-shell — one month after the project began. Everything below also runs
-under QEMU `virt`.
+**PCIe enumeration on real silicon.** Building on the v0.11 first-boot,
+QSOE/L's `pci-server` now walks the full SiFive Unmatched (FU740)
+DesignWare PCIe topology under seL4 — 11 devices across buses 0..7,
+including a Samsung NVMe SSD and an NVIDIA GK208 GPU with its HDMI-audio
+function. Serial input works on the board, and every process runs a
+per-process signal thread. Everything below also runs under QEMU `virt`.
 
 ```
-QSOE: Quick & Secure Operating Environment v0.11 booting
-[init] starting slogger...
-[slogger] alive, pid=3
+QSOE/L Operating System version v0.12
 [init] starting pci-server...
-[pci-server] scan complete: 2 devices on bus 0
-[init] starting devc-ser8250...
-[devc-ser8250] 16550 initialised @ vaddr 0xA00000
-[devc-ser8250] /dev/ser1 registered (chid=1)
-[init] repointing /dev/console -> /dev/ser1...
-[init] entering interactive shell...
-[/]# echo hello
-hello
+[pci-server] scan complete: 11 devices across buses 0..7
+[init] starting devc-sersifive...
+[devc-sersifive] /dev/ser1 registered (chid=2)
+[/]# lspci
+06:00.0 NVM controller [0108]: 144d:a80a (rev 00)
+07:00.0 VGA compatible controller [0300]: 10de:128b (rev a1)
+07:00.1 Multimedia controller [0403]: 10de:0e0f (rev a1)
 [/]#
 ```
 
@@ -96,9 +95,11 @@ What's working:
 - **Path manager.** Prefix-tree namespace with `register` / `repath` /
   `resolve` / `symlink` wire ops; synthetic-directory handlers; an
   embedded `modpkg.cpio` mounted read-only at `/`.
-- **PCI bus.** `/sbin/pci-server` enumerates the qemu-virt root complex
-  over generic ECAM; INTx routing through four PLIC vectors. Client
-  surface via `libpci.a`.
+- **PCI bus.** `/sbin/pci-server` enumerates both the qemu-virt root
+  complex (generic ECAM, INTx via four PLIC vectors) and the FU740's
+  Synopsys DesignWare host (config window + iATU + DW-MSI) — taskman
+  recognizes `sifive,fu740-pcie` and the shared server drives both.
+  Client surface via `libpci.a`.
 - **Serial console.** `devc-ser8250` 16550 driver with IRQ-driven RX;
   `init` repaths `/dev/console` to `/dev/ser1` so qsh's blocking reads
   land on the real UART. Line discipline handles backspace, VKILL,
@@ -119,6 +120,24 @@ What's working:
 - **FDT-driven syscfg.** Taskman parses the device tree at boot into a
   tagged blob (`_MEMORY`, `_CPUS`, `_PLIC`, `_PCI_ECAM`, …); user-space
   queries via `<qsoe/hwinfo.h>`.
+
+New in v0.12:
+
+- **FU740 PCIe** — taskman parses the `sifive,fu740-pcie` DesignWare host
+  (config/DBI windows + MSI source); a device-untyped high-water-mark fix
+  in `MAP_PHYS` lets `pci-server` map windows that sit deep inside seL4's
+  coarse gap-filled device-untypeds. Full topology enumerates on the
+  board (NVMe + GK208).
+- **Per-process signal thread** — main + system thread in every process;
+  cross-process `kill()` runs handlers on the system thread (seL4
+  Notification rebound to that TCB; per-thread reply objects).
+- **Unified logger** — taskman uses the shared `libtaskman` logger;
+  `--debug[=N]` from `/chosen/bootargs`; boot command line echoed.
+- **Kconfig multi-board build** — multi-select QEMU-virt / SiFive,
+  board-named ELFs, one recursive Makefile.
+- **Build-time seL4 patches** (FU740) — `MAX_IRQ` 53 → 128 for PCIe MSI,
+  and PLIC complete-on-claiming-hart, which fixed serial input on SMP
+  hardware (was one char then silence).
 
 New since v0.9 (the v0.10 MCS line and v0.11):
 

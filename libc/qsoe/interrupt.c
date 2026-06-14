@@ -94,15 +94,23 @@ int InterruptWait(int flags, const uint64_t *timeout)
         qsoe_errno = EINVAL;
         return -1;
     }
-    int rc = qsoe_irq_wait(s_attach[iid - 1].ntfn_slot);
-    if (rc != 0) return -1;
-
-    /* QSOE_INTR_WAIT_FLAGS_UNMASK: auto-ack on the way out, saving
-     * the caller an InterruptUnmask kercall.  Carries the QRV
-     * intr-wait auto-unmask semantics across. */
+    /* QSOE_INTR_WAIT_FLAGS_UNMASK: re-arm on the way IN, not out.  On seL4
+     * hardware (hifive/FU740) the PLIC claim is completed ONLY by the
+     * userspace IRQHandler_Ack -- unlike qemu-riscv-virt, where the kernel
+     * auto-completes it in getActiveIRQ (its "QEMU bug" workaround).  Acking
+     * here completes the claim for the PREVIOUS fire, which the IST has by
+     * now serviced and drained, so the level-triggered SiFive UART line is
+     * re-armed only once its RX FIFO is empty.  Acking on the way OUT instead
+     * re-armed the source while the byte was still in the FIFO -- the level
+     * keeps re-asserting and one wrong interleave leaves the claim stuck and
+     * the device silent after a single character.  Re-arm-then-block also
+     * matches Skimmer's sys_intr_wait and the IST loop's documented shape. */
     if (flags & QSOE_INTR_WAIT_FLAGS_UNMASK) {
         (void)qsoe_irq_ack(s_attach[iid - 1].handler_slot);
     }
+
+    int rc = qsoe_irq_wait(s_attach[iid - 1].ntfn_slot);
+    if (rc != 0) return -1;
     return 0;
 }
 

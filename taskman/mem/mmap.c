@@ -130,6 +130,14 @@ static unsigned ctz_ul(unsigned long x)
     return n;
 }
 
+/* Floor log2: the size-bits of the largest power-of-2 <= x (x != 0). */
+static unsigned fls_ul(unsigned long x)
+{
+    unsigned n = 0;
+    while (x > 1) { x >>= 1; ++n; }
+    return n;
+}
+
 /* ---- MAP_PHYS device-frame registry (v0.11) ----------------------
  * A device region is carved from its device-UT exactly ONCE.  A
  * device-UT's free index only ever advances (and the watermark advance
@@ -172,6 +180,26 @@ static tm_devmap_t *devmap_find(unsigned long phys, unsigned long len)
  * region spans at least 2 MiB, else 4 KiB (e.g. the ser8250 UART, which
  * also store-faulted once as a 2 MiB superpage).  Returns the entry or 0
  * (logging the specific failure). */
+/* Per device-UT high-water mark.  A seL4 untyped's free index advances
+ * monotonically and persists in the cap, so once a carve has consumed up
+ * to byte N of a device-UT, the NEXT carve from the SAME UT must skip
+ * from N -- not from 0 -- or it double-consumes the UT and overflows it
+ * (the FU740 config @ 0xdf0000000 and DBI @ 0xe00000000 share one 32 GiB
+ * gap-filled device-UT).  Tracked here because seL4 doesn't expose the
+ * free index to userspace. */
+static struct { seL4_CPtr ut; unsigned long hwm; } s_ut_hwm[TM_DEVMAP_MAX];
+static unsigned s_ut_hwm_n;
+
+static unsigned long *ut_hwm_slot(seL4_CPtr ut)
+{
+    for (unsigned i = 0; i < s_ut_hwm_n; ++i)
+        if (s_ut_hwm[i].ut == ut) return &s_ut_hwm[i].hwm;
+    if (s_ut_hwm_n >= TM_DEVMAP_MAX) return 0;
+    s_ut_hwm[s_ut_hwm_n].ut  = ut;
+    s_ut_hwm[s_ut_hwm_n].hwm = 0;
+    return &s_ut_hwm[s_ut_hwm_n++].hwm;
+}
+
 static tm_devmap_t *devmap_carve(unsigned long phys, unsigned long len)
 {
     unsigned ut_sizebits = 0;
@@ -181,6 +209,7 @@ static tm_devmap_t *devmap_carve(unsigned long phys, unsigned long len)
     if (!ut) { tm_err("tm_mmap_serve(PHYS): no matching device-UT"); return 0; }
 
     unsigned long ut_size = 1UL << ut_sizebits;
+
     if (ut_offset + len > ut_size) {
         tm_err("tm_mmap_serve(PHYS): region exceeds device-UT");
         return 0;
@@ -203,19 +232,33 @@ static tm_devmap_t *devmap_carve(unsigned long phys, unsigned long len)
         if (!s_devmaps[i].in_use) { d = &s_devmaps[i]; break; }
     if (!d) { tm_err("tm_mmap_serve(PHYS): device-map registry full"); return 0; }
 
-    /* Advance the device-UT watermark to ut_offset with throwaway child
-     * untypeds (greedy biggest-aligned chunk; phys + UT base are aligned). */
-    unsigned long advanced = 0;
+    /* Advance the device-UT's free index to ut_offset with throwaway child
+     * untypeds, starting from where prior carves left THIS UT (its high-
+     * water mark), not from 0 -- else a second region in the same UT
+     * double-consumes it.  Greedy largest-aligned block (fls of remaining,
+     * capped by the position's alignment) keeps the throwaway count O(log)
+     * rather than O(offset / min-chunk).  Caveat: regions in one UT must be
+     * carved in increasing-offset order (the free index only moves forward);
+     * out-of-order is rejected loudly below. */
+    unsigned long *hwm = ut_hwm_slot(ut);
+    if (!hwm) { tm_err("tm_mmap_serve(PHYS): device-UT hwm table full"); return 0; }
+    if (ut_offset < *hwm) {
+        tm_err("tm_mmap_serve(PHYS): off 0x%lx below UT hwm 0x%lx (out-of-order map)",
+               ut_offset, *hwm);
+        return 0;
+    }
+    unsigned long advanced = *hwm;
     while (advanced < ut_offset) {
         unsigned long rem = ut_offset - advanced;
-        unsigned chunk_sb = ctz_ul(rem);
-        unsigned align_sb = ctz_ul(advanced ? advanced : ut_size);
+        unsigned chunk_sb = fls_ul(rem);                                /* largest 2^k <= rem */
+        unsigned align_sb = advanced ? ctz_ul(advanced) : ut_sizebits;  /* alignment of pos  */
         if (chunk_sb > align_sb) chunk_sb = align_sb;
         seL4_CPtr dummy = taskman_alloc_empty_slot();
         if (!dummy) return 0;
         if (qsoe_untyped_retype(ut, seL4_UntypedObject, chunk_sb,
                                 s_cnode_root, 0, 0, dummy, 1) != 0) {
-            tm_err("tm_mmap_serve(PHYS): skip-retype failed");
+            tm_err("tm_mmap_serve(PHYS): skip-retype failed at advanced=0x%lx chunk=2^%u",
+                   advanced, chunk_sb);
             taskman_free_slot(dummy);
             return 0;
         }
@@ -235,6 +278,9 @@ static tm_devmap_t *devmap_carve(unsigned long phys, unsigned long len)
         }
         d->frames[i] = f;
     }
+    /* The skip + frames advanced the UT free index to ut_offset + rlen;
+     * record it so the next carve from this UT skips from here. */
+    *hwm = ut_offset + rlen;
     d->phys = phys; d->len = rlen; d->granule = granule;
     d->nframes = nframes; d->in_use = 1;
     return d;

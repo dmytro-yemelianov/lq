@@ -95,8 +95,9 @@ int tm_sysmap_build(void)
 
     /* PCI_ECAM: ecam base/size/lastbus from syscfg PCI_ECAM, plus the
      * 32-bit non-prefetchable MMIO window from the matching PCI_WINDOW
-     * so the pci-server can assign device BARs.  dbi/msi_irq stay zero
-     * -- flat ECAM on QEMU virt. */
+     * so the pci-server can assign device BARs.  On a DesignWare host
+     * (FU740) the DBI window + aggregate MSI PLIC source come from the
+     * DW_MSI tag below; they stay zero on flat ECAM (QEMU virt). */
     const void *ep;
     unsigned    el;
     if (tm_syscfg_find(TM_SYSCFG_TAG_PCI_ECAM, &ep, &el) == 0 && el >= 20) {
@@ -132,6 +133,18 @@ int tm_sysmap_build(void)
                 off += 4 + len;
             }
         }
+
+        /* DesignWare (FU740): DBI window + aggregate MSI PLIC source.
+         * Absent on flat-ECAM boards, leaving dbi/msi_irq zero. */
+        const void *dp;
+        unsigned    dl;
+        if (tm_syscfg_find(TM_SYSCFG_TAG_DW_MSI, &dp, &dl) == 0 && dl >= 20) {
+            const unsigned char *d = (const unsigned char *)dp;
+            pe.dbi_base = rd64(d, 0);
+            pe.dbi_size = rd64(d, 8);
+            pe.msi_irq  = rd32(d, 16);
+        }
+
         emit(QSOE_SYSMAP_TAG_PCI_ECAM, &pe, (unsigned)sizeof pe);
     }
 

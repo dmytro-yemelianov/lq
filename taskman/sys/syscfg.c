@@ -69,6 +69,55 @@ static int emit_asciz(uint16_t id, const char *s)
     return emit(id, s, len + 1);
 }
 
+/* Emit a TM_SYSCFG_TAG_PCI_WINDOW for each MMIO/IO entry in a PCI host
+ * bridge node's `ranges` (the CPU<->PCI BAR windows the pci-server
+ * assigns from).  Shared by the generic-ECAM and FU740 DesignWare
+ * branches.  Each entry is (PCI #addr-cells=3 + parent #addr-cells=2 +
+ * PCI #size-cells=2) = 7 u32s = 28 bytes.  The first PCI address cell's
+ * high bits encode the window type:
+ *     0x01000000 → I/O space   0x02000000 → 32-bit memory
+ *     0x03000000 → 64-bit mem  0x40000000 → prefetchable (OR'd in)
+ * (Open Firmware "Numerical Representation" Annex C, "PCI Bus Binding".) */
+static void emit_pci_windows(const void *fdt_blob, int node)
+{
+    const void *rp; unsigned rlen;
+    if (tm_fdt_prop(fdt_blob, node, "ranges", &rp, &rlen) != 0 ||
+        rlen % 28 != 0)
+        return;
+    const unsigned char *bp = (const unsigned char *)rp;
+    unsigned n = rlen / 28;
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned char *r = bp + i * 28;
+        uint32_t hi = ((uint32_t)r[0] << 24) | ((uint32_t)r[1] << 16) |
+                      ((uint32_t)r[2] <<  8) |  (uint32_t)r[3];
+        uint64_t pci_addr = 0;
+        for (int b = 4; b < 12; ++b) pci_addr = (pci_addr << 8) | r[b];
+        uint64_t cpu_addr = 0;
+        for (int b = 12; b < 20; ++b) cpu_addr = (cpu_addr << 8) | r[b];
+        uint64_t size = 0;
+        for (int b = 20; b < 28; ++b) size = (size << 8) | r[b];
+
+        uint32_t flags = 0;
+        switch ((hi >> 24) & 0x3) {
+        case 0x1: flags |= TM_SYSCFG_PCI_WINDOW_IO;  break;
+        case 0x2: flags |= TM_SYSCFG_PCI_WINDOW_MEM; break;
+        case 0x3: flags |= TM_SYSCFG_PCI_WINDOW_MEM; break;
+        default:  continue;     /* configuration space, skip */
+        }
+        if (hi & 0x40000000u) flags |= TM_SYSCFG_PCI_WINDOW_PREFETCH;
+
+        unsigned char wbuf[28];
+        for (int b = 0; b < 8; ++b) wbuf[b]      = (unsigned char)((cpu_addr >> (b * 8)) & 0xff);
+        for (int b = 0; b < 8; ++b) wbuf[8 + b]  = (unsigned char)((pci_addr >> (b * 8)) & 0xff);
+        for (int b = 0; b < 8; ++b) wbuf[16 + b] = (unsigned char)((size     >> (b * 8)) & 0xff);
+        wbuf[24] = (unsigned char)(flags & 0xff);
+        wbuf[25] = (unsigned char)((flags >> 8) & 0xff);
+        wbuf[26] = (unsigned char)((flags >> 16) & 0xff);
+        wbuf[27] = (unsigned char)((flags >> 24) & 0xff);
+        (void)emit(TM_SYSCFG_TAG_PCI_WINDOW, wbuf, 28);
+    }
+}
+
 int tm_syscfg_build(const void *fdt_blob)
 {
     if (tm_fdt_check(fdt_blob) != 0) return -1;
@@ -218,55 +267,8 @@ int tm_syscfg_build(const void *fdt_blob)
             (void)emit(TM_SYSCFG_TAG_PCI_ECAM, buf, 20);
         }
 
-        /* `ranges` property: each entry is (PCI #addr-cells=3 +
-         * parent #addr-cells=2 + PCI #size-cells=2) = 7 u32s = 28
-         * bytes.  The first PCI address cell's high bits encode the
-         * window type:
-         *     0x01000000 → I/O space
-         *     0x02000000 → 32-bit memory
-         *     0x03000000 → 64-bit memory
-         *     0x40000000 → prefetchable (OR'd in)
-         * (see Open Firmware "Numerical Representation" Annex C, table
-         * "PCI Bus Binding".) */
-        const void *rp; unsigned rlen;
-        if (tm_fdt_prop(fdt_blob, pci, "ranges", &rp, &rlen) == 0 &&
-            rlen % 28 == 0) {
-            const unsigned char *bp = (const unsigned char *)rp;
-            unsigned n = rlen / 28;
-            for (unsigned i = 0; i < n; ++i) {
-                const unsigned char *r = bp + i * 28;
-                /* PCI high-addr cell (4 bytes BE). */
-                uint32_t hi = ((uint32_t)r[0] << 24) | ((uint32_t)r[1] << 16) |
-                              ((uint32_t)r[2] <<  8) |  (uint32_t)r[3];
-                /* PCI mid+lo addr cells (skip the high 4 bytes — bits
-                 * 0..63 carry the PCI address). */
-                uint64_t pci_addr = 0;
-                for (int b = 4; b < 12; ++b) pci_addr = (pci_addr << 8) | r[b];
-                uint64_t cpu_addr = 0;
-                for (int b = 12; b < 20; ++b) cpu_addr = (cpu_addr << 8) | r[b];
-                uint64_t size = 0;
-                for (int b = 20; b < 28; ++b) size = (size << 8) | r[b];
-
-                uint32_t flags = 0;
-                switch ((hi >> 24) & 0x3) {
-                case 0x1: flags |= TM_SYSCFG_PCI_WINDOW_IO;  break;
-                case 0x2: flags |= TM_SYSCFG_PCI_WINDOW_MEM; break;
-                case 0x3: flags |= TM_SYSCFG_PCI_WINDOW_MEM; break;
-                default:  continue;     /* configuration space, skip */
-                }
-                if (hi & 0x40000000u) flags |= TM_SYSCFG_PCI_WINDOW_PREFETCH;
-
-                unsigned char wbuf[28];
-                for (int b = 0; b < 8; ++b) wbuf[b]      = (unsigned char)((cpu_addr >> (b * 8)) & 0xff);
-                for (int b = 0; b < 8; ++b) wbuf[8 + b]  = (unsigned char)((pci_addr >> (b * 8)) & 0xff);
-                for (int b = 0; b < 8; ++b) wbuf[16 + b] = (unsigned char)((size     >> (b * 8)) & 0xff);
-                wbuf[24] = (unsigned char)(flags & 0xff);
-                wbuf[25] = (unsigned char)((flags >> 8) & 0xff);
-                wbuf[26] = (unsigned char)((flags >> 16) & 0xff);
-                wbuf[27] = (unsigned char)((flags >> 24) & 0xff);
-                (void)emit(TM_SYSCFG_TAG_PCI_WINDOW, wbuf, 28);
-            }
-        }
+        /* CPU<->PCI BAR windows from `ranges`. */
+        emit_pci_windows(fdt_blob, pci);
 
         /* `interrupt-map`: PCI INTx routing.  On qemu-virt each entry
          * is (PCI #addr-cells=3 + PCI #int-cells=1 + parent phandle=1 +
@@ -302,6 +304,64 @@ int tm_syscfg_build(const void *fdt_blob)
                 (void)emit(TM_SYSCFG_TAG_PCI_IRQ, ibuf, 16);
             }
         }
+    }
+
+    /* SiFive FU740 (Unmatched) DesignWare PCIe.  Distinct from the flat
+     * ECAM above: `reg` is indexed by reg-names "dbi","config","mgmt"
+     * (fixed binding) -- index 0 = DBI register block, index 1 = config
+     * window (our ECAM slot), index 2 = mgmt.  U-Boot has already
+     * trained the link and programmed iATU; the config window still
+     * needs iATU re-aiming per access, which the shared pci-server's
+     * DesignWare path handles once it sees dbi_base + msi_irq.  Parent
+     * /soc is #address-cells=2, #size-cells=2 (same reg shape as the
+     * generic path). */
+    int dwpci = tm_fdt_compatible(fdt_blob, "sifive,fu740-pcie");
+    if (dwpci >= 0) {
+        uint64_t ecam_base = 0, ecam_size = 0, dbi_base = 0, dbi_size = 0;
+        (void)tm_fdt_reg(fdt_blob, dwpci, 2, 2, 1, &ecam_base, &ecam_size); /* config */
+        (void)tm_fdt_reg(fdt_blob, dwpci, 2, 2, 0, &dbi_base,  &dbi_size);  /* dbi    */
+
+        /* msi_irq = first `interrupts` entry (interrupt-names[0] = "msi"
+         * on this binding; #interrupt-cells = 1).  Big-endian u32. */
+        uint32_t msi_irq = 0;
+        const void *mip; unsigned milen;
+        if (tm_fdt_prop(fdt_blob, dwpci, "interrupts", &mip, &milen) == 0 &&
+            milen >= 4) {
+            const unsigned char *mb = (const unsigned char *)mip;
+            msi_irq = ((uint32_t)mb[0] << 24) | ((uint32_t)mb[1] << 16) |
+                      ((uint32_t)mb[2] <<  8) |  (uint32_t)mb[3];
+        }
+
+        /* PCI_ECAM: the config window (iATU-paged) is the ECAM slot. */
+        uint32_t lastbus = 0xff;
+        const void *brp; unsigned brlen;
+        if (tm_fdt_prop(fdt_blob, dwpci, "bus-range", &brp, &brlen) == 0 &&
+            brlen == 8) {
+            const unsigned char *bp = (const unsigned char *)brp;
+            lastbus = ((uint32_t)bp[4] << 24) | ((uint32_t)bp[5] << 16) |
+                      ((uint32_t)bp[6] <<  8) |  (uint32_t)bp[7];
+        }
+        unsigned char eb[20];
+        for (int b = 0; b < 8; ++b) eb[b]     = (unsigned char)((ecam_base >> (b * 8)) & 0xff);
+        for (int b = 0; b < 8; ++b) eb[8 + b] = (unsigned char)((ecam_size >> (b * 8)) & 0xff);
+        eb[16] = (unsigned char)(lastbus & 0xff);
+        eb[17] = (unsigned char)((lastbus >> 8) & 0xff);
+        eb[18] = (unsigned char)((lastbus >> 16) & 0xff);
+        eb[19] = (unsigned char)((lastbus >> 24) & 0xff);
+        (void)emit(TM_SYSCFG_TAG_PCI_ECAM, eb, 20);
+
+        /* DW_MSI: DBI register block + the aggregate MSI PLIC source. */
+        unsigned char db[20];
+        for (int b = 0; b < 8; ++b) db[b]     = (unsigned char)((dbi_base >> (b * 8)) & 0xff);
+        for (int b = 0; b < 8; ++b) db[8 + b] = (unsigned char)((dbi_size >> (b * 8)) & 0xff);
+        db[16] = (unsigned char)(msi_irq & 0xff);
+        db[17] = (unsigned char)((msi_irq >> 8) & 0xff);
+        db[18] = (unsigned char)((msi_irq >> 16) & 0xff);
+        db[19] = (unsigned char)((msi_irq >> 24) & 0xff);
+        (void)emit(TM_SYSCFG_TAG_DW_MSI, db, 20);
+
+        /* CPU<->PCI BAR windows from `ranges`. */
+        emit_pci_windows(fdt_blob, dwpci);
     }
 
     /* Sentinel. */
