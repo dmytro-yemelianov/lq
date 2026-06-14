@@ -13,7 +13,7 @@
 #include "pmdir.h"
 #include "pathmgr.h"
 #include "../proc/proc.h"
-#include "../tm_log.h"
+#include <tm_log.h>
 #include <sys/qsoe.h>
 
 #define TM_PMDIR_MAX_OPEN  8

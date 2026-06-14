@@ -52,7 +52,7 @@
 #include "../sel4_types.h"
 #include "../qsoe_invoke.h"
 #include "../proc/proc.h"          /* s_untyped, s_cnode_root, taskman_alloc_empty_slot */
-#include "../tm_log.h"
+#include <tm_log.h>
 #include "initrd.h"
 
 extern int  tm_fdt_path(const void *blob, const char *path);

@@ -9,7 +9,7 @@
 
 #include "spawn.h"
 #include "../qsoe_invoke.h"
-#include "../tm_log.h"
+#include <tm_log.h>
 #include "proc.h"
 #include "../mem/mem.h"
 #include "../path/pathmgr.h"
@@ -166,7 +166,7 @@ static int ensure_scratch_pt(void)
                                               TM_SCRATCH_VADDR,
                                               QSOE_VM_ATTR_DEFAULT);
     if (err) {
-        tm_err("spawn: ensure_scratch_pt: L1 PageTable_Map failed err=%u",
+        tm_err("spawn: ensure_scratch_pt: L1 PageTable_Map failed err=%lu",
                (unsigned long)err);
         return -ENOMEM;
     }
@@ -180,7 +180,7 @@ static int ensure_scratch_pt(void)
                                     TM_SCRATCH_VADDR,
                                     QSOE_VM_ATTR_DEFAULT);
     if (err) {
-        tm_err("spawn: ensure_scratch_pt: L0 PageTable_Map failed err=%u",
+        tm_err("spawn: ensure_scratch_pt: L0 PageTable_Map failed err=%lu",
                (unsigned long)err);
         return -ENOMEM;
     }
@@ -199,7 +199,7 @@ static int scratch_map(seL4_CPtr frame)
                                        QSOE_RIGHTS_ALL,
                                        QSOE_VM_ATTR_DEFAULT);
     if (rc) {
-        tm_err("spawn: scratch_map: vaddr=%08x rc=%02x",
+        tm_err("spawn: scratch_map: vaddr=%08lx rc=%02lx",
                (unsigned long)TM_SCRATCH_VADDR, (unsigned long)rc);
     }
     return rc;
@@ -439,7 +439,7 @@ static int reloc_write_cb(void *user, uint64_t vaddr, uint64_t value)
     (void)user;
     seL4_CPtr frame = spawn_find_frame((unsigned long)vaddr);
     if (!frame) {
-        tm_err("spawn: reloc target va=%08x has no mapped frame",
+        tm_err("spawn: reloc target va=%08lx has no mapped frame",
                (unsigned long)vaddr);
         return -1;
     }
@@ -452,14 +452,14 @@ static int reloc_write_cb(void *user, uint64_t vaddr, uint64_t value)
                                      s_cnode_root, frame, 64,
                                      QSOE_RIGHTS_ALL);
     if (err) {
-        tm_err("spawn: reloc cnode_copy failed err=%u", (unsigned long)err);
+        tm_err("spawn: reloc cnode_copy failed err=%lu", (unsigned long)err);
         return -1;
     }
     err = qsoe_riscv_page_map(s_reloc_copy_slot, seL4_CapInitThreadVSpace,
                               TM_SCRATCH_VADDR, QSOE_RIGHTS_ALL,
                               QSOE_VM_ATTR_DEFAULT);
     if (err) {
-        tm_err("spawn: reloc Page_Map failed err=%u", (unsigned long)err);
+        tm_err("spawn: reloc Page_Map failed err=%lu", (unsigned long)err);
         qsoe_cnode_delete(s_cnode_root, s_reloc_copy_slot, 64);
         return -1;
     }
@@ -502,7 +502,7 @@ int tm_spawn_read_args(tm_process_t *proc, unsigned long args_va,
 
     seL4_CPtr frame = tm_process_find_frame(proc, args_va);
     if (!frame) {
-        tm_err("tm_spawn_read_args: pid %d has no mmap covering va=%08x",
+        tm_err("tm_spawn_read_args: pid %ld has no mmap covering va=%08lx",
                (long)proc->pid, args_va);
         return -EINVAL;
     }
@@ -514,7 +514,7 @@ int tm_spawn_read_args(tm_process_t *proc, unsigned long args_va,
                                      s_cnode_root, frame, 64,
                                      QSOE_RIGHTS_ALL);
     if (err) {
-        tm_err("tm_spawn_read_args: cnode_copy failed err=%u",
+        tm_err("tm_spawn_read_args: cnode_copy failed err=%lu",
                (unsigned long)err);
         return -ENOMEM;
     }
@@ -522,7 +522,7 @@ int tm_spawn_read_args(tm_process_t *proc, unsigned long args_va,
                               TM_SCRATCH_MEGA_VADDR, QSOE_RIGHTS_ALL,
                               QSOE_VM_ATTR_DEFAULT);
     if (err) {
-        tm_err("tm_spawn_read_args: Page_Map failed err=%u",
+        tm_err("tm_spawn_read_args: Page_Map failed err=%lu",
                (unsigned long)err);
         qsoe_cnode_delete(s_cnode_root, s_args_scratch_slot, 64);
         return -ENOMEM;
@@ -556,7 +556,7 @@ int tm_zero_megaframe(seL4_CPtr frame)
                                         TM_SCRATCH_MEGA_VADDR,
                                         QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
     if (err) {
-        tm_err("tm_zero_megaframe: Page_Map failed err=%u",
+        tm_err("tm_zero_megaframe: Page_Map failed err=%lu",
                (unsigned long)err);
         return -ENOMEM;
     }
@@ -629,7 +629,7 @@ static int load_elf_segments(seL4_CPtr vspace, const void *elf_blob,
             err = qsoe_riscv_page_map(frame, vspace, v, rights,
                                        QSOE_VM_ATTR_DEFAULT);
             if (err) {
-                tm_err("spawn: load_elf Page_Map failed va=%08x", (unsigned long)v);
+                tm_err("spawn: load_elf Page_Map failed va=%08lx", (unsigned long)v);
                 return -ENOMEM;
             }
             if (spawn_record_frame((unsigned long)v, frame) != 0)
@@ -811,7 +811,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     for (u16 i = 0; i < eh->e_phnum; ++i) {
         if (ph[i].p_type == PT_INTERP) { interp_ph = &ph[i]; break; }
     }
-    tm_info("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
+    tm_dbg("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
             eh->e_type, eh->e_phnum, interp_ph ? "yes" : "no");
 
     int          dyn_link        = 0;
@@ -925,7 +925,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             tm_err("spawn: libc.so reloc failed");
             return -ENOEXEC;
         }
-        tm_info("spawn: libc.so relocs %lu/%lu (%lu skipped)", ap, tot, sk);
+        tm_dbg("spawn: libc.so relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
         tm_reloc_resolver_t libc_resolver;
         if (tm_reloc_init_resolver(&libc_view, DL_LIBC_LOAD_VA,
@@ -941,7 +941,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             tm_err("spawn: rtld reloc failed");
             return -ENOEXEC;
         }
-        tm_info("spawn: rtld relocs %lu/%lu (%lu skipped)", ap, tot, sk);
+        tm_dbg("spawn: rtld relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
         if (tm_reloc_apply(&main_view, /*bias=*/0, &libc_resolver,
                             reloc_write_cb, tm_reloc_skip_warn,
@@ -950,7 +950,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             tm_err("spawn: main reloc failed");
             return -ENOEXEC;
         }
-        tm_info("spawn: main relocs %lu/%lu (%lu skipped)", ap, tot, sk);
+        tm_dbg("spawn: main relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
         /* AT_PHDR is the VA of the main image's program-header table.
          * The PHDR table sits in the first PT_LOAD; compute its VA as
@@ -984,7 +984,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         dyn_link       = 1;
 
         const unsigned char *rb = (const unsigned char *)rtld_blob;
-        tm_info("spawn: skip rtld magic=%02x%02x%02x%02x rtld_entry=%08x pc=%08x phdr_va=%08x",
+        tm_dbg("spawn: skip rtld magic=%02x%02x%02x%02x rtld_entry=%08lx pc=%08lx phdr_va=%08lx",
                 rb[0], rb[1], rb[2], rb[3],
                 (unsigned long)rtld_eh->e_entry,
                 (unsigned long)entry_pc,
@@ -1301,7 +1301,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * raw index here -- NOT the encoded TASKMAN_CHID = (gen<<16)|idx
      * the user-facing ABI exposes (see <sys/qsoe.h>).               */
     int primary_idx = tm_channel_index(QSOE_PID_TASKMAN, /*raw chid*/1);
-    tm_info("spawn: probe channel pid=%u chid=1 -> idx=%d",
+    tm_dbg("spawn: probe channel pid=%lu chid=1 -> idx=%ld",
             (unsigned long)QSOE_PID_TASKMAN, (long)primary_idx);
     if (primary_idx < 0) {
         tm_err("spawn: primary channel not registered yet");
@@ -1338,7 +1338,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                                  s_cnode_root, src,
                                                  TM_DEPTH_TASKMAN);
                 if (merr) {
-                    tm_err("spawn: objcnode move failed err=%u",
+                    tm_err("spawn: objcnode move failed err=%lu",
                            (unsigned long)merr);
                     return -ENOMEM;
                 }
@@ -1356,7 +1356,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                                  s_cnode_root, src,
                                                  TM_DEPTH_TASKMAN);
                 if (merr) {
-                    tm_err("spawn: objcnode PT move failed err=%u",
+                    tm_err("spawn: objcnode PT move failed err=%lu",
                            (unsigned long)merr);
                     return -ENOMEM;
                 }

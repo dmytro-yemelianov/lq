@@ -1,10 +1,16 @@
 # QSOE — top-level Makefile (iteration v0.1)
 #
-# Produces build/qsoe.elf, a bootable image for qemu-system-riscv64.
-# The image is the seL4 ELF-loader, with a CPIO archive of [kernel.elf,
-# taskman] linked into its .rodata section.
+# Produces build/qsoe-l-<board>.elf for every board selected in Kconfig
+# (qsoe-l-qemu.elf by default; qsoe-l-sifive.elf for the FU740).  Boards
+# are chosen via `make menuconfig` (multi-select -- you can build one or
+# both at once).  The image is the seL4 ELF-loader, with a CPIO archive
+# of [kernel.elf, taskman] linked into its .rodata section.
 #
 #   OpenSBI  →  elfloader  →  seL4 kernel  →  taskman (rootserver)
+#
+# The userspace (libc, rtld, libtaskman, taskman, modpkg.cpio) is
+# board-independent and built ONCE; only the seL4 kernel and the
+# elfloader (which bakes in the board's FirstHartID) are per-board.
 #
 # Build inputs:
 #   ../sel4-bootstrap/seL4/        — upstream seL4 kernel; cloned by `make
@@ -14,27 +20,18 @@
 #                                    `make prepare` (shallow).  We compile
 #                                    elfloader-tool/src/ ourselves with
 #                                    rules below; no CMake involvement.
-#   ../common/                     — umbrella shared code.  Currently:
-#                                    libcpio (vendored from seL4 util_libs;
-#                                    see ../common/NOTICE-libcpio.md).  A
-#                                    self-referencing symlink `cpio -> .`
-#                                    makes both `<cpio.h>` and the
-#                                    upstream-style `<cpio/cpio.h>`
-#                                    resolve to ../common/cpio.h, so no
-#                                    per-OS shim header is needed.
-#   taskman/                       — hand-written taskman + vendored
-#                                    sel4runtime (taskman/runenv/).
-#
-# Generated configuration headers (build/gen/) are written by this Makefile
-# directly, with the minimum set of CONFIG_ defines the RISC-V elfloader
-# actually references.
+#   ../common/                     — umbrella shared code (libcpio).
+#   taskman/                       — hand-written taskman + sel4runtime.
 #
 # Targets:
-#   make            build build/qsoe.elf            (default)
-#   ./emu.sh        boot it under qemu-system-riscv64
-#   make kernel     build kernel.elf only
-#   make clean      remove build/
-#   make distclean  also remove ../sel4test-full/build-qsoe-riscv64/
+#   make                  build every selected board's qsoe-l-<board>.elf
+#   make menuconfig       choose the target board(s) (QEMU virt / SiFive)
+#   make qemu_defconfig   QEMU virt only (the default)
+#   make sifive_defconfig SiFive Unmatched (FU740) only
+#   make both_defconfig   build both boards
+#   ./emu.sh              boot the qemu image under qemu-system-riscv64
+#   make clean            remove build/  (.config is preserved)
+#   make distclean        also remove the seL4 kernel build dirs
 
 # ----------------------------------------------------------------------------
 # Toolchain
@@ -52,37 +49,27 @@ QEMU    := qemu-system-riscv64
 TOP         := $(CURDIR)
 BUILD       := $(TOP)/build
 GEN         := $(BUILD)/gen
-ELFBUILD    := $(BUILD)/elfloader
 TASKBUILD   := $(BUILD)/taskman
 
 # Bootstrap clones live at the QSOE umbrella root (~/proj/QSOE/
-# sel4-bootstrap/), one level UP from lq/.  `make prepare` populates
-# them on first build; downstream rules reach into them by path.
+# sel4-bootstrap/), one level UP from lq/.  `make prepare` populates them.
 SEL4_BOOTSTRAP := $(abspath $(TOP)/..)/sel4-bootstrap
 SEL4_DIR       := $(SEL4_BOOTSTRAP)/seL4
 SEL4_TOOLS_DIR := $(SEL4_BOOTSTRAP)/seL4_tools
 
 # Elfloader sources live INSIDE seL4_tools' clone; we compile them
-# ourselves with our own Make rules — no upstream CMake involvement
-# for the elfloader.
+# ourselves with our own Make rules — no upstream CMake involvement.
 ELFSRC      := $(SEL4_TOOLS_DIR)/elfloader-tool/src
 ELFINCLUDE  := $(SEL4_TOOLS_DIR)/elfloader-tool/include
 
 # libcpio lives in the umbrella's common/ tree (vendored from seL4
-# util_libs, BSD-2-Clause; see ../common/NOTICE-libcpio.md).  A
-# `cpio -> .` symlink at common/cpio lets the upstream-style include
-# `<cpio/cpio.h>` resolve to common/./cpio.h via the same -I path
-# that our flat `<cpio.h>` uses -- no per-OS shim header needed.
+# util_libs, BSD-2-Clause; see ../common/NOTICE-libcpio.md).
 LIBCPIO     := $(TOP)/../common
 
 TASKMAN_DIR := $(TOP)/taskman
 
 # libc — shared OS-independent body lives in the sibling repo
-# ~/proj/QSOE/libc/; LQ's seL4-specific seam (POSIX entry points that
-# translate to TM_REQ_* over seL4 IPC) lives in lq/libc/.  The local
-# Makefile under lq/libc/ drives the cross-tree build and lands the
-# archives under $(BUILD)/libc/.  Replaced the older vendored musl
-# tree at core/userland/libc/ on 2026-05-31.
+# ~/proj/QSOE/libc/; LQ's seL4-specific seam lives in lq/libc/.
 LIBC_DIR     := $(TOP)/libc
 LIBC_BUILD   := $(BUILD)/libc
 LIBC_A       := $(LIBC_BUILD)/libc.a
@@ -90,100 +77,92 @@ LIBC_SO      := $(LIBC_BUILD)/libc.so
 LIBC_CRT0    := $(LIBC_BUILD)/crt0.o
 LIBC_INCLUDE := $(TOP)/../libc/include
 
-# libtaskman — OS-independent body of every QSOE taskman.  Lives at the
-# umbrella root, will graduate to its own gitlab repo (qsoe/libtaskman).
-# Linked into taskman.elf; provides pathmgr / cred / syscfg / cpio /
-# elf primitives plus init/seams.  See ~/proj/QSOE/libtaskman/CLAUDE.md
-# (when written) and project_libtaskman memory.
-LIBTASKMAN_DIR := $(abspath $(TOP)/..)/libtaskman
+# libtaskman — OS-independent body of every QSOE taskman.
+LIBTASKMAN_DIR   := $(abspath $(TOP)/..)/libtaskman
 LIBTASKMAN_BUILD := $(BUILD)/libtaskman
 LIBTASKMAN_A     := $(LIBTASKMAN_BUILD)/libtaskman.a
 
-# rtld -- the QSOE dynamic linker (ld-qsoe.so.1).  Lives in the shared
-# libc/rtld/ tree (OS-independent: walks libc.so's .dynsym at startup
-# for POSIX entrypoints, no raw kernel calls).  Borrowed from FreeBSD,
-# see project_borrow_rtld memory.
+# rtld -- the QSOE dynamic linker (ld-qsoe.so.1).
 RTLD_DIR        := $(abspath $(TOP)/..)/libc/rtld
 RTLD_BUILD      := $(BUILD)/rtld
 RTLD_SO         := $(RTLD_BUILD)/ld-qsoe.so.1
 
-# ----------------------------------------------------------------------------
-# Target platform (PLAT) — selects the seL4 KernelPlatform and the few
-# board-specific knobs that differ between QEMU and real hardware.
-#
-#   make                 build for qemu-riscv-virt (default; ./emu.sh)
-#   make PLAT=hifive     build for the SiFive Unmatched / FU740 (seL4's
-#                        `hifive` platform); also emits the raw
-#                        build/qsoe-l-fu740.bin for U-Boot / mr-bml.
-#
-# Only two things actually differ per platform at this layer:
-#   * KernelPlatform passed to the seL4 cmake (+ QEMU_MEMORY, which is a
-#     QEMU-only configure-time knob — the hifive memory map comes from
-#     the board DTS, so it must NOT be forced there).
-#   * CONFIG_FIRST_HART_ID baked into the elfloader's autoconf.h: the
-#     FU740 boots the OS on its four U74 application cores (harts 1..4)
-#     while hart 0 is the S7 monitor, so seL4's hifive platform sets
-#     FirstHartID=1.  The elfloader uses CONFIG_FIRST_HART_ID to know
-#     which secondary harts to release — getting it wrong on hifive
-#     would start the monitor hart and skip an application core.
-# Per-platform kernels build into separate dirs so switching PLAT
-# doesn't reconfigure the other platform's kernel.
-# ----------------------------------------------------------------------------
-PLAT ?= qemu-riscv-virt
-
-ifeq ($(PLAT),qemu-riscv-virt)
-SEL4BUILD       := $(SEL4_BOOTSTRAP)/build-qsoe-riscv64
-FIRST_HART_ID   := 0
-KERNEL_QEMU_MEM := -DQEMU_MEMORY=512
-else ifeq ($(PLAT),hifive)
-SEL4BUILD       := $(SEL4_BOOTSTRAP)/build-qsoe-hifive
-FIRST_HART_ID   := 1
-KERNEL_QEMU_MEM :=
-else
-$(error unknown PLAT '$(PLAT)' — use qemu-riscv-virt or hifive)
-endif
-
-KERNEL_SRC  := $(SEL4BUILD)/kernel.elf
-KERNEL_ELF  := $(BUILD)/kernel.elf
-
-IMAGE         := $(BUILD)/qsoe.elf
-TASKMAN_ELF   := $(BUILD)/taskman.elf
-
-# FU740 / SiFive Unmatched raw boot image.  The `hifive` PLAT links the
-# elfloader (IMAGE) at IMAGE_START_ADDR; objcopy strips the ELF wrapper
-# to a flat binary that U-Boot (`go`) or mr-bml can load + jump to at
-# that address.  The variant is spelled out in the name -- QSOE/L on
-# FU740 -- so a first-time user can tell what they are flashing at a
-# glance (plain "qsoe" is ambiguous between /L and /N).  Produced
-# automatically by the hifive build; see the `image:` rule below.
-FU740_BIN     := $(BUILD)/qsoe-l-fu740.bin
-
-# Userland module package -- the spawnable-binary archive that taskman
-# walks at runtime.  Lives in the sibling quser/ tree (one repo per QRV
-# convention) and is built there by `make -C ../quser cpio`.  This LQ
-# build does NOT produce its own userland.cpio (retired 2026-05-31).
-# Taskman embeds the archive via .incbin (see taskman/Makefile and
-# taskman/main.c #else branch); the bytes therefore travel inside
-# taskman.elf, no QEMU `-initrd` plumbing.  A vestigial FDT-driven
-# loader path is parked behind -DTM_USE_INITRD_LOADER pending
-# elfloader work on reserved-memory delivery -- see
-# taskman/sys/initrd.c.
+# Userland module package (board-independent), built in the quser/ tree.
 QUSER         := $(abspath $(TOP)/..)/quser
 MODPKG_CPIO   := $(QUSER)/build/modpkg.cpio
 export MODPKG_CPIO
 
+# taskman.elf is board-independent (the seL4 API it builds against is the
+# same on every platform) and therefore built once and shared.
+TASKMAN_ELF   := $(BUILD)/taskman.elf
+
 # ----------------------------------------------------------------------------
-# Platform configuration (qemu-riscv-virt, RV64)
+# Board selection — Kconfig (lq/Kconfig -> lq/.config), multi-select.
+# `make menuconfig`, or `make {qemu,sifive,both}_defconfig`.  .config lives
+# at the repo root (survives `make clean`); -include pulls CONFIG_* in at
+# parse time.  Absent (fresh checkout) the qemu default applies, and the
+# `.config` rule bootstraps one via alldefconfig.
+# ----------------------------------------------------------------------------
+-include $(TOP)/.config
+
+CONFIG_MAX_NUM_NODES ?= 4               # parse-time default for a fresh tree
+
+BOARDS :=
+ifeq ($(CONFIG_PLAT_QEMU_VIRT),y)
+BOARDS += qemu
+endif
+ifeq ($(CONFIG_PLAT_SIFIVE),y)
+BOARDS += sifive
+endif
+
+# ----------------------------------------------------------------------------
+# Kconfig drive -- python3-kconfiglib, same as QSOE/N (nq/Makefile).
+# ----------------------------------------------------------------------------
+KCFG_LIB := /usr/lib/python3/dist-packages
+KCFG_ENV := KCONFIG_CONFIG=$(TOP)/.config \
+            KCONFIG_AUTOHEADER=$(GEN)/autoconf.h \
+            srctree=$(TOP)
+
+define kcfg_genheader
+	@mkdir -p $(GEN)
+	@$(KCFG_ENV) python3 $(KCFG_LIB)/genconfig.py --header-path $(GEN)/autoconf.h $(TOP)/Kconfig
+endef
+
+# ----------------------------------------------------------------------------
+# Per-board values.  BOARD is set by the outer make when it recurses into
+# a single board (board-% target); empty in the outer (dispatch) make.
+# The seL4 kernel rules below derive KernelPlatform/QEMU_MEMORY from the
+# build-dir name via target-specific variables, so they are independent of
+# BOARD and work for both the per-board kernels and the shared taskman's
+# (qemu) API headers.
+# ----------------------------------------------------------------------------
+ifeq ($(BOARD),sifive)
+FIRST_HART_ID   := 1
+SEL4BUILD       := $(SEL4_BOOTSTRAP)/build-qsoe-hifive
+else
+FIRST_HART_ID   := 0
+SEL4BUILD       := $(SEL4_BOOTSTRAP)/build-qsoe-riscv64
+endif
+
+BBUILD      := $(BUILD)/$(BOARD)
+ELFBUILD    := $(BBUILD)/elfloader
+KERNEL_SRC  := $(SEL4BUILD)/kernel.elf
+KERNEL_ELF  := $(BBUILD)/kernel.elf
+IMAGE       := $(BUILD)/qsoe-l-$(BOARD).elf
+BOOT_BIN    := $(BUILD)/qsoe-l-$(BOARD).bin
+
+# taskman's seL4 ABI headers come from the qemu build dir (the seL4 API is
+# board-independent, so this is correct for a sifive-only build too).
+TM_SEL4BUILD := $(SEL4_BOOTSTRAP)/build-qsoe-riscv64
+
+# ----------------------------------------------------------------------------
+# Platform constants (board-independent today)
 # ----------------------------------------------------------------------------
 
-# Final address the elfloader relocates itself to. OpenSBI initially loads us
-# at 0x80200000 (its default next-stage address), and the seL4 kernel.elf is
-# linked to that same physical address. fixup_image_base() in crt0.S sees the
-# mismatch and copies the elfloader image up here, clearing the kernel region.
+# Final address the elfloader relocates itself to (links + enters here).
 IMAGE_START_ADDR := 0x84000000
 
 # Memory region exposed to the elfloader. 512 MiB starting at 0x80000000.
-# Must agree with the `-m` value passed to qemu in the `run` target below.
 MEM_START := 0x80000000UL
 MEM_END   := 0xA0000000UL
 
@@ -193,10 +172,14 @@ MEM_END   := 0xA0000000UL
 
 ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mstrict-align
 
+# CONFIG_FIRST_HART_ID is injected here (per board) rather than via
+# autoconf.h, since autoconf.h is shared and a single value could not be
+# correct when both boards are built.
 EL_CFLAGS := $(ARCH_CFLAGS) \
     -ffreestanding -nostdlib -nostdinc \
     -fno-pic -fno-pie -fno-common -fno-stack-protector \
     -fno-builtin -D_XOPEN_SOURCE=700 -D__KERNEL_64__ \
+    -DCONFIG_FIRST_HART_ID=$(FIRST_HART_ID) \
     -Wall -Wextra
 
 EL_INCLUDES := \
@@ -205,26 +188,10 @@ EL_INCLUDES := \
     -I$(ELFINCLUDE)/arch-riscv \
     -I$(LIBCPIO)
 
-# Taskman's sel4_types.h / sel4_syscalls.h are our own minimal seL4
-# surface, but they transitively #include <arch/api/invocation.h>
-# and <arch/api/syscall.h> — generated by the kernel build, 4 files
-# under $(SEL4BUILD)/gen_headers/.  Anyone using TM_CFLAGS therefore
-# needs that include path.
-TM_CFLAGS := $(ARCH_CFLAGS) \
-    -ffreestanding -nostdlib -nostdinc \
-    -fno-pic -fno-pie -fno-common -fno-stack-protector \
-    -fno-builtin -Wall -Wextra \
-    -I$(GEN) \
-    -I$(SEL4BUILD)/gen_headers \
-    -I$(LIBC_INCLUDE)
-
 # ----------------------------------------------------------------------------
 # Source lists
 # ----------------------------------------------------------------------------
 
-# Elfloader sources actually needed for RISC-V (drivers/ is ARM-only
-# upstream).  Sources span two roots — upstream seL4_tools and our
-# vendored libcpio — so the object-name mapping is done explicitly.
 EL_UP_C_SRCS := \
     $(ELFSRC)/common.c \
     $(ELFSRC)/defaults.c \
@@ -241,48 +208,166 @@ EL_UP_S_SRCS := $(ELFSRC)/arch-riscv/crt0.S
 
 EL_CPIO_C_SRCS := $(LIBCPIO)/cpio.c
 
+# Resolves under the per-board $(ELFBUILD) when BOARD is set (inner make).
 EL_OBJS := \
     $(patsubst $(ELFSRC)/%.c,$(ELFBUILD)/elfloader/%.o,$(EL_UP_C_SRCS)) \
     $(patsubst $(ELFSRC)/%.S,$(ELFBUILD)/elfloader/%.o,$(EL_UP_S_SRCS)) \
     $(patsubst $(LIBCPIO)/%.c,$(ELFBUILD)/cpio/%.o,$(EL_CPIO_C_SRCS))
 
+THIS_MAKEFILE := $(firstword $(MAKEFILE_LIST))
+
 # ----------------------------------------------------------------------------
-# Default target
+# Generated configuration headers (board-independent, shared in build/gen).
 # ----------------------------------------------------------------------------
 
-.PHONY: all image kernel clean distclean prepare
-.DEFAULT_GOAL := all
+GEN_HEADERS := \
+    $(GEN)/autoconf.h \
+    $(GEN)/elfloader/gen_config.h \
+    $(GEN)/image_start_addr.h \
+    $(GEN)/platform_info.h
 
-# `all` triggers `prepare` first so a clean clone is auto-populated
-# on the very first build.  `prepare` is idempotent: it checks for
-# the bootstrap clones and only fetches what is missing.  modpkg is
-# also folded in so a clean `make` produces both qsoe.elf AND the
-# userland CPIO that emu.sh hands to QEMU as initrd.
-all: prepare image modpkg
-image: $(IMAGE)
+# autoconf.h is generated from Kconfig (lq/Kconfig + lq/.config) by
+# kconfiglib's genconfig, mirroring QSOE/N.  Board-independent.
+$(GEN)/autoconf.h: $(TOP)/.config $(TOP)/Kconfig
+	@mkdir -p $(@D)
+	@echo "  KCFG    $@"
+	@$(KCFG_ENV) python3 $(KCFG_LIB)/genconfig.py --header-path $@ $(TOP)/Kconfig
 
-# Selecting the FU740 platform also yields the raw qsoe-l-fu740.bin
-# (the v0.11 Kconfig will make this a CONFIG_KERNEL_VARIANT_FU740
-# selection; for now it keys off PLAT=hifive).
-ifeq ($(PLAT),hifive)
-image: $(FU740_BIN)
-endif
+$(GEN)/elfloader/gen_config.h: $(THIS_MAKEFILE)
+	@mkdir -p $(@D)
+	@printf '%s\n' \
+	    '/* Auto-generated by QSOE Makefile. Do not edit. */' \
+	    '#pragma once' \
+	    '#define CONFIG_HASH_NONE 1' \
+	    > $@
 
-$(FU740_BIN): $(IMAGE)
+$(GEN)/image_start_addr.h: $(THIS_MAKEFILE)
+	@mkdir -p $(@D)
+	@printf '%s\n' \
+	    '/* Auto-generated by QSOE Makefile. Do not edit. */' \
+	    '#pragma once' \
+	    '#define IMAGE_START_ADDR $(IMAGE_START_ADDR)' \
+	    > $@
+
+$(GEN)/platform_info.h: $(THIS_MAKEFILE)
+	@mkdir -p $(@D)
+	@printf '%s\n' \
+	    '/* Auto-generated by QSOE Makefile. Do not edit. */' \
+	    '#pragma once' \
+	    'struct memory_region {' \
+	    '    unsigned long start;' \
+	    '    unsigned long end;' \
+	    '};' \
+	    'static const struct memory_region memory_region[] = {' \
+	    '    { $(MEM_START), $(MEM_END) },' \
+	    '};' \
+	    'static const int num_memory_regions = 1;' \
+	    > $@
+
+# ----------------------------------------------------------------------------
+# Elfloader: per-file compile rules (objects land under the per-board
+# $(ELFBUILD); EL_CFLAGS carries that board's CONFIG_FIRST_HART_ID).
+# ----------------------------------------------------------------------------
+
+$(ELFBUILD)/elfloader/%.o: $(ELFSRC)/%.c $(GEN_HEADERS) | prepare
+	@mkdir -p $(@D)
+	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
+
+$(ELFBUILD)/elfloader/%.o: $(ELFSRC)/%.S $(GEN_HEADERS) | prepare
+	@mkdir -p $(@D)
+	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
+
+$(ELFBUILD)/cpio/%.o: $(LIBCPIO)/%.c $(GEN_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
+
+$(ELFBUILD)/linker.lds_pp: $(ELFSRC)/linker.lds $(GEN_HEADERS) | prepare
+	@mkdir -p $(@D)
+	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -P -E -x c -o $@ $<
+
+# ----------------------------------------------------------------------------
+# seL4 kernel: built via cmake against ../sel4-bootstrap/seL4/.  One build
+# dir per board; KernelPlatform + QEMU_MEMORY come from target-specific
+# variables keyed on the dir name, so these rules don't depend on $(BOARD)
+# (the shared taskman triggers the qemu dir; each board triggers its own).
+# ----------------------------------------------------------------------------
+
+$(SEL4_BOOTSTRAP)/build-qsoe-riscv64/kernel.elf: KPLAT := qemu-riscv-virt
+$(SEL4_BOOTSTRAP)/build-qsoe-riscv64/kernel.elf: KMEM  := -DQEMU_MEMORY=512
+$(SEL4_BOOTSTRAP)/build-qsoe-hifive/kernel.elf:  KPLAT := hifive
+$(SEL4_BOOTSTRAP)/build-qsoe-hifive/kernel.elf:  KMEM  :=
+
+# QEMU_MEMORY=512 (MiB) is baked into the qemu kernel at CONFIGURE time and
+# MUST match `-m 512M` in ./emu.sh, else the kernel maps phantom RAM and
+# faults (scause=7).  The hifive memory map comes from the board DTS, so
+# QEMU_MEMORY must NOT be forced there.
+$(SEL4_BOOTSTRAP)/build-qsoe-%/kernel.elf: | prepare
+	@echo "==> Configuring + building seL4 kernel in $(@D) (one-time cmake ~1 min)..."
+	@mkdir -p $(@D)
+	cd $(@D) && cmake -G Ninja \
+	    -DCMAKE_SYSTEM_NAME=Generic \
+	    -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+	    -DCMAKE_ASM_COMPILER=riscv64-linux-gnu-gcc \
+	    -DCROSS_COMPILER_PREFIX=riscv64-linux-gnu- \
+	    -DKernelPlatform=$(KPLAT) \
+	    -DKernelSel4Arch=riscv64 \
+	    -DKernelMaxNumNodes=$(CONFIG_MAX_NUM_NODES) \
+	    -DKernelIsMCS=ON \
+	    -DKernelVerificationBuild=OFF \
+	    $(KMEM) \
+	    $(SEL4_DIR)
+	cd $(@D) && ninja kernel.elf
+
+# Per-board copy into the board's build subtree (feeds archive.cpio).
+$(KERNEL_ELF): $(KERNEL_SRC)
+	@mkdir -p $(@D)
+	cp $(KERNEL_SRC) $@
+
+# ----------------------------------------------------------------------------
+# CPIO archive: [kernel.elf, taskman.elf] → archive.cpio → archive.o.
+# Per board (its kernel + the shared taskman.elf).
+# ----------------------------------------------------------------------------
+
+$(BBUILD)/archive.cpio: $(KERNEL_ELF) $(TASKMAN_ELF)
+	@mkdir -p $(@D)
+	@cp $(TASKMAN_ELF) $(BBUILD)/taskman.elf
+	@cd $(BBUILD) && \
+	    printf '%s\n' kernel.elf taskman.elf | \
+	    cpio --quiet --create -H newc \
+	         --owner=+0:+0 --reproducible \
+	         --file=archive.cpio
+
+$(ELFBUILD)/archive.S: $(BBUILD)/archive.cpio $(THIS_MAKEFILE)
+	@mkdir -p $(@D)
+	@printf '%s\n' \
+	    '.section ._archive_cpio,"aw"' \
+	    '.globl _archive_start, _archive_start_end' \
+	    '_archive_start:' \
+	    '.incbin "$<"' \
+	    '_archive_start_end:' \
+	    > $@
+
+$(ELFBUILD)/archive.o: $(ELFBUILD)/archive.S
+	$(CC) $(EL_CFLAGS) -c -o $@ $<
+
+# ----------------------------------------------------------------------------
+# Final link → build/qsoe-l-<board>.elf  (+ the raw .bin for SiFive).
+# ----------------------------------------------------------------------------
+
+$(IMAGE): $(EL_OBJS) $(ELFBUILD)/archive.o $(ELFBUILD)/linker.lds_pp
+	$(CC) $(EL_CFLAGS) -static -nostdlib \
+	    -Wl,-T,$(ELFBUILD)/linker.lds_pp \
+	    -Wl,--build-id=none \
+	    -Wl,--no-warn-rwx-segments \
+	    -o $@ $(EL_OBJS) $(ELFBUILD)/archive.o
+
+$(BOOT_BIN): $(IMAGE)
 	$(CROSS)objcopy -O binary $< $@
-	@echo "  BIN     $@  (QSOE/L on FU740; U-Boot/mr-bml load + go @ $(IMAGE_START_ADDR))"
+	@echo "  BIN     $@  (QSOE/L on FU740; U-Boot load + go @ $(IMAGE_START_ADDR))"
 
 # ----------------------------------------------------------------------------
-# Prepare: shallow-clone seL4 + seL4_tools into ../sel4-bootstrap/.
-#
-# Two repos.  No `repo` tool, no manifest, no test apps, no musl, no
-# CapDL, no nanopb — just the kernel and the elfloader source we
-# actually compile.  Total footprint ~50 MB vs ~2 GB for the full
-# sel4test-manifest checkout.
-#
-# Idempotent: existing clones are left alone.  To refresh, either
-# `git pull` inside each clone, or `rm -rf ../sel4-bootstrap/` and
-# re-run `make prepare`.
+# prepare: shallow-clone seL4 + seL4_tools into ../sel4-bootstrap/.
+# Idempotent: existing clones are left alone.
 # ----------------------------------------------------------------------------
 
 SEL4_URL       := https://github.com/seL4/seL4.git
@@ -302,130 +387,104 @@ prepare:
 	    echo "==> seL4_tools already present at $(SEL4_TOOLS_DIR)"; \
 	fi
 
-# ----------------------------------------------------------------------------
-# Generated configuration headers
-# ----------------------------------------------------------------------------
+ifeq ($(BOARD),)
+# ============================================================================
+# OUTER make (BOARD unset): build the shared userspace once, then recurse
+# into each selected board to build its kernel + elfloader + ELF.
+# ============================================================================
 
-GEN_HEADERS := \
-    $(GEN)/autoconf.h \
-    $(GEN)/elfloader/gen_config.h \
-    $(GEN)/image_start_addr.h \
-    $(GEN)/platform_info.h
+ifeq ($(strip $(BOARDS)),)
+$(error No target board selected — run `make menuconfig` and enable at least \
+one board, or use `make qemu_defconfig` / `sifive_defconfig` / `both_defconfig`)
+endif
 
-# Track the Makefile itself so that editing values (like IMAGE_START_ADDR)
-# in the variable block above forces the generated headers to regenerate.
-THIS_MAKEFILE := $(firstword $(MAKEFILE_LIST))
+.PHONY: all shared prepare clean distclean libc rtld libtaskman taskman modpkg \
+        menuconfig defconfig qemu_defconfig sifive_defconfig both_defconfig \
+        $(addprefix board-,$(BOARDS))
+.DEFAULT_GOAL := all
 
-# build/gen/ is shared across platforms, but autoconf.h bakes in
-# CONFIG_FIRST_HART_ID (PLAT-dependent).  A `make PLAT=hifive` after a
-# qemu build doesn't touch the Makefile, so the gen headers wouldn't
-# otherwise regenerate with the new hart-id.  This PLAT-named stamp is
-# absent after a platform switch, re-firing the gen-header rules (and
-# the downstream elfloader objects + qsoe.elf link).
-PLAT_STAMP := $(GEN)/.plat-$(PLAT)
-$(PLAT_STAMP):
-	@mkdir -p $(@D) && rm -f $(GEN)/.plat-* && touch $@
+BOARD_TARGETS := $(addprefix board-,$(BOARDS))
 
-$(GEN_HEADERS): $(THIS_MAKEFILE) $(PLAT_STAMP)
+all: prepare shared $(BOARD_TARGETS)
 
-$(GEN)/autoconf.h:
-	@mkdir -p $(@D)
-	@printf '%s\n' \
-	    '/* Auto-generated by QSOE Makefile. Do not edit. */' \
-	    '#pragma once' \
-	    '#define CONFIG_PT_LEVELS         3' \
-	    '#define CONFIG_FIRST_HART_ID     $(FIRST_HART_ID)' \
-	    '#define CONFIG_MAX_NUM_NODES     4' \
-	    '#define CONFIG_ENABLE_SMP_SUPPORT 1' \
-	    > $@
+# Everything board-independent: built once, before any board recurses.
+shared: $(GEN_HEADERS) $(LIBC_A) $(LIBC_SO) $(LIBC_CRT0) $(RTLD_SO) \
+        $(LIBTASKMAN_A) $(TASKMAN_ELF) $(MODPKG_CPIO)
 
-$(GEN)/elfloader/gen_config.h:
-	@mkdir -p $(@D)
-	@printf '%s\n' \
-	    '/* Auto-generated by QSOE Makefile. Do not edit. */' \
-	    '#pragma once' \
-	    '#define CONFIG_HASH_NONE 1' \
-	    > $@
+# Static-pattern (not implicit) rule so it still fires for these .PHONY
+# targets -- GNU make skips implicit/pattern rules for phony targets.
+$(BOARD_TARGETS): board-%: shared
+	+$(MAKE) BOARD=$* __image
 
-$(GEN)/image_start_addr.h:
-	@mkdir -p $(@D)
-	@printf '%s\n' \
-	    '/* Auto-generated by QSOE Makefile. Do not edit. */' \
-	    '#pragma once' \
-	    '#define IMAGE_START_ADDR $(IMAGE_START_ADDR)' \
-	    > $@
+# ---- Kconfig front-ends -----------------------------------------------------
+menuconfig:
+	@dpkg -s python3-kconfiglib >/dev/null 2>&1 || \
+		{ echo "Error: python3-kconfiglib not installed.";       \
+		  echo "  apt install python3-kconfiglib"; exit 1; }
+	$(KCFG_ENV) python3 $(KCFG_LIB)/menuconfig.py $(TOP)/Kconfig
+	$(call kcfg_genheader)
 
-$(GEN)/platform_info.h:
-	@mkdir -p $(@D)
-	@printf '%s\n' \
-	    '/* Auto-generated by QSOE Makefile. Do not edit. */' \
-	    '#pragma once' \
-	    'struct memory_region {' \
-	    '    unsigned long start;' \
-	    '    unsigned long end;' \
-	    '};' \
-	    'static const struct memory_region memory_region[] = {' \
-	    '    { $(MEM_START), $(MEM_END) },' \
-	    '};' \
-	    'static const int num_memory_regions = 1;' \
-	    > $@
+defconfig qemu_defconfig:
+	$(KCFG_ENV) python3 $(KCFG_LIB)/alldefconfig.py $(TOP)/Kconfig
+	$(call kcfg_genheader)
 
-# ----------------------------------------------------------------------------
-# Elfloader: per-file compile rules
-# ----------------------------------------------------------------------------
+sifive_defconfig:
+	$(KCFG_ENV) python3 $(KCFG_LIB)/alldefconfig.py $(TOP)/Kconfig
+	$(KCFG_ENV) python3 $(KCFG_LIB)/setconfig.py --kconfig $(TOP)/Kconfig \
+	    PLAT_QEMU_VIRT=n PLAT_SIFIVE=y
+	$(call kcfg_genheader)
 
-# Two source roots — upstream elfloader and our vendored libcpio —
-# get separate rules so the object-tree under $(ELFBUILD) mirrors
-# the source layout cleanly.
-$(ELFBUILD)/elfloader/%.o: $(ELFSRC)/%.c $(GEN_HEADERS) | prepare
-	@mkdir -p $(@D)
-	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
+both_defconfig:
+	$(KCFG_ENV) python3 $(KCFG_LIB)/alldefconfig.py $(TOP)/Kconfig
+	$(KCFG_ENV) python3 $(KCFG_LIB)/setconfig.py --kconfig $(TOP)/Kconfig \
+	    PLAT_SIFIVE=y
+	$(call kcfg_genheader)
 
-$(ELFBUILD)/elfloader/%.o: $(ELFSRC)/%.S $(GEN_HEADERS) | prepare
-	@mkdir -p $(@D)
-	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
+# Bootstrap: a fresh checkout with no .config gets the qemu defaults.
+$(TOP)/.config:
+	@echo "  KCFG    (bootstrap: alldefconfig -> .config)"
+	@$(KCFG_ENV) python3 $(KCFG_LIB)/alldefconfig.py $(TOP)/Kconfig
 
-$(ELFBUILD)/cpio/%.o: $(LIBCPIO)/%.c $(GEN_HEADERS)
-	@mkdir -p $(@D)
-	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -c -o $@ $<
+# ---- shared userspace -------------------------------------------------------
+AR := $(CROSS)ar
 
-# ----------------------------------------------------------------------------
-# Elfloader: preprocess linker script
-# ----------------------------------------------------------------------------
+libc:
+	+$(MAKE) -C $(LIBC_DIR) all
+$(LIBC_A) $(LIBC_SO) $(LIBC_CRT0): | libc
+	@true
 
-$(ELFBUILD)/linker.lds_pp: $(ELFSRC)/linker.lds $(GEN_HEADERS) | prepare
-	@mkdir -p $(@D)
-	$(CC) $(EL_CFLAGS) $(EL_INCLUDES) -P -E -x c -o $@ $<
+rtld: $(RTLD_SO)
+$(RTLD_SO):
+	@mkdir -p $(RTLD_BUILD)
+	+$(MAKE) -C $(RTLD_DIR) \
+	    O=$(RTLD_BUILD) \
+	    LIBC_INC=$(LIBC_INCLUDE) \
+	    EXTRA_CPPFLAGS=-DQSOE_KERNEL_SEL4 \
+	    ARCHFLAGS="-march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany" \
+	    all
 
-# ----------------------------------------------------------------------------
-# Taskman (rootserver — currently just spins)
-# ----------------------------------------------------------------------------
+libtaskman: $(LIBTASKMAN_A)
+$(LIBTASKMAN_A):
+	@mkdir -p $(LIBTASKMAN_BUILD)
+	+$(MAKE) -C $(LIBTASKMAN_DIR) \
+	    O=$(LIBTASKMAN_BUILD) \
+	    LIBC_INC=$(LIBC_INCLUDE) \
+	    PICFLAG=-fno-pic \
+	    ARCHFLAGS="$(ARCH_CFLAGS)" \
+	    all
 
-# Headers shared across taskman/libqsoe TUs.
-# v0.7: taskman was split into sys/ proc/ mem/ path/ subdirs; the
-# headers now live under those.  Keep them all in TM_HEADERS as the
-# coarse "if anything changed, rebuild" trigger.
-TM_HEADERS := \
-    $(TASKMAN_DIR)/sel4_syscalls.h \
-    $(TASKMAN_DIR)/sel4_types.h \
-    $(TASKMAN_DIR)/qsoe_invoke.h \
-    $(TASKMAN_DIR)/proc/proc.h \
-    $(TASKMAN_DIR)/proc/spawn.h \
-    $(TASKMAN_DIR)/mem/mem.h \
-    $(TASKMAN_DIR)/path/path.h \
-    $(TASKMAN_DIR)/path/pathmgr.h \
-    $(TASKMAN_DIR)/path/cpiofs.h \
-    $(TASKMAN_DIR)/sys/console.h \
-    $(TASKMAN_DIR)/sys/platform.h \
-    $(LIBC_INCLUDE)/sys/qsoe.h \
-    $(TASKMAN_DIR)/qsoe/slots.h \
-    $(LIBC_INCLUDE)/qsoe/tls.h \
-    $(LIBC_INCLUDE)/qsoe/tm_msgs.h \
-    $(GEN)/qsoe/sys_version.h
+# taskman is board-independent.  Its seL4 ABI headers come from the qemu
+# kernel build dir (the API is the same on every platform), so we depend on
+# that kernel.elf to guarantee the generated headers exist — even for a
+# sifive-only build.  (A future optimization could configure-only.)
+taskman: $(MODPKG_CPIO) $(LIBTASKMAN_A) $(GEN)/qsoe/sys_version.h \
+         $(TM_SEL4BUILD)/kernel.elf
+	+$(MAKE) -C $(TOP)/taskman all \
+	    LIBTASKMAN_A=$(LIBTASKMAN_A) LIBTASKMAN_INC=$(LIBTASKMAN_DIR)/include
+$(TASKMAN_ELF): | taskman
+	@true
 
-# Auto-generated version header. Pulls the latest git tag (vMAJOR.MINOR[.PATCH])
-# and emits the numeric components + a build date. Regenerates whenever
-# .git/HEAD or .git/index changes (new commit, branch switch, tag bump).
+# Version header. Regenerates whenever .git/HEAD or .git/index changes.
 $(GEN)/qsoe/sys_version.h: $(wildcard .git/HEAD .git/index)
 	@mkdir -p $(@D)
 	@VERSION=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
@@ -443,217 +502,25 @@ $(GEN)/qsoe/sys_version.h: $(wildcard .git/HEAD .git/index)
 	 printf '#define QSOE_BUILD_DATE "%s"\n\n' "$$(date +%Y-%m-%d)" >> $@; \
 	 printf '#endif\n' >> $@
 
-# ----------------------------------------------------------------------------
-# libc — build delegated to lq/libc/Makefile, which drives the shared
-# OS-independent body in ~/proj/QSOE/libc/ with LQ's seam.
-#
-# Run `make -C libc clean all` for a standalone rebuild.
-# ----------------------------------------------------------------------------
-
-AR := $(CROSS)ar
-
-.PHONY: libc
-libc:
-	+$(MAKE) -C $(LIBC_DIR) all
-
-# Order-only proxy: downstream rules listing $(LIBC_A) / $(LIBC_SO) /
-# $(LIBC_CRT0) as a prerequisite trigger the libc submake.
-$(LIBC_A) $(LIBC_SO) $(LIBC_CRT0): | libc
-	@true
-
-# libqsoe — retired 2026-06-01.  User-mode primitives folded into the
-# libc seam at lq/libc/qsoe/; taskman absorbed its own private copies
-# under taskman/qsoe/.  See project_libqsoe_folds_into_libc.
-
-# taskman — build delegated to taskman/Makefile.  Embeds the quser-
-# built modpkg.cpio via .incbin (the path retired 2026-05-31 then
-# restored 2026-06-01; see taskman/Makefile top-of-file).
-# Depends on $(MODPKG_CPIO) so changing a quser binary triggers a
-# taskman re-link.
-.PHONY: rtld
-rtld: $(RTLD_SO)
-
-# Build ld-qsoe.so.1 from the shared libc/rtld/ tree.  Pure userland
-# shared object -- no taskman/seL4 dependency at build time.  LIBC_INC
-# plumbs <sys/qsoe.h>.
-$(RTLD_SO):
-	@mkdir -p $(RTLD_BUILD)
-	+$(MAKE) -C $(RTLD_DIR) \
-	    O=$(RTLD_BUILD) \
-	    LIBC_INC=$(LIBC_INCLUDE) \
-	    EXTRA_CPPFLAGS=-DQSOE_KERNEL_SEL4 \
-	    ARCHFLAGS="-march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany" \
-	    all
-
-.PHONY: libtaskman
-libtaskman: $(LIBTASKMAN_A)
-
-# Build libtaskman.a from the umbrella-root tree.  Taskman is a freestanding
-# static-link client, so override PICFLAG to -fno-pic to match the rest of
-# taskman.  LIBC_INC plumbs <sys/qsoe.h> in.
-$(LIBTASKMAN_A):
-	@mkdir -p $(LIBTASKMAN_BUILD)
-	+$(MAKE) -C $(LIBTASKMAN_DIR) \
-	    O=$(LIBTASKMAN_BUILD) \
-	    LIBC_INC=$(LIBC_INCLUDE) \
-	    PICFLAG=-fno-pic \
-	    ARCHFLAGS="$(ARCH_CFLAGS)" \
-	    all
-
-.PHONY: taskman
-taskman: $(MODPKG_CPIO) $(LIBTASKMAN_A) $(GEN)/qsoe/sys_version.h
-	+$(MAKE) -C $(TOP)/taskman all LIBTASKMAN_A=$(LIBTASKMAN_A) LIBTASKMAN_INC=$(LIBTASKMAN_DIR)/include
-
-$(TASKMAN_ELF): | taskman
-	@true
-
-# Standalone tester (lq/userland/tester) retired 2026-06-01.  The same
-# exercises now live in the umbrella's quser/test/suite/ alongside
-# QRV's syscall conformance suite, build into a single `suite` binary
-# that travels via modpkg.cpio and runs on both NQ and LQ.
-
-# ----------------------------------------------------------------------------
-# Spawnable userland (init.sh, qsh, devc-ser8250, sbin/{pipe,slogger,
-# pci-server}, sloginfo, libpci, utils) lives in the umbrella-level
-# quser/ tree.  Its CPIO archive (modpkg.cpio, QRV-style name) is built
-# by `make -C ../quser cpio` and embedded into taskman.elf via .incbin
-# (see taskman/Makefile -- restored 2026-06-01 from the brief
-# FDT-initrd interlude).  See top-of-file MODPKG_CPIO note.
-# ----------------------------------------------------------------------------
-
-.PHONY: modpkg
-modpkg: $(MODPKG_CPIO)
-
-# Always re-enter quser's submake so per-component changes propagate;
-# quser is responsible for its own incremental rebuild discipline.
-# Pass LQ's own libc.so + rtld so they ship inside modpkg.cpio's /lib/
-# tree -- needed at load time by every dynamically-linked binary
-# (qsh + drivers + utils).  Regular deps on $(LIBC_SO) / $(RTLD_SO)
-# (not order-only) so an updated libc.so triggers cpio rebuild + the
-# downstream taskman .incbin re-link.
+# Always re-enter quser's submake; it owns its own incremental discipline.
 $(MODPKG_CPIO): $(LIBC_SO) $(LIBC_CRT0) $(RTLD_SO)
 	+$(MAKE) -C $(QUSER) cpio \
 	    LIBC_SO=$(LIBC_SO) \
 	    RTLD_SO=$(RTLD_SO) \
 	    DYNLIBC_SO=$(LIBC_SO)
 
-# ----------------------------------------------------------------------------
-# Kernel: built directly via cmake against ../sel4-bootstrap/seL4/.
-#
-# No sel4test layer, no init-build.sh, no settings.cmake from
-# projects/sel4test/.  The seL4 kernel's own CMakeLists.txt declares
-# `project(seL4 C ASM)` -- no CXX, so no g++-riscv64-linux-gnu host
-# requirement and no sed hacks.  We feed it the Kernel* cache vars
-# directly; the kernel build produces $(SEL4BUILD)/kernel.elf, which
-# we copy into our build tree at $(BUILD)/kernel.elf.
-# ----------------------------------------------------------------------------
-
-kernel: $(KERNEL_ELF)
-
-# $(BUILD)/kernel.elf is shared across platforms (it feeds archive.cpio).
-# The PLAT_STAMP prerequisite forces this copy to re-run on a platform
-# switch — otherwise, after `make PLAT=hifive` left the hifive kernel
-# here, a plain `make` would see build/kernel.elf newer than the qemu
-# $(KERNEL_SRC) and skip the copy, silently embedding the WRONG
-# platform's kernel (a hifive kernel under qemu-virt faults with
-# scause=7 on phantom RAM — the QEMU_MEMORY-mismatch symptom).
-$(KERNEL_ELF): $(KERNEL_SRC) $(PLAT_STAMP)
-	@mkdir -p $(@D)
-	cp $(KERNEL_SRC) $@
-
-$(KERNEL_SRC): | prepare
-	@echo "==> Configuring seL4 kernel (one-time, ~1 min)..."
-	@mkdir -p $(SEL4BUILD)
-	@# Kernel cache vars (Kernel*):
-	@#   KernelPlatform        — qemu-riscv-virt selects the virt machine
-	@#   KernelSel4Arch        — riscv64 selects RV64
-	@#   KernelMaxNumNodes=4   — SMP, 4 harts (must match -smp passed
-	@#                            to qemu in ./emu.sh)
-	@#   KernelIsMCS=ON        — MCS scheduler: time as a first-class
-	@#                            citizen (sched contexts, reply objects,
-	@#                            Wait-with-timeout).  Adopted for QSOE/L
-	@#                            v0.10; see project_mcs memory.
-	@#   KernelVerificationBuild=OFF — keep debug syscalls (printf etc.)
-	@#                                  available; the verification mode
-	@#                                  strips them.
-	@#   QEMU_MEMORY=512       — MiB.  The kernel build runs qemu with
-	@#                            `-m $QEMU_MEMORY` at CONFIGURE TIME
-	@#                            to extract the DTS and bakes the
-	@#                            resulting memory map into the kernel
-	@#                            image.  MUST match the `-m 512M`
-	@#                            passed by ./emu.sh at RUN TIME --
-	@#                            otherwise the kernel maps phantom RAM
-	@#                            beyond the qemu-allocated range and
-	@#                            faults on first access (scause=7
-	@#                            store/AMO access fault).
-	@#                            qemu-riscv-virt's default is 3 GiB
-	@#                            which exceeds our launch config.
-	@# seL4's gcc.cmake is a template (configure_file expects @var@s to
-	@# be expanded by the outer project); without that pre-pass the
-	@# toolchain falls through to host gcc and fails with riscv flags.
-	@# Bypass it by setting CROSS_COMPILER_PREFIX directly + a tiny
-	@# CMAKE_TOOLCHAIN_FILE that only sets CMAKE_SYSTEM_NAME.
-	cd $(SEL4BUILD) && cmake -G Ninja \
-	    -DCMAKE_SYSTEM_NAME=Generic \
-	    -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
-	    -DCMAKE_ASM_COMPILER=riscv64-linux-gnu-gcc \
-	    -DCROSS_COMPILER_PREFIX=riscv64-linux-gnu- \
-	    -DKernelPlatform=$(PLAT) \
-	    -DKernelSel4Arch=riscv64 \
-	    -DKernelMaxNumNodes=4 \
-	    -DKernelIsMCS=ON \
-	    -DKernelVerificationBuild=OFF \
-	    $(KERNEL_QEMU_MEM) \
-	    $(SEL4_DIR)
-	cd $(SEL4BUILD) && ninja kernel.elf
-
-# ----------------------------------------------------------------------------
-# CPIO archive: [kernel.elf, taskman] → archive.cpio → archive.o
-# ----------------------------------------------------------------------------
-
-$(BUILD)/archive.cpio: $(KERNEL_ELF) $(TASKMAN_ELF)
-	@mkdir -p $(@D)
-	@cd $(BUILD) && \
-	    printf '%s\n' kernel.elf taskman.elf | \
-	    cpio --quiet --create -H newc \
-	         --owner=+0:+0 --reproducible \
-	         --file=archive.cpio
-
-$(ELFBUILD)/archive.S: $(BUILD)/archive.cpio $(firstword $(MAKEFILE_LIST))
-	@mkdir -p $(@D)
-	@printf '%s\n' \
-	    '.section ._archive_cpio,"aw"' \
-	    '.globl _archive_start, _archive_start_end' \
-	    '_archive_start:' \
-	    '.incbin "$<"' \
-	    '_archive_start_end:' \
-	    > $@
-
-$(ELFBUILD)/archive.o: $(ELFBUILD)/archive.S
-	$(CC) $(EL_CFLAGS) -c -o $@ $<
-
-# ----------------------------------------------------------------------------
-# Final link
-# ----------------------------------------------------------------------------
-
-$(IMAGE): $(EL_OBJS) $(ELFBUILD)/archive.o $(ELFBUILD)/linker.lds_pp
-	$(CC) $(EL_CFLAGS) -static -nostdlib \
-	    -Wl,-T,$(ELFBUILD)/linker.lds_pp \
-	    -Wl,--build-id=none \
-	    -Wl,--no-warn-rwx-segments \
-	    -o $@ $(EL_OBJS) $(ELFBUILD)/archive.o
-
-# ----------------------------------------------------------------------------
-# Run under QEMU — moved out to ./emu.sh once the device list grew past
-# a one-liner (NVMe drive image, gdb stub toggle, etc.).
-# ----------------------------------------------------------------------------
-
-# ----------------------------------------------------------------------------
-# Cleanup
-# ----------------------------------------------------------------------------
-
 clean:
 	rm -rf $(BUILD)
 
 distclean: clean
-	rm -rf $(SEL4BUILD)
+	rm -rf $(SEL4_BOOTSTRAP)/build-qsoe-riscv64 $(SEL4_BOOTSTRAP)/build-qsoe-hifive
+
+else
+# ============================================================================
+# INNER make (BOARD set): build just this board's image.
+# ============================================================================
+
+.PHONY: __image
+__image: $(IMAGE) $(if $(filter sifive,$(BOARD)),$(BOOT_BIN))
+
+endif

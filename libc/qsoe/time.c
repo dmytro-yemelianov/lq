@@ -2,7 +2,7 @@
  * time.c — QNX-compatible Clock* implementation, backed by RISC-V's
  * `rdtime` CSR plus a process-wide cached frequency.
  *
- * Boot path: _qsoe_start_main (spawned processes) issues TM_REQ_CLOCK_FREQ
+ * Boot path: qsoe_libc_init (spawned processes) issues TM_REQ_CLOCK_FREQ
  * once and stores the reply into qsoe_time_freq_hz.  taskman itself
  * assigns it directly from sys/platform.h's TM_CLOCK_FREQ_HZ, no IPC.
  * Future v0.8 work moves the constant to a runtime FDT query
@@ -42,7 +42,7 @@ static inline unsigned long ticks_to_nsec(unsigned long ticks)
     return whole + part;
 }
 
-/* One-shot IPC to taskman; called from _qsoe_start_main exactly once. */
+/* One-shot IPC to taskman; called from qsoe_libc_init exactly once. */
 int qsoe_query_clock_freq(unsigned long *out_hz);
 int qsoe_query_clock_freq(unsigned long *out_hz)
 {

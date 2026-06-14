@@ -106,9 +106,10 @@ int ThreadCreate(pid_t pid, void *(*func)(void *), void *arg,
         qsoe_errno = (int)werr;
         return -1;
     }
-    seL4_CPtr tcb_slot  = (seL4_CPtr)mr0;
-    seL4_CPtr ntfn_slot = (seL4_CPtr)mr1;
+    seL4_CPtr tcb_slot   = (seL4_CPtr)mr0;
+    seL4_CPtr ntfn_slot  = (seL4_CPtr)mr1;
     int       tid_assigned = (int)mr2;
+    seL4_CPtr reply_slot = (seL4_CPtr)mr3;   /* this worker's own reply object */
 
     /* Populate the per-thread state. tp will be installed below via
      * WriteRegisters. */
@@ -121,6 +122,7 @@ int ThreadCreate(pid_t pid, void *(*func)(void *), void *arg,
     t->ipcbuf         = (void *)ipc_vaddr;
     t->tcb_cap        = tcb_slot;
     t->join_ntfn      = ntfn_slot;
+    t->reply_cap      = reply_slot;
     t->exit_status    = 0;
     t->runmask        = 0;
     for (int i = 0; i < 16; ++i) t->name[i] = 0;

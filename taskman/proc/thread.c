@@ -14,6 +14,16 @@ static tm_thread_t g_threads[TM_MAX_THREADS];
 
 tm_thread_t *tm_threads_array(void) { return g_threads; }
 
+tm_thread_t *tm_thread_find(pid_t pid, int tid)
+{
+    for (int i = 0; i < TM_MAX_THREADS; ++i) {
+        if (g_threads[i].in_use &&
+            g_threads[i].pid == pid && g_threads[i].tid == tid)
+            return &g_threads[i];
+    }
+    return 0;
+}
+
 static int thread_alloc_slot_idx(void)
 {
     for (int i = 0; i < TM_MAX_THREADS; ++i) {
@@ -152,6 +162,7 @@ int tm_thread_alloc(pid_t caller_pid,
     g_threads[gidx].tcb_in_caller  = child_tcb_slot;
     g_threads[gidx].ntfn_in_caller = child_ntfn_slot;
     g_threads[gidx].sc             = sc;
+    g_threads[gidx].name[0]        = '\0';   /* unnamed until tagged */
 
     *out_tid        = new_tid;
     *out_tcb_slot   = child_tcb_slot;

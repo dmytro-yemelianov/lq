@@ -15,7 +15,8 @@
 #include "sel4_types.h"
 #include "sel4_syscalls.h"
 #include "qsoe_invoke.h"
-#include "tm_log.h"
+#include <tm_log.h>
+#include "tm_kdbg.h"
 
 #include "proc/proc.h"
 #include "proc/spawn.h"
@@ -26,6 +27,7 @@
 #include "path/sysfs.h"
 #include "path/procfs.h"
 #include "sys/console.h"
+#include "sys/fdt.h"
 #include "sys/irq.h"
 #include "sys/platform.h"
 #include "sys/rsrcdb.h"
@@ -43,8 +45,9 @@
 /* LQ's variant-private wire opcodes must live in the variant space
  * (>= TM_REQ_VARIANT_BASE) so they can never collide with a shared
  * opcode -- see the rule in <qsoe/tm_msgs.h>. */
-_Static_assert(TM_REQ_DUP_CAP    >= TM_REQ_VARIANT_BASE &&
-               TM_REQ_DETACH_CAP >= TM_REQ_VARIANT_BASE,
+_Static_assert(TM_REQ_DUP_CAP            >= TM_REQ_VARIANT_BASE &&
+               TM_REQ_DETACH_CAP         >= TM_REQ_VARIANT_BASE &&
+               TM_REQ_CHANNEL_BIND_THREAD >= TM_REQ_VARIANT_BASE,
                "LQ variant opcode defined below TM_REQ_VARIANT_BASE");
 
 #ifdef TM_USE_INITRD_LOADER
@@ -56,6 +59,33 @@ _Static_assert(TM_REQ_DUP_CAP    >= TM_REQ_VARIANT_BASE &&
 extern const char _userland_cpio_start[];
 extern const char _userland_cpio_end[];
 #endif
+
+/* Emit one QSOE_SYSINFO_THREADS record into the reply buffer, honoring
+ * the caller's skip/want window.  *idx is the running record ordinal
+ * (advanced for every candidate, emitted or skipped); *got counts those
+ * actually written.  A NULL/empty name leaves the field zeroed. */
+static void
+si_emit_thread(unsigned char *dst, unsigned recsz, unsigned want,
+               unsigned skip, unsigned *idx, unsigned *got,
+               int tid, int pid, char state, const char *name)
+{
+    if (*got >= want) return;
+    if ((*idx)++ < skip) return;
+    qsoe_sysinfo_thread_t t;
+    unsigned char *tb = (unsigned char *)&t;
+    for (unsigned b = 0; b < recsz; ++b) tb[b] = 0;
+    t.tid    = (int32_t)tid;
+    t.pid    = (int32_t)pid;
+    t.hartid = 0;
+    t.state  = state;
+    if (name)
+        for (unsigned n = 0; n < QSOE_SYSINFO_NAME_LEN - 1 &&
+                             name[n] != '\0'; ++n)
+            t.name[n] = name[n];
+    for (unsigned b = 0; b < recsz; ++b)
+        dst[*got * recsz + b] = tb[b];
+    ++*got;
+}
 
 /* Dispatch one incoming message. */
 static seL4_MessageInfo_t
@@ -232,30 +262,40 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
                 ++got;
             }
         } else if (group == QSOE_SYSINFO_THREADS) {
+            /* One record per thread: each process's main thread (tid 1,
+             * which lives in tm_process_t, not g_threads) plus every
+             * ThreadCreate'd thread (the per-process system/signal thread
+             * and any workers) from g_threads.  This is what makes ps(1)
+             * report THR=2 for the main+signal pair. */
             recsz = sizeof(qsoe_sysinfo_thread_t);
+            tm_thread_t *threads = tm_threads_array();
             for (int i = 0; i < TM_MAX_PROCESSES; ++i) {
                 tm_process_t *p = tm_process_by_index(i);
                 if (p && p->in_use) ++avail;
             }
+            for (int i = 0; i < TM_MAX_THREADS; ++i)
+                if (threads[i].in_use) ++avail;
+
             unsigned idx = 0;
-            for (int i = 0; i < TM_MAX_PROCESSES && got < want; ++i) {
+            for (int i = 0; i < TM_MAX_PROCESSES; ++i) {
                 tm_process_t *p = tm_process_by_index(i);
                 if (!p || !p->in_use) continue;
-                if (idx++ < skip) continue;
-                qsoe_sysinfo_thread_t t;
-                unsigned char *tb = (unsigned char *)&t;
-                for (unsigned b = 0; b < recsz; ++b) tb[b] = 0;
-                t.tid    = (int32_t)p->pid;
-                t.pid    = (int32_t)p->pid;
-                t.hartid = 0;
-                t.state  = (char)(p->exit_state ? QSOE_TSTATE_ZOMBIE
-                                                : QSOE_TSTATE_RUNNING);
-                for (unsigned n = 0; n < QSOE_SYSINFO_NAME_LEN - 1 &&
-                                     p->name[n] != '\0'; ++n)
-                    t.name[n] = p->name[n];
-                for (unsigned b = 0; b < recsz; ++b)
-                    dst[got * recsz + b] = tb[b];
-                ++got;
+                /* Main thread: named after the process, like the prior
+                 * one-row-per-process output. */
+                char pstate = (char)(p->exit_state ? QSOE_TSTATE_ZOMBIE
+                                                   : QSOE_TSTATE_RUNNING);
+                si_emit_thread(dst, recsz, want, skip, &idx, &got,
+                               /*tid=*/1, (int)p->pid, pstate, p->name);
+                /* Then this process's ThreadCreate'd threads. */
+                for (int j = 0; j < TM_MAX_THREADS; ++j) {
+                    if (!threads[j].in_use || threads[j].pid != p->pid)
+                        continue;
+                    const char *nm = threads[j].name[0] ? threads[j].name
+                                                        : p->name;
+                    si_emit_thread(dst, recsz, want, skip, &idx, &got,
+                                   threads[j].tid, (int)p->pid,
+                                   QSOE_TSTATE_RUNNING, nm);
+                }
             }
         }
         /* MEM / IRQS / TIMERS: not yet sourced on LQ -> empty (avail 0). */
@@ -302,6 +342,11 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     }
     case TM_REQ_CHANNEL_DESTROY: {
         int rc = tm_channel_destroy(caller, (seL4_CPtr)mr0);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_CHANNEL_BIND_THREAD: {
+        int rc = tm_channel_bind_thread(caller, (int)mr0, (int)mr1);
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
@@ -487,8 +532,12 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             err = (seL4_Word)ESRCH;
             break;
         }
-        *out_mr0 = (seL4_Word)target;
-        *out_mr1 = (seL4_Word)proc->signal_chid;
+        /* Reply word order matches the shared kill.c + NQ handler:
+         * mr0 = signal chid, mr1 = owner pid (ConnectAttach's (pid,
+         * chid) pair check wants both).  These were swapped, so kill()
+         * connected to (pid=chid, chid=pid) and the pulse missed. */
+        *out_mr0 = (seL4_Word)proc->signal_chid;
+        *out_mr1 = (seL4_Word)target;
         reply_len = 2;
         break;
     }
@@ -916,6 +965,12 @@ static const void *find_fdt_in_extra_bi(seL4_BootInfo *bi,
 
 int main(seL4_BootInfo *bi)
 {
+    /* Point the shared logger at the seL4 debug console FIRST — before
+     * this, tm_log() has no sink and drops silently.  Threshold starts
+     * at TM_LOG_LEVEL_DEFAULT (INFO); --debug from the boot cmdline
+     * (below, once the FDT is in hand) can raise it to DBG/TRACE. */
+    tm_log_console_init();
+
     print_banner();
     qsoe_libc_init(bi->ipcBuffer, QSOE_PID_TASKMAN);
 
@@ -924,6 +979,23 @@ int main(seL4_BootInfo *bi)
      * compile-time hardcoded values — boot still completes. */
     unsigned dtb_size = 0;
     const void *dtb = find_fdt_in_extra_bi(bi, &dtb_size);
+
+    /* Boot command line from /chosen/bootargs.  Echo it Linux-style
+     * right after the banner (which leaves a trailing blank line), then
+     * honor `--debug[=N]` (same verbosity contract as NQ) -- applied
+     * before the first gated log line below so the level is settled.
+     * No FDT / no bootargs => default INFO. */
+    const char *bootargs = 0;
+    if (dtb) {
+        int chosen = tm_fdt_path(dtb, "/chosen");
+        if (chosen >= 0)
+            (void)tm_fdt_prop_str(dtb, chosen, "bootargs", &bootargs);
+    }
+    tm_info("Boot command line: %s",
+            (bootargs && bootargs[0]) ? bootargs : "(none)");
+    if (bootargs)
+        tm_log_apply_cmdline(bootargs);
+
     if (dtb && tm_syscfg_build(dtb) == 0) {
         tm_info("syscfg built from FDT");
         /* Translate the syscfg data into the 'PSYS' sysmap page that
@@ -1173,7 +1245,7 @@ int main(seL4_BootInfo *bi)
     if (!init_pid) {
         tm_crash("pid allocator empty");
     }
-    tm_info("spawning /sbin/init (pid=%d)...", (long)init_pid);
+    tm_info("spawning /sbin/init (pid=%ld)...", (long)init_pid);
     static const char *boot_argv0 = "init";
     const char *boot_argv[1] = { boot_argv0 };
     int sr = tm_spawn(elf, elf_size, init_pid, primary_ep,

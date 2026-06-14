@@ -14,7 +14,7 @@
 #include "../mem/mem.h"   /* QSOE_MMAP_BASE */
 #include "../qsoe_invoke.h"
 #include "../path/cpiofs.h"  /* tm_cpio_lookup */
-#include "../tm_log.h"
+#include <tm_log.h>
 #include <qsoe/slots.h>
 #include <cpio.h>
 

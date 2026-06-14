@@ -1,21 +1,23 @@
 /*
  * tm_log.c — sole sel4_debug_* callsite in taskman.
  *
- * Implements the printf-lite formatter behind tm_err/warn/info/dbg/
- * trace, plus the raw byte-stream emit used by the /dev/console
- * resmgr's early-boot write path.
- *
- * Future work: when the trace-buffer subsystem lands, this file
- * grows a second emit path that writes each formatted message into
- * a ring buffer alongside the live putchar.  Callers don't change —
- * they keep calling tm_err(...) etc.
+ * Logging itself is OS-independent and lives in the shared
+ * libtaskman logger (<tm_log.h> / libtaskman/src/log.c): leveled,
+ * --debug[=N]-gated, formatted into a line buffer and handed to a
+ * per-kernel sink.  This file supplies that sink (tm_console_sink ->
+ * seL4 debug console) and the install hook (tm_log_console_init),
+ * plus the two LQ-only primitives that share the sel4_debug seam:
+ * tm_raw_putc (the /dev/console resmgr write path) and tm_crash (the
+ * terminal-failure banner + halt, kept self-contained so it speaks
+ * even when the logger is unhealthy).
  *
  * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "sel4_syscalls.h"
-#include "tm_log.h"
+#include <tm_log.h>
+#include "tm_kdbg.h"
 
 /* va_list machinery — taskman builds with -nostdinc so reach for the
  * compiler builtins directly rather than <stdarg.h>. */
@@ -110,28 +112,32 @@ static void vemit(const char *fmt, va_list ap)
     }
 }
 
-/* ---- Level emit -------------------------------------------------- */
+/* ---- Shared-logger sink ----------------------------------------- */
 
-static const char *level_prefix(tm_log_level_t lvl)
+/* The shared tm_log() formats + level-filters, then hands us the
+ * finished bytes (no NUL, no added prefix) once per message.  Push
+ * them at the seL4 debug console.
+ *
+ * Newline policy: the shared contract is "caller supplies the trailing
+ * \n", but every LQ taskman call site predates that (the old emitter
+ * appended \n itself), so none of them do -- and each is always a
+ * complete line (the old emitter \n-terminated every call, so there is
+ * no piece-by-piece line building to preserve).  We therefore GUARANTEE
+ * exactly one trailing newline here: append one when the message didn't
+ * already end in \n.  That keeps the 117 existing call sites correct AND
+ * tolerates a future site that does include \n -- no doubled blank line
+ * either way. */
+static void tm_console_sink(const char *buf, unsigned len)
 {
-    switch (lvl) {
-    case TM_LOG_ERR:   return "[ERR ] ";
-    case TM_LOG_WARN:  return "[WARN] ";
-    case TM_LOG_INFO:  return "[INFO] ";
-    case TM_LOG_DBG:   return "[DBG ] ";
-    case TM_LOG_TRACE: return "[TRCE] ";
-    }
-    return "[??? ] ";
+    for (unsigned i = 0; i < len; ++i)
+        put_char(buf[i]);
+    if (len == 0 || buf[len - 1] != '\n')
+        put_char('\n');
 }
 
-void tm_log_emit(tm_log_level_t lvl, const char *fmt, ...)
+void tm_log_console_init(void)
 {
-    put_str(level_prefix(lvl));
-    va_list ap;
-    va_start(ap, fmt);
-    vemit(fmt, ap);
-    va_end(ap);
-    put_char('\n');
+    tm_log_init(tm_console_sink);
 }
 
 /* ---- Terminal failure ------------------------------------------- */

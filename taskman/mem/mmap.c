@@ -28,7 +28,7 @@
 #include "../proc/proc.h"
 #include "../sel4_types.h"
 #include "../qsoe_invoke.h"
-#include "../tm_log.h"
+#include <tm_log.h>
 
 static seL4_BootInfo *s_bi;
 
@@ -107,7 +107,7 @@ static int mmap_anonymous(tm_process_t *proc, unsigned long len,
          * to walk the child's page tables.  Loud crash on overflow
          * per the no-silent-truncation rule. */
         if (proc->mmap_count >= TM_MAX_MMAP_PER_PROC) {
-            tm_err("tm_mmap_serve: pid %d mmap tracker full (cap=%d) -- "
+            tm_err("tm_mmap_serve: pid %ld mmap tracker full (cap=%d) -- "
                    "bump TM_MAX_MMAP_PER_PROC in <tm_limits.h>",
                    (long)proc->pid, TM_MAX_MMAP_PER_PROC);
             return -ENOMEM;
@@ -262,7 +262,7 @@ static int devmap_map_into(tm_process_t *proc, tm_devmap_t *d,
         unsigned long va = base_va + (unsigned long)(f - first) * g;
 
         if (proc->devframe_count >= TM_MAX_DEVFRAMES) {
-            tm_err("tm_mmap_serve(PHYS): pid %d devframe tracker full (cap=%d)",
+            tm_err("tm_mmap_serve(PHYS): pid %ld devframe tracker full (cap=%d)",
                    (long)proc->pid, TM_MAX_DEVFRAMES);
             return -ENOMEM;
         }
@@ -367,7 +367,7 @@ int tm_munmap_serve(pid_t caller, unsigned long vaddr, unsigned long len)
      * range and leaving the tracker in a weird state. */
     for (unsigned long i = 0; i < pages; ++i) {
         if (find_mmap_idx(proc, vaddr + i * QSOE_MEGA_PAGE) < 0) {
-            tm_err("tm_munmap_serve: pid %d va 0x%lx not in tracker",
+            tm_err("tm_munmap_serve: pid %ld va 0x%lx not in tracker",
                    (long)proc->pid, vaddr + i * QSOE_MEGA_PAGE);
             return -EINVAL;
         }

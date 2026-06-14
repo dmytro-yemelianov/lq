@@ -14,7 +14,8 @@
 
 #include "console.h"
 #include "../sel4_types.h"
-#include "../tm_log.h"
+#include <tm_log.h>
+#include "../tm_kdbg.h"
 #include <sys/qsoe.h>
 #include <qsoe/ipcbuf.h>
 

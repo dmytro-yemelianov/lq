@@ -97,7 +97,8 @@ TM_HEADERS := \
     $(TASKMAN_DIR)/sel4_syscalls.h \
     $(TASKMAN_DIR)/sel4_types.h \
     $(TASKMAN_DIR)/qsoe_invoke.h \
-    $(TASKMAN_DIR)/tm_log.h \
+    $(TASKMAN_DIR)/tm_kdbg.h \
+    $(LIBTASKMAN_INC)/tm_log.h \
     $(TASKMAN_DIR)/proc/proc.h \
     $(TASKMAN_DIR)/proc/spawn.h \
     $(TASKMAN_DIR)/mem/mem.h \

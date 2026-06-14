@@ -1,0 +1,55 @@
+# QSOE/L (seL4) build configuration.
+#
+# Driven by python3-kconfiglib, mirroring QSOE/N (nq/Kconfig).  Edit with
+# `make menuconfig`; the selection is stored in lq/.config.  Headless
+# shortcuts: `make qemu_defconfig`, `make sifive_defconfig`,
+# `make both_defconfig`.
+
+mainmenu "QSOE/L Configuration"
+
+menu "Target boards"
+
+comment "Enable at least one board (enforced by the Makefile)"
+
+config PLAT_QEMU_VIRT
+    bool "QEMU virt"
+    default y
+    help
+      qemu-system-riscv64 -M virt -- the default development target
+      (./emu.sh).  seL4 KernelPlatform=qemu-riscv-virt; the OS boots on
+      hart 0.  Produces build/qsoe-l-qemu.elf.
+
+config PLAT_SIFIVE
+    bool "SiFive Unmatched (FU740)"
+    help
+      The SiFive Unmatched board, FU740 SoC.  seL4
+      KernelPlatform=hifive; the OS boots on the four U74 application
+      harts (1..4) -- hart 0 is the non-application S7 monitor core, so
+      the first hart is 1.  Produces build/qsoe-l-sifive.elf (+ .bin).
+
+endmenu
+
+menu "Kernel"
+
+config MAX_NUM_NODES
+    int "Maximum number of harts (SMP)"
+    default 4
+    range 1 8
+    help
+      Number of harts seL4 brings up (KernelMaxNumNodes).  Must match the
+      -smp value ./emu.sh passes to QEMU.  Shared by both boards.
+
+endmenu
+
+# Fixed values for the RISC-V Sv39 / SMP target, exposed as CONFIG_* so the
+# generated autoconf.h carries them for the elfloader.  (FIRST_HART_ID is
+# NOT here: it is per-board and injected by the Makefile, since with both
+# boards enabled a single Kconfig value could not be correct for both.)
+
+config PT_LEVELS
+    int
+    default 3
+
+config ENABLE_SMP_SUPPORT
+    bool
+    default y

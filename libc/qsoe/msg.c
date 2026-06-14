@@ -22,6 +22,7 @@
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/tm_msgs.h>
+#include <qsoe/sigdeliver.h>   /* __qsoe_syschan_init (signal thread) */
 #include <stddef.h>
 #include "state.h"
 #include "libc.h"           /* musl-style struct __libc + the `libc` alias */
@@ -65,6 +66,10 @@ void qsoe_libc_init(void *ipcbuf, pid_t self_pid)
 
     qsoe_curthr()->ipcbuf   = ipcbuf;
     qsoe_curthr()->self_pid = self_pid;
+    /* The main thread receives with the well-known reply object taskman
+     * provisioned at spawn; worker threads carry their own (set in
+     * ThreadCreate).  Reply objects cannot be shared between threads. */
+    qsoe_curthr()->reply_cap = QSOE_CAP_REPLY;
     if (self_pid != QSOE_PID_TASKMAN) {
         qsoe_state_bind_coid(TASKMAN_COID, QSOE_CAP_TASKMAN_EP);
     }
@@ -84,6 +89,21 @@ void qsoe_libc_init(void *ipcbuf, pid_t self_pid)
         qsoe_state_force_bind_coid(0, QSOE_CAP_STDIN_CONNECT);
         qsoe_state_force_bind_coid(1, QSOE_CAP_STDOUT_CONNECT);
         qsoe_state_force_bind_coid(2, QSOE_CAP_STDERR_CONNECT);
+
+        /* v0.7: cache the platform's rdtime frequency so ClockTime /
+         * ClockCycles / nanosleep convert ticks->nsec without IPC.  One
+         * round-trip per process at startup; the value is fixed for the
+         * life of the system.  (Was lost when crt0 began calling main
+         * directly; restored here on the live path.) */
+        extern int qsoe_query_clock_freq(unsigned long *out_hz);
+        extern unsigned long qsoe_time_freq_hz;
+        (void)qsoe_query_clock_freq(&qsoe_time_freq_hz);
+
+        /* Signals-as-pulses: bring up the per-process system thread +
+         * signal channel before main runs (same shape as NQ).  Failure
+         * is announced inside and non-fatal -- the process just cannot
+         * receive signals. */
+        __qsoe_syschan_init();
     }
 }
 
@@ -206,14 +226,16 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
 
     seL4_Word badge;
     seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
-    /* MCS: the receive carries this thread's reply object (register a6),
-     * which the kernel binds to the incoming Call so MsgReply can answer
-     * it.  The main thread uses the well-known QSOE_CAP_REPLY slot
-     * taskman provisioned at spawn.  (Worker-thread receive needs a
-     * per-thread reply object — deferred until the signal thread and
-     * multi-threaded resmgr pools land; see proc/thread.c which already
-     * provisions one per worker.) */
-    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge, QSOE_CAP_REPLY,
+    /* MCS: the receive carries THIS thread's own reply object (register
+     * a6), which the kernel binds to the incoming Call so MsgReply can
+     * answer it.  Reply objects cannot be shared between threads -- the
+     * main thread uses QSOE_CAP_REPLY (taskman-provisioned at spawn),
+     * every worker/system thread the one ThreadCreate gave it.  Sharing
+     * one across two receivers trips seL4's "Reply object already has
+     * unexecuted reply!" and the second receive never completes. */
+    seL4_CPtr reply_cap = (seL4_CPtr)qsoe_curthr()->reply_cap;
+    if (!reply_cap) reply_cap = QSOE_CAP_REPLY;   /* defensive: pre-init */
+    seL4_MessageInfo_t tag = qsoe_sys_recv(recv, &badge, reply_cap,
                                             &mr0, &mr1, &mr2, &mr3);
 
     /* v0.4.3: bound-Notification pulse wake. If the receive resolved

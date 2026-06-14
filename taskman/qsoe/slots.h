@@ -60,4 +60,17 @@
  *   MR0 = caller-CSpace slot of the cap being dropped. */
 #define TM_REQ_DETACH_CAP       (TM_REQ_VARIANT_BASE + 1u)  /* LQ variant op 1 */
 
+/* LQ-private taskman opcode, in the variant opcode space (see
+ * TM_REQ_VARIANT_BASE in <qsoe/tm_msgs.h>).  Per-process signal-thread
+ * plumbing: rebind a channel's pulse Notification from the process's
+ * main TCB (where tm_channel_create binds it by default) to the
+ * non-main system thread that will park in MsgReceive on it.  On seL4 a
+ * signaled Notification is delivered to its BOUND TCB, so without this
+ * the signal thread would never wake on a kill() pulse.  Lives here,
+ * not in the shared table, because binding a Notification to a TCB is a
+ * seL4 concept (NQ/Skimmer has no equivalent; its hook is a no-op).
+ *   MR0 = owner chid of the signal channel.
+ *   MR1 = tid of the system thread to bind the Notification to. */
+#define TM_REQ_CHANNEL_BIND_THREAD (TM_REQ_VARIANT_BASE + 2u)  /* LQ variant op 2 */
+
 #endif /* QSOE_SLOTS_H */

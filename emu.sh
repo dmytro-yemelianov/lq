@@ -20,7 +20,9 @@ set -e
 
 TOP=$(cd "$(dirname "$0")" && pwd)
 BUILD=$TOP/build
-IMAGE=$BUILD/qsoe.elf
+# emu.sh always runs the QEMU-virt board image (the SiFive build is for
+# real hardware, deployed via boot/).
+IMAGE=$BUILD/qsoe-l-qemu.elf
 # Note: the userland module package (modpkg.cpio, built by
 # `make -C ../quser cpio`) is NOT passed via QEMU `-initrd`.  Taskman
 # embeds it directly via .incbin (see taskman/Makefile), so the bytes

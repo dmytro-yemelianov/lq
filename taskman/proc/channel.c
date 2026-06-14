@@ -141,6 +141,41 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
     return 0;
 }
 
+/* TM_REQ_CHANNEL_BIND_THREAD: move chid's pulse Notification from the
+ * main TCB (where tm_channel_create bound it) onto the process's system
+ * thread `tid`, so that thread -- not main -- wakes on kill() pulses.
+ * seL4 binds at most one Notification per TCB, and the signal channel
+ * is the first channel a process creates (in __qsoe_syschan_init, before
+ * main), so the main TCB's current binding IS this channel's: unbind it
+ * cleanly, then bind to the system thread.  Also tags the thread name so
+ * ps(1) -H labels it. */
+int tm_channel_bind_thread(pid_t owner_pid, int chid, int tid)
+{
+    tm_process_t *owner = tm_process_lookup(owner_pid);
+    if (!owner) return -ESRCH;
+    tm_channel_t *c = channel_find(owner_pid, chid);
+    if (!c) return -EINVAL;
+    if (!c->ntfn_master) return -EINVAL;   /* channel has no pulse ntfn */
+
+    tm_thread_t *t = tm_thread_find(owner_pid, tid);
+    if (!t || !t->tcb_master) return -ESRCH;
+
+    /* Drop the default main-TCB binding, then attach to the system
+     * thread.  Unbind is harmless if main wasn't bound. seL4 allows at
+     * most one bound Notification per TCB, so the unbind must precede
+     * the bind. */
+    if (owner->tcb) (void)qsoe_tcb_unbind_notification(owner->tcb);
+    if (qsoe_tcb_bind_notification(t->tcb_master, c->ntfn_master) != 0)
+        return -EINVAL;
+
+    static const char sigthread_name[] = "sigthread";  /* ps(1) -H label */
+    unsigned i = 0;
+    for (; i < TM_THREAD_NAME_LEN - 1 && sigthread_name[i]; ++i)
+        t->name[i] = sigthread_name[i];
+    t->name[i] = '\0';
+    return 0;
+}
+
 /* Forward decl — defined in connect.c.  Used here to invalidate
  * connections that targeted a channel about to be destroyed. */
 void tm_connections_drop_for_channel_idx(int channel_idx);

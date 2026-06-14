@@ -20,7 +20,7 @@
 #include "sync.h"
 #include "../proc/proc.h"
 #include "../qsoe_invoke.h"
-#include "../tm_log.h"
+#include <tm_log.h>
 
 #define TM_SYNC_MAX_ENTRIES   16    /* (pid, addr) tuples in flight  */
 #define TM_SYNC_MAX_WAITERS    4    /* per-entry parked thread cap   */
@@ -217,7 +217,7 @@ void tm_sync_pid_release(pid_t pid)
             tm_reply_drop(g_sync[i].wait_slots[w]);
         }
         g_sync[i].in_use = 0;
-        tm_warn("sync: dropped entry for terminated pid=%d addr=0x%x",
+        tm_warn("sync: dropped entry for terminated pid=%d addr=0x%lx",
                 (int)pid, (unsigned long)g_sync[i].addr);
     }
 }

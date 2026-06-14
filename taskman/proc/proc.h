@@ -220,6 +220,10 @@ typedef struct {
     seL4_CPtr fault_ep;
 } tm_process_t;
 
+/* Per-thread name length for ps(1) -H rows (incl. NUL).  Matches the
+ * 16-char cap of libc's qsoe_tcb_t.name. */
+#define TM_THREAD_NAME_LEN  16
+
 typedef struct {
     int       in_use;
     pid_t     pid;
@@ -232,6 +236,11 @@ typedef struct {
      * CNode.  Like the main thread's, its slot must be freed in teardown
      * (the object dies with Revoke(pput); the slot does not). */
     seL4_CPtr sc;
+    /* Short thread name for ps(1) -H rows; "" until set.  taskman can't
+     * see libc's ThreadCtl(TCTL_NAME) (that writes the libc-local TCB),
+     * so this is populated only where taskman already knows the role --
+     * e.g. tm_channel_bind_thread tags the system thread "sigthread". */
+    char      name[TM_THREAD_NAME_LEN];
 } tm_thread_t;
 
 #define TM_PULSE_QUEUE_LEN 8
@@ -503,6 +512,16 @@ int tm_thread_alloc(pid_t caller_pid,
                     seL4_CPtr *out_tcb_slot,
                     seL4_CPtr *out_ntfn_slot,
                     seL4_CPtr *out_reply_slot);
+
+/* Look up a ThreadCreate'd thread by (pid, tid).  Returns NULL if no
+ * such live entry; the main thread (tid 1) is NOT in g_threads (it is
+ * tm_process_t.tcb) and so is never returned here. */
+tm_thread_t *tm_thread_find(pid_t pid, int tid);
+
+/* TM_REQ_CHANNEL_BIND_THREAD: rebind chid's pulse Notification from the
+ * process's main TCB to its system thread `tid`, and tag that thread
+ * "sigthread" for ps(1).  See <qsoe/slots.h>. */
+int tm_channel_bind_thread(pid_t owner_pid, int chid, int tid);
 
 /* ----------- pulses ----------- */
 
