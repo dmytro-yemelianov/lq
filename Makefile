@@ -57,6 +57,13 @@ SEL4_BOOTSTRAP := $(abspath $(TOP)/..)/sel4-bootstrap
 SEL4_DIR       := $(SEL4_BOOTSTRAP)/seL4
 SEL4_TOOLS_DIR := $(SEL4_BOOTSTRAP)/seL4_tools
 
+# FU740 seL4 source patches (applied by the $(SEL4_PATCH_STAMP) rule below,
+# before any seL4 cmake/ninja build).  Defined here so the kernel build rule's
+# prerequisite resolves.
+SEL4_HIFIVE_CMK  := $(SEL4_DIR)/src/plat/hifive/config.cmake
+SEL4_PLIC_H      := $(SEL4_DIR)/include/drivers/irq/riscv_plic0.h
+SEL4_PATCH_STAMP := $(SEL4_DIR)/.qsoe-fu740-patched
+
 # Elfloader sources live INSIDE seL4_tools' clone; we compile them
 # ourselves with our own Make rules — no upstream CMake involvement.
 ELFSRC      := $(SEL4_TOOLS_DIR)/elfloader-tool/src
@@ -301,7 +308,7 @@ $(SEL4_BOOTSTRAP)/build-qsoe-hifive/kernel.elf:  KMEM  :=
 # MUST match `-m 512M` in ./emu.sh, else the kernel maps phantom RAM and
 # faults (scause=7).  The hifive memory map comes from the board DTS, so
 # QEMU_MEMORY must NOT be forced there.
-$(SEL4_BOOTSTRAP)/build-qsoe-%/kernel.elf: | prepare
+$(SEL4_BOOTSTRAP)/build-qsoe-%/kernel.elf: | prepare $(SEL4_PATCH_STAMP)
 	@echo "==> Configuring + building seL4 kernel in $(@D) (one-time cmake ~1 min)..."
 	@mkdir -p $(@D)
 	cd $(@D) && cmake -G Ninja \
@@ -386,6 +393,32 @@ prepare:
 	else \
 	    echo "==> seL4_tools already present at $(SEL4_TOOLS_DIR)"; \
 	fi
+
+# ----------------------------------------------------------------------------
+# FU740 patches for the vendored seL4 kernel.  seL4's "hifive" platform targets
+# the FU540 (Unleashed); two things are wrong for the FU740 (Unmatched).  Per
+# the vendoring convention these are sed'd in-place once per clone, recorded by
+# a stamp inside the seL4 tree so a fresh `make prepare` re-clone re-applies
+# them (the stamp dies with the tree).  The MAX_IRQ bump is in the hifive-only
+# config.cmake; the PLIC fix touches the shared driver header but is benign on
+# qemu-virt (whose claim auto-completes in-kernel).
+#
+#   1. MAX_IRQ 53 -> 128.  The FU540 PLIC stops at 53; the FU740 has more and
+#      PCIe MSI lands above 53, so pci-server / NVMe never start.  seL4 derives
+#      PLIC_MAX_IRQ, maxIRQ and the IRQ-cnode size from this one value.
+#   2. PLIC complete-on-claiming-hart.  seL4 completes a PLIC claim on whichever
+#      hart the userspace IRQHandler_Ack runs on; on SMP that may differ from
+#      the hart that took the IRQ, so a level-triggered line never re-arms
+#      (serial: one char, then silence).  Record the claiming hart per IRQ and
+#      complete to it -- mirrors QRV/Skimmer.  NQ/Skimmer has no such bug.
+# ----------------------------------------------------------------------------
+$(SEL4_PATCH_STAMP): | prepare
+	@echo "==> Patching vendored seL4 for FU740 (MAX_IRQ=128, PLIC complete-on-claiming-hart)..."
+	sed -i 's/MAX_IRQ 53/MAX_IRQ 128/' $(SEL4_HIFIVE_CMK)
+	sed -i '/^static inline irq_t plic_get_claim(void)/i static word_t plic_claim_hart[PLIC_MAX_IRQ + 1]; /* QSOE FU740: hart that claimed each IRQ */' $(SEL4_PLIC_H)
+	sed -i 's|    return readl(PLIC_PPTR_BASE + plic_claim_offset(hart_id, PLIC_SVC_CONTEXT));|    irq_t claimed = readl(PLIC_PPTR_BASE + plic_claim_offset(hart_id, PLIC_SVC_CONTEXT));\n    if ((word_t)claimed <= (word_t)PLIC_MAX_IRQ) { plic_claim_hart[claimed] = hart_id; }\n    return claimed;|' $(SEL4_PLIC_H)
+	sed -i 's|    writel(irq, PLIC_PPTR_BASE + plic_claim_offset(hart_id, PLIC_SVC_CONTEXT));|    if ((word_t)irq <= (word_t)PLIC_MAX_IRQ) { hart_id = plic_claim_hart[irq]; }\n    writel(irq, PLIC_PPTR_BASE + plic_claim_offset(hart_id, PLIC_SVC_CONTEXT));|' $(SEL4_PLIC_H)
+	@touch $@
 
 ifeq ($(BOARD),)
 # ============================================================================
