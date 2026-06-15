@@ -98,22 +98,17 @@ QEMUOPTS=(-machine "$MACHINE" -nographic -m "$MEM" -smp "$CPUS"
           -bios default -kernel "$IMAGE")
 
 # ---------------------------------------------------------------------
-# NVMe — mirror NQ.  Backing store is a GPT-formatted image (8 x 16 MiB,
-# p8 = fs-qrv), laid by host_tools/mkgpt.py; the controller hangs behind
-# a PCIe root port (Type-1 bridge) so the MSI-X path is exercised, like
-# the FU740.  `FLAT=1 ./emu.sh` puts it directly on bus 0 instead.
+# NVMe — mirror NQ.  The backing store is a GPT image (8 x 16 MiB,
+# p8 = fs-qrv) shared by both variants and built by the umbrella's
+# `make nvme` (host_tools/mkgpt.py); emu.sh never lays it itself.  The
+# controller hangs behind a PCIe root port (Type-1 bridge) so the MSI-X
+# path is exercised, like the FU740.  `FLAT=1 ./emu.sh` puts it directly
+# on bus 0 instead.
 # ---------------------------------------------------------------------
 if [[ $ATTACH_NVME -eq 1 ]]; then
-    mkdir -p "$BUILD"
-    # (Re)lay the GPT if the image is missing or carries no GPT header
-    # ("EFI PART" at byte offset 512).  An existing GPT image survives.
-    if [[ ! -f "$BUILD/nvme.img" ]] || \
-       [[ "$(dd if="$BUILD/nvme.img" bs=8 skip=64 count=1 2>/dev/null)" != "EFI PART" ]]; then
-        truncate -s 192M "$BUILD/nvme.img"
-        echo "emu.sh: creating $BUILD/nvme.img (192 MiB, GPT, 8 x 16 MiB, p8 = fs-qrv)..."
-        "$TOP/host_tools/mkgpt.py" --fsqrv 8 "$BUILD/nvme.img" 16 16 16 16 16 16 16 16
-    fi
-    QEMUOPTS+=(-drive "file=$BUILD/nvme.img,if=none,format=raw,id=nvm0")
+    NVME_IMG="$TOP/../build/nvme.img"
+    make -C "$TOP/.." nvme            # idempotent; the umbrella owns the image
+    QEMUOPTS+=(-drive "file=$NVME_IMG,if=none,format=raw,id=nvm0")
     if [[ "${FLAT:-0}" == "1" ]]; then
         QEMUOPTS+=(-device "nvme,drive=nvm0,serial=qsoe-test")
     else
