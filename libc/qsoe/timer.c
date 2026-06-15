@@ -5,22 +5,25 @@
  * facility) donates the remaining timeslice and requeues the caller
  * at the tail of its priority -- the QNX SchedYield contract.
  *
- * The Timer* family is announcing ENOSYS stubs: kernel-tracked
- * timers need a tick + expiry-pulse story that LQ doesn't have yet.
- * LQ runs on MCS now, so sched contexts + Wait-with-timeout exist,
- * but the user timer surface built on top of them is not wired up.
- * The symbols must still exist so the SHARED userspace -- one suite
- * binary for both kernels -- links and runs; the timer tests then
- * FAIL loudly at runtime instead of the build dying or, worse, a
- * silent no-op.
+ * TimerCreate / TimerDestroy manage per-process POSIX timer OBJECTS in
+ * a libc-local table: a timer is allocated, validated (clock id, a
+ * SIGEV_PULSE notify event, a live connection id), and freed.  This is
+ * the create/destroy lifecycle; ARMING a timer (TimerSettime) and the
+ * expiry-pulse delivery are a separate step -- they hang off taskman's
+ * existing lazy sweep (proc/timer.c, the itimer/nanosleep path), so
+ * TimerSettime/Info/Timeout stay announcing ENOSYS stubs for now.  The
+ * stored sigevent makes each object ready for that future arm.
  * NQ's kernel-side implementation (nq/kernel/timer.c) is the shape
- * to mirror when this lands.
+ * to mirror when arming lands.
  *
  * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <errno.h>
+#include <time.h>            /* CLOCK_REALTIME / CLOCK_MONOTONIC */
+#include <sys/siginfo.h>     /* SIGEV_GET_TYPE, SIGEV_PULSE, sigev_coid */
 #include <sys/qsoe.h>
+#include "state.h"           /* qsoe_state_coid_to_slot, qsoe_spinlock_t */
 #include "sel4_syscalls.h"   /* SEL4_SYS_YIELD, derived from the seL4 enum */
 
 long SchedYield_r(void)
@@ -48,11 +51,44 @@ int SchedYield(void)
         }                                                                \
     } while (0)
 
+/* Per-process POSIX timer objects.  The id handed to the caller is the
+ * table index (>= 0, unique while live, reusable after TimerDestroy).
+ * 32 is generous for a single process and keeps the exhaustion path
+ * (EAGAIN) reachable. */
+#define QSOE_TIMER_MAX 32
+
+typedef struct {
+    int             in_use;
+    clockid_t       clockid;
+    struct sigevent ev;        /* full copy: coid/code/prio for a future arm */
+} qsoe_timer_t;
+
+static qsoe_timer_t   g_timers[QSOE_TIMER_MAX];
+static qsoe_spinlock_t g_timer_lock;
+
 long TimerCreate_r(clockid_t id, const struct sigevent *event)
 {
-    (void) id; (void) event;
-    TIMER_STUB_ANNOUNCE("TimerCreate");
-    return -ENOSYS;
+    /* Validate the notify event first (NULL / non-pulse).  Signals are
+     * removed in QSOE, so only SIGEV_PULSE is accepted. */
+    if (!event)                              return -EINVAL;
+    if (SIGEV_GET_TYPE(event) != SIGEV_PULSE) return -EINVAL;
+    /* Only the wall-clock and monotonic clocks exist (SOFTTIME aliases
+     * REALTIME); CPU-time clocks and junk ids are rejected. */
+    if (id != CLOCK_REALTIME && id != CLOCK_MONOTONIC) return -EINVAL;
+    /* The pulse target connection must be live. */
+    if (qsoe_state_coid_to_slot(event->sigev_coid) == 0) return -EBADF;
+
+    qsoe_spin_lock(&g_timer_lock);
+    int tid = -1;
+    for (int i = 0; i < QSOE_TIMER_MAX; ++i) {
+        if (!g_timers[i].in_use) { tid = i; break; }
+    }
+    if (tid < 0) { qsoe_spin_unlock(&g_timer_lock); return -EAGAIN; }
+    g_timers[tid].in_use  = 1;
+    g_timers[tid].clockid = id;
+    g_timers[tid].ev      = *event;
+    qsoe_spin_unlock(&g_timer_lock);
+    return tid;
 }
 
 int TimerCreate(clockid_t id, const struct sigevent *event)
@@ -64,9 +100,12 @@ int TimerCreate(clockid_t id, const struct sigevent *event)
 
 long TimerDestroy_r(int tid)
 {
-    (void) tid;
-    TIMER_STUB_ANNOUNCE("TimerDestroy");
-    return -ENOSYS;
+    if (tid < 0 || tid >= QSOE_TIMER_MAX) return -EINVAL;
+    qsoe_spin_lock(&g_timer_lock);
+    if (!g_timers[tid].in_use) { qsoe_spin_unlock(&g_timer_lock); return -EINVAL; }
+    g_timers[tid].in_use = 0;
+    qsoe_spin_unlock(&g_timer_lock);
+    return 0;
 }
 
 int TimerDestroy(int tid)
