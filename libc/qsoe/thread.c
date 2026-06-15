@@ -15,8 +15,9 @@
  *     base + 0xE000..0xF000    pad (1 page)
  *     base + 0x0000..0xE000    stack (56 KiB max; sp starts at +0xE000)
  *
- * Worker priority defaults to 254 (matches the main thread). Stacks
- * up to 14 pages (= 56 KiB) per the slot layout.
+ * Worker priority defaults to the QNX default user priority (matches the
+ * main thread's spawn priority); a driver raises its IST above it with
+ * SchedSet.  Stacks up to 14 pages (= 56 KiB) per the slot layout.
  */
 
 #include <sys/qsoe.h>
@@ -36,7 +37,10 @@
 #define WORKER_STACK_TOP_OFF  0xE000UL     /* sp = base + this */
 #define WORKER_IPC_OFF        0xF000UL     /* IPC buffer at base + this */
 #define WORKER_DEFAULT_PAGES  14           /* 56 KiB */
-#define WORKER_DEFAULT_PRIO   254
+/* QNX default user-thread priority (0..255 scale, higher = higher).  Must
+ * track taskman's TM_PRIO_USER_DEFAULT; both await a shared cross-kernel
+ * priority-band header (the NQ-side half of the QNX 0..255 alignment). */
+#define WORKER_DEFAULT_PRIO   10
 
 /* Trampoline: every new thread enters here. We're called with C-ABI
  * argument registers a0=func, a1=arg (set by ThreadCreate via

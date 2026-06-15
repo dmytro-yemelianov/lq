@@ -23,6 +23,7 @@
 
 #define QSOE_MAX_FD_CHANNELS     64
 #define QSOE_MAX_SIDE_CHANNELS   16
+#define QSOE_MAX_GLOBAL_CHANNELS  8   /* global channels a process owns */
 #define QSOE_MAX_FD_CONNECTIONS 256
 #define QSOE_MAX_SIDE_CONNECTIONS 16
 

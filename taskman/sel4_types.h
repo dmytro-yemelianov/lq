@@ -164,6 +164,7 @@ typedef struct { seL4_Word words[1]; } seL4_CapRights_t;
 #define INV_RISCVPageTableUnmap  RISCVPageTableUnmap
 #define INV_RISCVPageMap         RISCVPageMap
 #define INV_RISCVPageUnmap       RISCVPageUnmap
+#define INV_RISCVPageGetAddress  RISCVPageGetAddress
 #define INV_RISCVASIDPoolAssign  RISCVASIDPoolAssign
 
 /* Fast-path syscall numbers — aliases for upstream enum members. */

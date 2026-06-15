@@ -201,33 +201,57 @@ int SyncMutexUnlock(sync_t *s)
  * — Wait reads cond->count under the mutex, unlocks, then issues a
  * gen-checked wait.  Spurious wakeups (gen mismatch) cause an early
  * return so the caller's while-loop discipline handles them. */
-int SyncCondvarWait(sync_t *cond, sync_t *mutex)
+/* The _r forms carry the real logic and follow the QNX/QSOE convention:
+ * return 0 or a negated errno, never touch errno.  The shared libc
+ * pthread_cond_* layer calls these; the int SyncCondvar* below are the
+ * errno/-1 adapters.  (Mirrors SyncSemWait_r / SyncSemWait.) */
+long SyncCondvarWait_r(sync_t *cond, sync_t *mutex)
 {
-    if (!cond || !mutex) { qsoe_errno = EINVAL; return -1; }
+    if (!cond || !mutex) return -EINVAL;
     long seen = __atomic_load_n(&cond->count, __ATOMIC_ACQUIRE);
 
-    int rc = SyncMutexUnlock(mutex);
-    if (rc) return -1;
+    if (SyncMutexUnlock(mutex) != 0) {
+        int e = qsoe_errno; return e ? -(long)e : -EINVAL;
+    }
 
-    /* If a Signal raced ahead between unlock and here, taskman's
-     * tracked gen for this addr is now > seen, sync_wait_gen
-     * returns without parking. */
-    rc = sync_wait_gen(&cond->count, seen);
+    /* If a Signal raced ahead between unlock and here, taskman's tracked
+     * gen for this addr is now > seen, so sync_wait_gen returns without
+     * parking.  Spurious returns are fine — the caller re-tests its
+     * predicate under the re-acquired mutex. */
+    int wr = sync_wait_gen(&cond->count, seen);
 
-    /* Re-acquire the mutex even if wait returned -1 — POSIX says
-     * cond_wait always returns with the mutex held. */
+    /* POSIX: cond_wait always returns with the mutex held — re-acquire
+     * even on a wait error. */
     SyncMutexLock(mutex);
-    return rc;
+
+    if (wr < 0) { int e = qsoe_errno; return e ? -(long)e : -EINTR; }
+    return 0;
+}
+
+int SyncCondvarWait(sync_t *cond, sync_t *mutex)
+{
+    long r = SyncCondvarWait_r(cond, mutex);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
+    return 0;
+}
+
+long SyncCondvarSignal_r(sync_t *cond, int wake_all)
+{
+    if (!cond) return -EINVAL;
+    /* Increment the gen the waiters compare against, then wake.  Discard
+     * mode: signals with no parked waiter are dropped (POSIX-compliant). */
+    __atomic_fetch_add(&cond->count, 1, __ATOMIC_RELEASE);
+    if (sync_wake(&cond->count, wake_all ? 0 : 1, 1 /* discard */) < 0) {
+        int e = qsoe_errno; return e ? -(long)e : -EINVAL;
+    }
+    return 0;
 }
 
 int SyncCondvarSignal(sync_t *cond, int wake_all)
 {
-    if (!cond) { qsoe_errno = EINVAL; return -1; }
-    /* Increment the gen the waiters compare against, then wake.
-     * Discard mode: signals with no parked waiter are dropped
-     * (POSIX-compliant). */
-    __atomic_fetch_add(&cond->count, 1, __ATOMIC_RELEASE);
-    return sync_wake(&cond->count, wake_all ? 0 : 1, 1 /* discard */);
+    long r = SyncCondvarSignal_r(cond, wake_all);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
+    return 0;
 }
 
 /* ---- Semaphore ----------------------------------------------------- */

@@ -13,6 +13,12 @@
 
 static unsigned long g_fd_chid_slot   [QSOE_MAX_FD_CHANNELS];
 static unsigned long g_side_chid_slot [QSOE_MAX_SIDE_CHANNELS];
+/* Global channels (QSOE_CHF_GLOBAL): taskman assigns an arbitrary
+ * system-unique chid (QSOE_GLOBAL_CHANNEL | counter), so we can't index it
+ * by value -- keep a small (chid -> recv slot) association the owner uses
+ * for MsgReceive.  A process owns few global channels. */
+static struct { int chid; unsigned long slot; }
+                     g_global_chid    [QSOE_MAX_GLOBAL_CHANNELS];
 static unsigned long g_fd_coid_slot   [QSOE_MAX_FD_CONNECTIONS];
 static unsigned long g_side_coid_slot [QSOE_MAX_SIDE_CONNECTIONS];
 /* v0.7 per-fd flags for POSIX fcntl(F_GETFD/SETFD/GETFL/SETFL).
@@ -68,6 +74,9 @@ static inline int is_side(int handle) {
 static inline int side_index(int handle) {
     return (int)((unsigned)handle & ~QSOE_SIDE_CHANNEL);
 }
+static inline int is_global(int handle) {
+    return QSOE_IS_GLOBAL_CHANNEL(handle) != 0;
+}
 
 /* ---------------- chid ---------------- */
 
@@ -99,7 +108,19 @@ int qsoe_state_alloc_chid(unsigned flags)
 void qsoe_state_bind_chid(int chid, unsigned long slot)
 {
     qsoe_spin_lock(&g_state_lock);
-    if (is_side(chid)) {
+    if (is_global(chid)) {
+        /* Find an existing entry for this chid, else a free one.  slot==0
+         * (unbind) clears the entry. */
+        int free = -1;
+        for (int i = 0; i < QSOE_MAX_GLOBAL_CHANNELS; ++i) {
+            if (g_global_chid[i].chid == chid) { free = i; break; }
+            if (free < 0 && g_global_chid[i].chid == 0) free = i;
+        }
+        if (free >= 0) {
+            g_global_chid[free].chid = slot ? chid : 0;
+            g_global_chid[free].slot = slot;
+        }
+    } else if (is_side(chid)) {
         int i = side_index(chid);
         if (i >= 0 && i < QSOE_MAX_SIDE_CHANNELS) g_side_chid_slot[i] = slot;
     } else {
@@ -112,7 +133,10 @@ unsigned long qsoe_state_chid_to_slot(int chid)
 {
     unsigned long s = 0;
     qsoe_spin_lock(&g_state_lock);
-    if (is_side(chid)) {
+    if (is_global(chid)) {
+        for (int i = 0; i < QSOE_MAX_GLOBAL_CHANNELS; ++i)
+            if (g_global_chid[i].chid == chid) { s = g_global_chid[i].slot; break; }
+    } else if (is_side(chid)) {
         int i = side_index(chid);
         if (i >= 0 && i < QSOE_MAX_SIDE_CHANNELS) s = g_side_chid_slot[i];
     } else {

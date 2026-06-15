@@ -162,6 +162,8 @@ int tm_thread_alloc(pid_t caller_pid,
     g_threads[gidx].tcb_in_caller  = child_tcb_slot;
     g_threads[gidx].ntfn_in_caller = child_ntfn_slot;
     g_threads[gidx].sc             = sc;
+    g_threads[gidx].sched_prio     = (int)prio;   /* tracked for SchedGet */
+    g_threads[gidx].sched_policy   = TM_SCHED_RR;
     g_threads[gidx].name[0]        = '\0';   /* unnamed until tagged */
 
     *out_tid        = new_tid;

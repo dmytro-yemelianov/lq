@@ -156,22 +156,10 @@ char *__nl_langinfo_l(int item, locale_t loc)
 }
 
 /* --- Sync* reentrant variants -------------------------------------- */
-/* The non-_r versions exist in libc.so; the _r reentrant variants
- * (which take an explicit errno location) aren't wired yet.  Forward
- * each to its non-reentrant counterpart and announce.  Declarations
- * come from <sys/qsoe.h> included at the top. */
-
-long SyncCondvarSignal_r(sync_t *cv, int all)
-{
-    ANNOUNCE_ONCE("SyncCondvarSignal_r", "via SyncCondvarSignal");
-    return SyncCondvarSignal(cv, all);
-}
-
-long SyncCondvarWait_r(sync_t *cv, sync_t *mx)
-{
-    ANNOUNCE_ONCE("SyncCondvarWait_r", "via SyncCondvarWait");
-    return SyncCondvarWait(cv, mx);
-}
+/* The non-_r versions exist in libc.so; some _r reentrant variants
+ * aren't wired yet.  Forward each to its non-reentrant counterpart and
+ * announce.  Declarations come from <sys/qsoe.h> included at the top.
+ * (SyncCondvarWait_r / SyncCondvarSignal_r are now real in qsoe/sync.c.) */
 
 long SyncDestroy_r(sync_t *s)
 {

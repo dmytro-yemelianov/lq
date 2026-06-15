@@ -514,6 +514,22 @@ qsoe_riscv_page_unmap(seL4_CPtr page)
     return seL4_MessageInfo_get_label(reply);
 }
 
+/* seL4_RISCV_Page_GetAddress: return the physical address a mapped frame
+ * backs.  No MRs in; the reply carries the paddr in MR0.  Needed by
+ * TM_REQ_ALLOC_PHYS to report a frame's PA to a driver (e.g. the
+ * DesignWare PCIe MSI trap target).  Returns the seL4 error label; on
+ * success *out_paddr holds the physical address. */
+static inline seL4_Word
+qsoe_riscv_page_get_address(seL4_CPtr page, seL4_Word *out_paddr)
+{
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(INV_RISCVPageGetAddress, 0, 0, 0);
+    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+    seL4_MessageInfo_t reply = qsoe_sys_call(page, tag, &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err == 0 && out_paddr) *out_paddr = mr0;
+    return err;
+}
+
 static inline seL4_Word
 qsoe_riscv_asidpool_assign(seL4_CPtr asid_pool, seL4_CPtr vspace)
 {

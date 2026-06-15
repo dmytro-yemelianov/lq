@@ -334,10 +334,15 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     case TM_REQ_CHANNEL_CREATE: {
         int chid = (int)mr0;
         unsigned flags = (unsigned)mr1;
+        int creator_tid = (int)mr2;          /* the calling thread's tid */
         unsigned long recv_slot = 0;
-        int rc = tm_channel_create(caller, chid, flags, &recv_slot);
+        int eff_chid = chid;
+        int rc = tm_channel_create(caller, chid, flags, creator_tid,
+                                   &recv_slot, &eff_chid);
         if (rc) { err = (seL4_Word)(-rc); }
-        else    { *out_mr0 = recv_slot; reply_len = 1; }
+        else    { *out_mr0 = recv_slot;
+                  *out_mr1 = (seL4_Word)eff_chid;   /* assigned chid if global */
+                  reply_len = 2; }
         break;
     }
     case TM_REQ_CHANNEL_DESTROY: {
@@ -692,6 +697,25 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         if (rc) err = (seL4_Word)(-rc);
         break;
     }
+    case TM_REQ_SCHED_SET: {
+        /* mr0 = pid (0 = caller), mr1 = tid, mr2 = policy, mr3 = priority.
+         * The client resolves tid==0 to its own tid before sending. */
+        int rc = tm_sched_set(caller, (pid_t)mr0, (int)mr1,
+                              (int)mr2, (int)mr3);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_SCHED_GET: {
+        /* mr0 = pid (0 = caller), mr1 = tid.  Reply: mr0 = priority,
+         * mr1 = policy. */
+        int policy = 0, prio = 0;
+        int rc = tm_sched_get(caller, (pid_t)mr0, (int)mr1, &policy, &prio);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)prio;
+        *out_mr1 = (seL4_Word)policy;
+        reply_len = 2;
+        break;
+    }
     case TM_REQ_PROC_SELF_INFO: {
         /* v0.7: backs POSIX getpid/getppid/getuid/etc.  Caller's pid
          * is in the badge; no MR inputs.  Reply layout (8 32-bit
@@ -730,6 +754,25 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         int rc = tm_munmap_serve(caller, (unsigned long)mr0,
                                   (unsigned long)mr1);
         if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_MPROTECT: {
+        /* mr0 = addr (page-aligned), mr1 = length, mr2 = PROT_* bits. */
+        int rc = tm_mprotect_serve(caller, (unsigned long)mr0,
+                                   (unsigned long)mr1, (unsigned long)mr2);
+        if (rc) err = (seL4_Word)(-rc);
+        break;
+    }
+    case TM_REQ_ALLOC_PHYS: {
+        /* mr0 = length (bytes, <= one Mega_Page), mr1 = prot.
+         * Reply: mr0 = VA, mr1 = PA. */
+        unsigned long va = 0, pa = 0;
+        int rc = tm_alloc_phys_serve(caller, (unsigned long)mr0,
+                                     (unsigned)mr1, &va, &pa);
+        if (rc) { err = (seL4_Word)(-rc); break; }
+        *out_mr0 = (seL4_Word)va;
+        *out_mr1 = (seL4_Word)pa;
+        reply_len = 2;
         break;
     }
 

@@ -95,6 +95,37 @@ typedef struct {
     gid_t rgid, egid, sgid;
 } tm_cred_t;
 
+/* Scheduling (v0.13).  QSOE adopts the QNX priority model verbatim:
+ * priorities 0..255, higher number = higher priority, 0 reserved for the
+ * per-CPU idle thread, user processes booting in the low unprivileged band
+ * (QNX's default is around 10).  seL4 exposes the identical 0..255 range
+ * (CONFIG_NUM_PRIORITIES = 256), so a QNX priority IS the seL4 priority --
+ * SchedSet passes the value through untranslated.  Skimmer (NQ) adopts the
+ * same 0..255 scale, so the one shared userspace means the same thing on
+ * both kernels (a driver IST that raises itself to 21 elevates above the
+ * default on either).
+ *
+ * Two roles one constant used to conflate are now separate:
+ *   TM_PRIO_USER_DEFAULT -- the priority a freshly spawned user thread (and
+ *      a default pthread worker) runs at.  A driver raises its interrupt
+ *      service thread ABOVE it with SchedSet, exactly as its QNX code does
+ *      (devb-nvme's IST -> 21).  Stays well below taskman so the server
+ *      never starves.
+ *   TM_SCHED_PRIO_MAX -- the ceiling SchedSet accepts (one below taskman).
+ *      The QNX 1..63-unprivileged / >63-needs-PROCMGR_AID_PRIORITY split
+ *      becomes a cred-gated policy once multi-user lands.
+ *
+ * taskman runs at seL4 InitThread priority (TM_PRIO_SYSTEM = 255) and blocks
+ * on Recv when idle, so any user thread yields to it on demand.  Policy is
+ * recorded and echoed by SchedGet but does not yet change SC budget/period
+ * -- SCHED_RR and SCHED_FIFO both ride the budget==period round-robin SC;
+ * the value must match <sched.h>'s SCHED_* (OTHER=0, FIFO=1, RR=2). */
+#define TM_PRIO_USER_DEFAULT  10                    /* QNX default user prio */
+#define TM_PRIO_SYSTEM        255                   /* taskman (seL4 InitThread) */
+#define TM_SCHED_PRIO_MIN     1                     /* 0 reserved for idle */
+#define TM_SCHED_PRIO_MAX     (TM_PRIO_SYSTEM - 1)  /* stay below taskman */
+#define TM_SCHED_RR           2     /* default policy; matches <sched.h> SCHED_RR */
+
 /* One entry in a process's mmap tracker.  Records the (va_page,
  * frame_cap) pair the taskman-side mmap allocator produced so a
  * later TM_REQ_* handler can find the frame backing an arbitrary
@@ -106,6 +137,22 @@ typedef struct {
     unsigned long va_page;
     seL4_CPtr     frame;
 } tm_mmap_entry_t;
+
+/* Per-process RELRO page registry (v0.13 real mprotect).  A page whose
+ * VA lands in a loaded object's PT_GNU_RELRO range keeps an INVOKEABLE
+ * frame cap here -- in its taskman root-CNode slot -- instead of moving
+ * to the per-process objcnode like the bulk image frames (a cap there
+ * can't be invoked, so Page_Map can't reach it; see the objcnode note
+ * below).  TM_REQ_MPROTECT re-Page_Maps these with the requested rights,
+ * which is exactly what rtld's RELRO pass needs (make .got / .data.rel.ro
+ * read-only after relocation).  Main image + libc.so + rtld each
+ * contribute only a few pages, so 32 is ample and the root-slot cost is
+ * negligible next to the ~150 bulk frames the objcnode absorbs. */
+typedef struct {
+    unsigned long va_page;   /* page-aligned child VA */
+    seL4_CPtr     frame;     /* invokeable frame cap (taskman root slot) */
+} tm_mprot_entry_t;
+#define TM_MAX_MPROT  32
 
 typedef struct {
     int       in_use;
@@ -119,6 +166,11 @@ typedef struct {
      * SLOT must be returned to the allocator explicitly in teardown --
      * otherwise every spawn leaks one slot and the root CNode fills. */
     seL4_CPtr sc;
+    /* v0.13 main-thread scheduling state, tracked here because seL4 has no
+     * get-priority invocation -- SchedGet reads these back.  Seeded at spawn
+     * (TM_PRIO_USER_DEFAULT / TM_SCHED_RR) and updated by SchedSet. */
+    int       sched_prio;
+    int       sched_policy;
     seL4_CPtr vspace;
     seL4_CPtr untyped_budget;
     seL4_CPtr workers_l1_pt;
@@ -171,6 +223,13 @@ typedef struct {
      * never mistakes a shared device frame for reclaimable RAM. */
     seL4_CPtr devframes[TM_MAX_DEVFRAMES];
     int       devframe_count;
+
+    /* v0.13 RELRO page registry (see tm_mprot_entry_t).  Populated at
+     * spawn for pages in any loaded object's PT_GNU_RELRO range; consulted
+     * by tm_mprotect_serve.  Slots reclaimed in teardown (the frame itself
+     * dies with Revoke(pput), same as the mmap megapages). */
+    tm_mprot_entry_t mprot[TM_MAX_MPROT];
+    int              mprot_count;
 
     /* v0.7 cred — inherited from parent at spawn, settable via
      * setuid/setgid later. */
@@ -236,6 +295,10 @@ typedef struct {
      * CNode.  Like the main thread's, its slot must be freed in teardown
      * (the object dies with Revoke(pput); the slot does not). */
     seL4_CPtr sc;
+    /* v0.13 scheduling state (see tm_process_t).  Seeded at TM_REQ_THREAD_ALLOC
+     * from the requested prio (TM_SCHED_RR policy); updated by SchedSet. */
+    int       sched_prio;
+    int       sched_policy;
     /* Short thread name for ps(1) -H rows; "" until set.  taskman can't
      * see libc's ThreadCtl(TCTL_NAME) (that writes the libc-local TCB),
      * so this is populated only where taskman already knows the role --
@@ -436,6 +499,16 @@ int           tm_set_cred(pid_t caller_pid,
                            unsigned rgid_new, unsigned egid_new,
                            unsigned sgid_new);
 
+/* v0.13 scheduling.  SchedSet sets thread (pid,tid)'s seL4 priority via
+ * TCB_SetPriority and records its policy; SchedGet reads both back.  pid==0
+ * means the caller; tid<=1 selects the process's main thread (p->tcb), a
+ * higher tid a TM_REQ_THREAD_ALLOC worker (tm_thread_find).  Return 0 / a
+ * negative errno (-ESRCH unknown thread, -EINVAL bad priority/policy). */
+int           tm_sched_set(pid_t caller_pid, pid_t pid, int tid,
+                           int policy, int prio);
+int           tm_sched_get(pid_t caller_pid, pid_t pid, int tid,
+                           int *out_policy, int *out_prio);
+
 /* v0.7 timer subsystem (hybrid lazy expiry).  See proc/timer.c.
  *
  * tm_timer_sweep()  — called at every dispatch entry; wakes any
@@ -457,7 +530,8 @@ int           tm_setitimer(pid_t caller_pid, int which,
 /* ----------- channels ----------- */
 
 int       tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
-                            seL4_CPtr *out_recv_slot);
+                            int creator_tid, seL4_CPtr *out_recv_slot,
+                            int *out_chid);
 int       tm_channel_destroy(pid_t owner_pid, seL4_CPtr recv_slot);
 int       tm_channel_register_existing(pid_t pid, int chid,
                                         seL4_CPtr master_slot,

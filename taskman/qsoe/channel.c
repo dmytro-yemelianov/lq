@@ -22,15 +22,17 @@ int ChannelCreate(unsigned flags)
     if (chid < 0) { qsoe_errno = ENOMEM; return -1; }
 
     unsigned long recv_slot = 0;
+    int eff_chid = chid;
     int err = tm_channel_create(QSOE_PID_TASKMAN, chid, flags,
-                                (unsigned long *)&recv_slot);
+                                qsoe_curthr()->tid,
+                                (seL4_CPtr *)&recv_slot, &eff_chid);
     if (err != 0) {
         qsoe_state_bind_chid(chid, 0);
         qsoe_errno = -err;
         return -1;
     }
-    qsoe_state_bind_chid(chid, recv_slot);
-    return chid;
+    qsoe_state_bind_chid(eff_chid, recv_slot);
+    return eff_chid;
 }
 
 int ChannelDestroy(int chid)

@@ -259,6 +259,7 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
          * those caps are stale -- never carry them across a reuse. */
         g_processes[i].mmap_free_count = 0;
         g_processes[i].devframe_count  = 0;
+        g_processes[i].mprot_count     = 0;
         /* Inherit parent's cred at spawn.  main.c's PROCESS_CREATE
          * handler calls tm_process_set_parent (and we'd ideally
          * inherit cred from there); until QSOE has multi-user state
@@ -753,6 +754,66 @@ int tm_set_cred(pid_t caller_pid,
     return 0;
 }
 
+/* ----------- v0.13 scheduling (SchedSet / SchedGet) ----------- */
+
+/* Resolve (pid, tid) to the target thread's TCB cap plus pointers to its
+ * tracked scheduling state.  pid==0 -> caller; tid<=1 -> the process's main
+ * thread (p->tcb / p->sched_*), a higher tid -> a TM_REQ_THREAD_ALLOC worker
+ * (tm_thread_find).  Returns 0 with the out-params filled, or -ESRCH. */
+static int sched_resolve(pid_t caller_pid, pid_t pid, int tid,
+                         seL4_CPtr *out_tcb, int **out_prio, int **out_policy)
+{
+    if (pid == 0) pid = caller_pid;
+    if (tid <= 1) {
+        tm_process_t *p = tm_process_lookup(pid);
+        if (!p) return -ESRCH;
+        *out_tcb    = p->tcb;
+        *out_prio   = &p->sched_prio;
+        *out_policy = &p->sched_policy;
+        return 0;
+    }
+    tm_thread_t *t = tm_thread_find(pid, tid);
+    if (!t) return -ESRCH;
+    *out_tcb    = t->tcb_master;
+    *out_prio   = &t->sched_prio;
+    *out_policy = &t->sched_policy;
+    return 0;
+}
+
+int tm_sched_set(pid_t caller_pid, pid_t pid, int tid, int policy, int prio)
+{
+    /* SCHED_OTHER(0)..SCHED_RR(TM_SCHED_RR) is the whole policy range. */
+    if (policy < 0 || policy > TM_SCHED_RR) return -EINVAL;
+    if (prio < TM_SCHED_PRIO_MIN || prio > TM_SCHED_PRIO_MAX) return -EINVAL;
+
+    seL4_CPtr tcb; int *cur_prio; int *cur_policy;
+    int rc = sched_resolve(caller_pid, pid, tid, &tcb, &cur_prio, &cur_policy);
+    if (rc) return rc;
+
+    /* TCB_SetPriority leaves the round-robin SC untouched -- only the
+     * priority changes.  seL4 caps the new value at the authority TCB's
+     * MCP; taskman's InitThread authority (255) sits above
+     * TM_SCHED_PRIO_MAX, so the bound check above is the real limiter. */
+    seL4_Word err = qsoe_tcb_set_priority(tcb, seL4_CapInitThreadTCB,
+                                          (seL4_Word)prio);
+    if (err) return -EINVAL;
+
+    *cur_prio   = prio;
+    *cur_policy = policy;
+    return 0;
+}
+
+int tm_sched_get(pid_t caller_pid, pid_t pid, int tid,
+                 int *out_policy, int *out_prio)
+{
+    seL4_CPtr tcb; int *cur_prio; int *cur_policy;
+    int rc = sched_resolve(caller_pid, pid, tid, &tcb, &cur_prio, &cur_policy);
+    if (rc) return rc;
+    if (out_prio)   *out_prio   = *cur_prio;
+    if (out_policy) *out_policy = *cur_policy;
+    return 0;
+}
+
 /* ----------- v0.4.1 process termination ----------- */
 
 int tm_process_terminate(pid_t target, int status)
@@ -901,6 +962,14 @@ int tm_process_terminate(pid_t target, int status)
         }
     }
     p->devframe_count = 0;
+
+    /* 8d. RELRO frame caps kept invokeable for mprotect.  Their objects
+     *     are pp_ut children destroyed by Revoke(pput) below (same as the
+     *     mmap megapages); only the root-CNode slots need reclaiming. */
+    for (int i = 0; i < p->mprot_count; ++i) {
+        if (p->mprot[i].frame) taskman_free_slot(p->mprot[i].frame);
+    }
+    p->mprot_count = 0;
 
     /* 9. Per-process untyped blocks.  Revoke each (destroying every
      *    object still retyped from it -- image frames, page tables,

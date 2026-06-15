@@ -59,6 +59,7 @@ struct elf64_phdr {
 #define PT_DYNAMIC 2
 #define PT_INTERP  3
 #define PT_PHDR    6
+#define PT_GNU_RELRO 0x6474e552u   /* read-only-after-relocation segment */
 #define PF_X    1
 #define PF_W    2
 #define PF_R    4
@@ -108,10 +109,8 @@ struct elf64_phdr {
 #define CHILD_SYSMAP_BASE  QSOE_SYSMAP_VA  /* read-only 'PSYS' page @0x1FC000 */
 #define CHILD_IPC_BUFFER   0x1FE000UL  /* seL4 IPC buffer (fixed; libc seam) */
 
-/* seL4 priority for spawned user processes — one below taskman so the
- * server always preempts.  (seL4 priorities run 0..255; taskman, the
- * root task, sits at 255.) */
-#define TM_PRIO_USER       254
+/* TM_PRIO_USER_DEFAULT (the QNX-default priority a spawned user thread
+ * runs at) and the SchedSet ceiling/range live in proc.h. */
 /* v0.6.4: no pre-allocated heap.  Memory comes on demand via
  * TM_REQ_MMAP — see tm_mmap_serve below.  The bottom of that region
  * is QSOE_MMAP_BASE (= 0x2000000, 32 MiB), well above the image,
@@ -413,6 +412,22 @@ static seL4_CPtr spawn_find_frame(unsigned long va)
     return 0;
 }
 
+/* Per-spawn GNU_RELRO ranges, one per loaded object that carries the
+ * segment (main image, libc.so, rtld).  Recorded by load_elf_segments
+ * (load_offset already applied); consulted at the objcnode-move step so
+ * pages in a range keep an invokeable frame cap for runtime mprotect. */
+#define SPAWN_MAX_RELRO 8
+typedef struct { unsigned long lo; unsigned long hi; } spawn_relro_t;
+static spawn_relro_t s_relro[SPAWN_MAX_RELRO];
+static int           s_relro_count;
+
+static int va_in_relro(unsigned long va_page)
+{
+    for (int i = 0; i < s_relro_count; ++i)
+        if (va_page >= s_relro[i].lo && va_page < s_relro[i].hi) return 1;
+    return 0;
+}
+
 /* seL4 forbids mapping one frame cap in two VSpaces at once.  Since
  * we've already Page_Map'd each frame into the child, we cannot also
  * scratch_map it in taskman's vspace via the same cap.  Workaround:
@@ -636,6 +651,23 @@ static int load_elf_segments(seL4_CPtr vspace, const void *elf_blob,
                 return -ENOMEM;
         }
     }
+
+    /* Note this object's GNU_RELRO range (load_offset applied) so the
+     * objcnode-move step keeps those pages' frame caps invokeable for
+     * rtld's runtime mprotect(PROT_READ). */
+    for (u16 i = 0; i < eh->e_phnum; ++i) {
+        if (ph[i].p_type != PT_GNU_RELRO) continue;
+        unsigned long lo = (load_offset + ph[i].p_vaddr) & ~0xFFFUL;
+        unsigned long hi = (load_offset + ph[i].p_vaddr + ph[i].p_memsz
+                            + 0xFFFUL) & ~0xFFFUL;
+        if (s_relro_count >= SPAWN_MAX_RELRO) {
+            tm_err("spawn: RELRO range table full (>%d)", SPAWN_MAX_RELRO);
+            break;
+        }
+        s_relro[s_relro_count].lo = lo;
+        s_relro[s_relro_count].hi = hi;
+        s_relro_count++;
+    }
     return 0;
 }
 
@@ -649,6 +681,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * are mapped; the reloc walker consults it to find write targets. */
     s_frame_count = 0;
     s_pt_count    = 0;
+    s_relro_count = 0;
 
     /* The L1 PT covering [0x40000000, 0x80000000).  In dyn-linked
      * spawns we install it below as `dl_l1` (so libc.so + rtld + the
@@ -1212,9 +1245,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
 
     /* MCS: a TCB cannot run until a scheduling context is bound.  Give
      * the main thread a round-robin SC on core 0 and bind it (along with
-     * priority) via SetSchedParams.  Spawned processes run below taskman
-     * (TM_PRIO_USER); taskman blocks on Recv when idle, so lower-priority
-     * threads always get the CPU. */
+     * priority) via SetSchedParams.  Spawned processes run in the QNX
+     * default user band (TM_PRIO_USER_DEFAULT), well below taskman; taskman
+     * blocks on Recv when idle, so user threads always get the CPU. */
     seL4_CPtr sc = tm_sched_context_create(/*core=*/0);
     if (!sc) { tm_err("spawn: sched-context create failed"); return -ENOMEM; }
     /* Graceful crash: give the main thread a fault handler -- a badged
@@ -1231,7 +1264,8 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                           TM_FAULT_BADGE_FLAG | (seL4_Word)pid);
     if (err) { tm_err("spawn: fault-ep mint failed"); return -ENOMEM; }
     err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
-                                    /*mcp=*/TM_PRIO_USER, /*prio=*/TM_PRIO_USER,
+                                    /*mcp=*/TM_PRIO_USER_DEFAULT,
+                                    /*prio=*/TM_PRIO_USER_DEFAULT,
                                     sc, fault_ep);
     if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return -ENOMEM; }
     /* The minted fault cap must stay in our CSpace -- the TCB references
@@ -1277,6 +1311,11 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     if (prec) {
         prec->untyped_budget = child_untyped;
         prec->fault_ep       = fault_ep;
+        /* Seed the main thread's tracked scheduling state to match the
+         * priority/policy it was just configured with (SetSchedParams
+         * above), so SchedGet reports the truth before any SchedSet. */
+        prec->sched_prio     = TM_PRIO_USER_DEFAULT;
+        prec->sched_policy   = TM_SCHED_RR;
         const char *base = elf_name ? elf_name : "?";
         for (const char *s = base; *s; ++s)
             if (*s == '/') base = s + 1;
@@ -1332,6 +1371,20 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             op->objcnode_next = 0;
             for (int i = 0; i < s_frame_count; ++i) {
                 seL4_CPtr src  = s_frames[i].frame;
+                /* RELRO pages keep their cap INVOKEABLE (left in the root
+                 * slot, recorded in op->mprot[]) so TM_REQ_MPROTECT can
+                 * re-map them; everything else moves to the objcnode. */
+                if (va_in_relro(s_frames[i].va_page)) {
+                    if (op->mprot_count >= TM_MAX_MPROT) {
+                        tm_err("spawn: pid %ld RELRO tracker full (cap=%d)",
+                               (long)pid, TM_MAX_MPROT);
+                        return -ENOMEM;
+                    }
+                    op->mprot[op->mprot_count].va_page = s_frames[i].va_page;
+                    op->mprot[op->mprot_count].frame   = src;
+                    op->mprot_count++;
+                    continue;
+                }
                 seL4_Word merr = qsoe_cnode_move(objc,
                                                  (seL4_Word)op->objcnode_next,
                                                  TM_OBJCNODE_RADIX,

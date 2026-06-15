@@ -68,7 +68,14 @@ static int mmap_anonymous(tm_process_t *proc, unsigned long len,
 {
     /* Round up to a multiple of QSOE_MEGA_PAGE. */
     unsigned long bytes = (len + QSOE_MEGA_PAGE - 1) & ~(QSOE_MEGA_PAGE - 1);
-    unsigned long base  = proc->mmap_top;
+    /* A Mega_Page maps only at a 2 MiB-aligned VA.  mmap_top is normally
+     * 2 MiB-aligned (this path only ever advances it by whole Mega_Pages),
+     * but a prior MAP_PHYS mapping of a 4 KiB-granule device region
+     * (devmap_map_into) leaves it merely 4 KiB-aligned -- so align up here,
+     * else seL4 rejects the Page_Map.  (Hit by devb-nvme: it maps BAR0 via
+     * MAP_PHYS, then alloc_phys's anonymous DMA page landed mis-aligned.) */
+    unsigned long base  = (proc->mmap_top + QSOE_MEGA_PAGE - 1) &
+                          ~(QSOE_MEGA_PAGE - 1);
     unsigned long pages = bytes / QSOE_MEGA_PAGE;
 
     for (unsigned long i = 0; i < pages; ++i) {
@@ -387,6 +394,44 @@ int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long flags,
     return rc;
 }
 
+/* TM_REQ_ALLOC_PHYS: map one anonymous RAM page in the caller's VSpace
+ * and report BOTH its VA and the physical address it backs.  An ordinary
+ * mmap hides the PA on purpose; a driver that must program a frame's PA
+ * into hardware (the DesignWare PCIe MSI trap target, a DMA buffer) uses
+ * this instead.  Backed by the same per-process Mega_Page path as
+ * anonymous mmap -- one 2 MiB frame even for a sub-page request, so the
+ * PA is 2 MiB-aligned; frugal sub-page packing is a later refinement.
+ * `prot` is accepted for API symmetry but the frame is mapped R|W (what
+ * every current caller wants). */
+int tm_alloc_phys_serve(pid_t caller, unsigned long length, unsigned prot,
+                        unsigned long *out_vaddr, unsigned long *out_paddr)
+{
+    (void)prot;
+    tm_process_t *proc = tm_process_lookup(caller);
+    if (!proc) return -ESRCH;
+    if (length == 0 || length > QSOE_MEGA_PAGE) return -EINVAL;
+
+    unsigned long base = 0;
+    tm_pput_proc_begin(proc);
+    int rc = mmap_anonymous(proc, length, &base);
+    tm_pput_end();
+    if (rc) return rc;
+
+    /* mmap_anonymous appended exactly the frame(s) it mapped; for a
+     * <= 2 MiB request that is one entry, the last in the tracker. */
+    seL4_CPtr frame = proc->mmap[proc->mmap_count - 1].frame;
+    seL4_Word paddr = 0;
+    seL4_Word err = qsoe_riscv_page_get_address(frame, &paddr);
+    if (err || paddr == 0) {
+        tm_err("tm_alloc_phys_serve: Page_GetAddress failed (err=%lu)",
+               (unsigned long)err);
+        return -ENOMEM;
+    }
+    *out_vaddr = base;
+    *out_paddr = (unsigned long)paddr;
+    return 0;
+}
+
 /* Walk proc->mmap[] for an entry whose va_page == va.  Returns index
  * or -1.  Linear scan: tracker is bounded by TM_MAX_MMAP_PER_PROC. */
 static int find_mmap_idx(tm_process_t *proc, unsigned long va)
@@ -456,6 +501,81 @@ int tm_munmap_serve(pid_t caller, unsigned long vaddr, unsigned long len)
      * exit); only the contiguous-top case can rewind safely. */
     if (vaddr + bytes == proc->mmap_top) {
         proc->mmap_top = vaddr;
+    }
+    return 0;
+}
+
+/* POSIX PROT_* bits (mirror <sys/mman.h>; taskman is freestanding). */
+#define TM_PROT_READ   0x1
+#define TM_PROT_WRITE  0x2
+#define TM_PROT_EXEC   0x4
+/* seL4 RISC-V page attribute: 0 = Default (executable); 1 = ExecuteNever. */
+#define TM_VM_ATTR_EXEC_NEVER  1
+
+/* Index of the anonymous Mega_Page entry whose 2 MiB span contains `va`,
+ * or -1.  (mmap[] records the 2 MiB-aligned base of each anon mapping.) */
+static int find_mmap_span(tm_process_t *proc, unsigned long va)
+{
+    for (int i = 0; i < proc->mmap_count; ++i) {
+        unsigned long lo = proc->mmap[i].va_page;
+        if (va >= lo && va < lo + QSOE_MEGA_PAGE) return i;
+    }
+    return -1;
+}
+
+/* TM_REQ_MPROTECT — change the rights on an already-mapped range.  See
+ * mem.h.  Page granular; the two real cases are rtld's RELRO pages
+ * (tracked invokeable in proc->mprot[], re-Page_Map'd here) and anonymous
+ * mmap pages (mapped R|W -- a request they already satisfy succeeds). */
+int tm_mprotect_serve(pid_t caller, unsigned long addr, unsigned long len,
+                      unsigned long prot)
+{
+    tm_process_t *proc = tm_process_lookup(caller);
+    if (!proc) return -ESRCH;
+    if (len == 0) return -EINVAL;
+    if (addr & (QSOE_PAGE_4K - 1)) return -EINVAL;
+
+    seL4_CapRights_t rights = seL4_CapRights_new(
+        0, 0,
+        (prot & TM_PROT_READ)  ? 1 : 0,
+        (prot & TM_PROT_WRITE) ? 1 : 0);
+    seL4_Word attr = (prot & TM_PROT_EXEC) ? QSOE_VM_ATTR_DEFAULT
+                                           : TM_VM_ATTR_EXEC_NEVER;
+
+    unsigned long end = (addr + len + QSOE_PAGE_4K - 1) & ~(QSOE_PAGE_4K - 1);
+    for (unsigned long va = addr; va < end; va += QSOE_PAGE_4K) {
+        /* RELRO page: re-Page_Map the retained invokeable frame cap with
+         * the new rights.  seL4 updates the live PTE in place when the cap
+         * is already mapped at this (vspace, vaddr) -- the real rights flip. */
+        int hit = -1;
+        for (int i = 0; i < proc->mprot_count; ++i)
+            if (proc->mprot[i].va_page == va) { hit = i; break; }
+        if (hit >= 0) {
+            seL4_Word err = qsoe_riscv_page_map(proc->mprot[hit].frame,
+                                                proc->vspace, va, rights, attr);
+            if (err) {
+                tm_err("tm_mprotect_serve: remap va=0x%lx err=%lu",
+                       va, (unsigned long)err);
+                return -EACCES;
+            }
+            continue;
+        }
+        /* Anonymous mmap page (2 MiB Mega_Page, mapped R|W).  A request the
+         * existing rights already satisfy is a genuine success (mallocng
+         * widening a page to R|W lands here).  Narrowing a sub-2 MiB slice
+         * is impossible at this granularity -- refuse it loudly (EACCES is
+         * POSIX's "protection change not supported"). */
+        if (find_mmap_span(proc, va) >= 0) {
+            if (prot & (TM_PROT_READ | TM_PROT_WRITE))
+                continue;
+            tm_err("tm_mprotect_serve: cannot narrow anon Mega_Page va=0x%lx "
+                   "prot=0x%lx (sub-2MiB granularity unsupported)", va, prot);
+            return -EACCES;
+        }
+        /* Outside every mapping taskman tracks for this process. */
+        tm_err("tm_mprotect_serve: pid %ld va=0x%lx not in a tracked mapping",
+               (long)proc->pid, va);
+        return -ENOMEM;
     }
     return 0;
 }

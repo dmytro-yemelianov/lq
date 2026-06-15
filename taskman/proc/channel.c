@@ -12,15 +12,25 @@
 static tm_channel_t g_channels[TM_MAX_CHANNELS];
 static seL4_Word    s_next_badge = 1;  /* 0 reserved as "no badge" */
 
+/* System-wide counter for global-channel chids (QSOE_CHF_GLOBAL).  LQ
+ * chids are otherwise allocated client-side per-process, which can't give
+ * a global channel the cross-process-unique chid it needs; taskman assigns
+ * it here.  Starts at 1 so a global chid is never bare QSOE_GLOBAL_CHANNEL. */
+static unsigned     s_global_chid_next = 1;
+
 tm_channel_t *tm_channels_array(void) { return g_channels; }
 
+/* A global chid (QSOE_GLOBAL_CHANNEL bit set) is matched by chid ALONE --
+ * pid is ignored, since the whole point is pid-independent discovery.  A
+ * normal chid is matched by the (owner_pid, owner_chid) pair (the QNX
+ * per-process model). */
 static tm_channel_t *channel_find(pid_t pid, int chid)
 {
+    int global = QSOE_IS_GLOBAL_CHANNEL(chid) != 0;
     for (int i = 0; i < TM_MAX_CHANNELS; ++i) {
         tm_channel_t *c = &g_channels[i];
-        if (c->in_use && c->owner_pid == pid && c->owner_chid == chid) {
-            return c;
-        }
+        if (!c->in_use || c->owner_chid != chid) continue;
+        if (global || c->owner_pid == pid) return c;
     }
     return 0;
 }
@@ -77,10 +87,31 @@ static int channel_alloc_slot_idx(void)
 }
 
 int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
-                      seL4_CPtr *out_recv_slot)
+                      int creator_tid, seL4_CPtr *out_recv_slot, int *out_chid)
 {
     tm_process_t *owner = tm_process_lookup(owner_pid);
     if (!owner) return -ESRCH;
+
+    /* The pulse Notification (below) is bound to the thread that will
+     * RECEIVE on this channel.  By convention that's the creating thread:
+     * a server thread MsgReceives its own channel (e.g. devb-nvme's IST
+     * creates AND receives the MSI pulse channel), so bind to the creator.
+     * tid<=1 is the main thread (owner->tcb); a worker resolves through
+     * tm_thread_find.  When receiver != creator (the signal channel, made
+     * at startup but serviced by the system thread) a later
+     * TM_REQ_CHANNEL_BIND_THREAD re-targets it.  seL4 binds one ntfn per
+     * TCB, so this is "one pulse-receiving channel per thread". */
+    seL4_CPtr bind_tcb = owner->tcb;
+    if (creator_tid > 1) {
+        tm_thread_t *t = tm_thread_find(owner_pid, creator_tid);
+        if (t) bind_tcb = t->tcb_master;
+    }
+    /* Global channel: taskman assigns a system-unique chid (the client's
+     * suggestion is ignored) and marks it so ConnectAttach/MsgReceive route
+     * via the global path.  owner_pid is still recorded so the channel is
+     * torn down with the creating process. */
+    if (flags & QSOE_CHF_GLOBAL)
+        chid = (int)(QSOE_GLOBAL_CHANNEL | (s_global_chid_next++));
     if (channel_find(owner_pid, chid)) return -EINVAL;
     int idx = channel_alloc_slot_idx();
     if (idx < 0) return -ENOMEM;
@@ -114,8 +145,8 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
             taskman_free_slot(ntfn_master);
             taskman_free_slot(ntfn_sig);
             ntfn_master = ntfn_sig = 0;
-        } else if (owner->tcb) {
-            if (qsoe_tcb_bind_notification(owner->tcb, ntfn_master) != 0) {
+        } else if (bind_tcb) {
+            if (qsoe_tcb_bind_notification(bind_tcb, ntfn_master) != 0) {
                 qsoe_cnode_revoke(s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN);
                 qsoe_cnode_delete(s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN);
                 taskman_free_slot(ntfn_master);
@@ -138,6 +169,7 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
     g_channels[idx].ntfn_sig    = ntfn_sig;
 
     *out_recv_slot = recv;
+    if (out_chid) *out_chid = chid;   /* effective chid (assigned if global) */
     return 0;
 }
 

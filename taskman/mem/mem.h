@@ -37,6 +37,22 @@ int tm_mmap_serve(pid_t caller, unsigned long len, unsigned long flags,
  * range MUST be present in the tracker; otherwise -EINVAL. */
 int tm_munmap_serve(pid_t caller, unsigned long vaddr, unsigned long len);
 
+/* TM_REQ_MPROTECT: change the PROT_* rights on an already-mapped range.
+ * Real for the pages rtld re-protects: RELRO pages tracked in proc->mprot[]
+ * are re-Page_Map'd with the new rights; an anonymous mmap Mega_Page that
+ * already satisfies the request (it is mapped R|W) is accepted as-is.  addr
+ * must be page-aligned, len > 0.  Returns 0, or a negative errno; an
+ * untracked range or a request unsatisfiable at the page's granularity is
+ * reported loudly (never a silent no-op). */
+int tm_mprotect_serve(pid_t caller, unsigned long addr, unsigned long len,
+                      unsigned long prot);
+
+/* TM_REQ_ALLOC_PHYS: map one anonymous RAM page and report its VA + PA
+ * (for drivers that must hand a frame's physical address to hardware,
+ * e.g. the DesignWare PCIe MSI trap target).  See mmap.c. */
+int tm_alloc_phys_serve(pid_t caller, unsigned long length, unsigned prot,
+                        unsigned long *out_vaddr, unsigned long *out_paddr);
+
 /* Bootinfo handle (set once at startup by main.c) — used by
  * MAP_PHYS to walk the device-untyped list. */
 void tm_mem_set_bootinfo(seL4_BootInfo *bi);

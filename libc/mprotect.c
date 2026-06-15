@@ -1,33 +1,41 @@
 /*
- * mprotect.c -- LQ stub for POSIX mprotect.
+ * mprotect.c -- LQ seam for POSIX mprotect().
  *
- * rtld resolves mprotect from libc.so at startup to adjust GNU_RELRO
- * page permissions during relocation.  Until taskman grows a real
- * TM_REQ_MPROTECT path (variable-granularity seL4 Page_Map with
- * adjusted rights), this stub returns success without touching the
- * mapping.  Pages stay at whatever rights they were created with --
- * for v0 dynamic-linked binaries that means writable + readable on
- * the data segment, which is the correct "loose" posture: relocations
- * can be applied, RELRO simply doesn't take effect.  Real mprotect
- * lands when the security-hardening pass needs it.
+ * Routes the protection change to taskman (TM_REQ_MPROTECT), which holds
+ * the page's frame cap and re-maps it with the requested rights.  The
+ * caller rtld is the dynamic linker's RELRO pass: after applying
+ * relocations it calls mprotect(relro_page, relro_size, PROT_READ) to make
+ * the GOT / .data.rel.ro / .dynamic read-only.  Taskman keeps an invokeable
+ * frame cap for every page in each loaded object's PT_GNU_RELRO range (see
+ * lq/taskman/proc/spawn.c) precisely so this call can take effect.
  *
- * Announces itself on first call per the announcing-stubs policy --
- * silent stubs get forgotten and waste hours later (see
- * feedback_stubs_announce memory).
+ * addr must be page-aligned and len > 0; taskman rounds len up to a page.
+ * Returns 0 on success, -1 with errno set on failure (EACCES if the
+ * requested protection can't be applied to that range, ENOMEM if the range
+ * isn't mapped, EINVAL on a misaligned addr / zero length).
  *
  * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <sys/mman.h>
-#include <stdio.h>
+#include <errno.h>
+#include <sys/qsoe.h>
+#include <qsoe/slots.h>     /* QSOE_CAP_TASKMAN_EP */
+#include <qsoe/tm_msgs.h>
+
+#include "sel4_types.h"
+#include "qsoe_invoke.h"
 
 int mprotect(void *addr, size_t len, int prot)
 {
-    static int announced;
-    if (!announced) {
-        announced = 1;
-        fprintf(stderr, "STUB: mprotect returning 0 (no-op, RELRO inert)\n");
-    }
-    (void)addr; (void)len; (void)prot;
+    seL4_Word mr0 = (seL4_Word)(unsigned long)addr;
+    seL4_Word mr1 = (seL4_Word)len;
+    seL4_Word mr2 = (seL4_Word)(unsigned)prot;
+    seL4_Word mr3 = 0;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_MPROTECT, 0, 0, 3);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                             &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err) { qsoe_errno = (int)err; return -1; }
     return 0;
 }
