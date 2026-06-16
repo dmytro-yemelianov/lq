@@ -1,0 +1,218 @@
+\chapter{Untyped Memory: How seL4 Carves RAM}
+
+This chapter explains the single seL4 idea that the rest of QSOE/L's
+memory management is built on --- \emph{untyped memory} and the
+\emph{retype} operation --- and then uses it to explain a console
+message that appears, harmlessly, on every boot. The treatment leans
+on an analogy and stays deliberately informal; the formal architecture
+lives in the companion \emph{Design and Architecture} document.
+
+\section{The one concept behind all of this}
+
+In a conventional kernel (QNX, Linux), the kernel keeps a pool of free
+RAM and hands it out on demand. \textbf{seL4 does the opposite: after
+boot, the kernel never allocates memory at all.} At boot it gives
+\emph{all} free RAM to user space as a handful of big raw blocks called
+\textbf{untyped memory} --- in effect, ``here is a pile of physical
+bytes; you manage it.''
+
+To actually \emph{use} some of that raw memory --- to obtain a page, a
+page table, a thread control block --- a user-space server asks the
+kernel to \textbf{retype} a chunk of an untyped block into a real
+kernel object. ``Retype'' means: \emph{carve a piece off this raw block
+and stamp it into a 2\,MiB page} (or a thread, or whatever object was
+requested).
+
+The crucial detail is the bookkeeping. Each untyped block carries a
+\textbf{watermark} --- seL4 calls it the \emph{free index}. A retype
+always carves at the watermark and pushes it forward. \textbf{The
+kernel only ever moves the watermark forward}, never back, until the
+block is emptied and explicitly reset. An untyped block is therefore a
+one-way bump allocator: it fills up, sheet by sheet, until it is full.
+
+\subsection{The analogy}
+
+Three nested physical things capture the whole model:
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Real thing} & \textbf{Analogy} & \textbf{Size} \\
+    \midrule
+    RAM untyped (given at boot) & a \textbf{box} of notepads      & big (tens--hundreds of MiB) \\
+    pp\_ut block (per-process)  & a \textbf{notepad} of 8 pages   & 16\,MiB \\
+    Mega\_Page (a process page) & one \textbf{page} torn off      & 2\,MiB \\
+    \bottomrule
+\end{tabular}
+\caption{The boxes / notepads / pages model of untyped memory}
+\label{tab:carve-analogy}
+\end{table}
+
+``Retype'' is tearing off the next item. The watermark is how far down
+you have torn. You can only tear \emph{forward}.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    pad/.style={draw, rounded corners=2pt, fill=blue!8,
+                minimum width=2.0cm, minimum height=1.5cm, align=center},
+    page/.style={draw, fill=orange!15, minimum width=2.6cm,
+                 minimum height=0.36cm},
+    arr/.style={-{Stealth[length=6pt]}, thick},
+]
+    % --- the box, containing three notepads ---
+    \node[pad] (p1) {notepad\\16\,MiB};
+    \node[pad, right=0.35cm of p1] (p2) {notepad\\16\,MiB};
+    \node[pad, right=0.35cm of p2] (p3) {notepad\\16\,MiB};
+    \node[font=\small, right=0.35cm of p3] (more) {\ldots};
+
+    \begin{scope}[on background layer]
+        \node[draw, thick, rounded corners=3pt, fill=gray!8,
+              fit=(p1)(p2)(p3)(more), inner sep=11pt] (box) {};
+    \end{scope}
+    \node[anchor=south west, font=\small\bfseries]
+        at (box.north west) {Box --- a boot-time RAM untyped};
+
+    % --- one notepad exploded into 8 pages ---
+    \node[page] (g1) [right=3.0cm of p3, yshift=1.55cm] {page 2\,MiB};
+    \foreach \i/\prev in {2/g1,3/g2,4/g3,5/g4,6/g5,7/g6,8/g7} {
+        \node[page, below=1pt of \prev] (g\i) {page 2\,MiB};
+    }
+    \begin{scope}[on background layer]
+        \node[draw, thick, rounded corners=3pt, fill=blue!6,
+              fit=(g1)(g8), inner sep=6pt] (nbexp) {};
+    \end{scope}
+    \node[anchor=south, font=\small\bfseries]
+        at (nbexp.north) {one notepad = 8 pages};
+
+    % watermark on the exploded notepad: torn down to page 3
+    \draw[arr, red!70!black]
+        ($(g3.south west)+(-0.85cm,0)$) -- ($(g3.south east)+(0.85cm,0)$)
+        node[right, font=\footnotesize\itshape, text=red!70!black] {watermark};
+
+    % link box -> exploded notepad
+    \draw[arr] (p3.east) ++(0.1cm,0) to[out=0,in=180] (nbexp.west);
+\end{tikzpicture}
+\caption{A box holds many notepads; each notepad tears into eight
+2\,MiB pages. The watermark only moves down.}
+\label{fig:carve-nesting}
+\end{figure}
+
+\section{How taskman builds memory on top of that}
+
+\texttt{taskman} (QSOE/L's process manager, the \texttt{procnto}
+analogue) is the user-space owner of all that raw memory. When it
+spawns a process or serves an \texttt{mmap}, it needs pages --- so it
+tears them off.
+
+To make a process's memory cleanly reclaimable, taskman gives
+\textbf{each process its own 16\,MiB notepad} (the ``pp\_ut block'').
+All of that process's pages come out of \emph{its} notepad. The payoff
+is teardown: when the process exits, taskman shreds the whole notepad
+in a single operation and every page in it is reclaimed at once.
+
+A 16\,MiB notepad is exactly \textbf{eight} 2\,MiB pages, and the
+notepads themselves are torn from the big \textbf{boxes} (the boot-time
+RAM untypeds). So there are two levels of tearing:
+
+\begin{itemize}
+    \item Tear a \textbf{page} (2\,MiB) off a \textbf{notepad}
+          (16\,MiB) --- for the process.
+    \item Tear a \textbf{notepad} (16\,MiB) off a \textbf{box} ---
+          when taskman needs a fresh notepad.
+\end{itemize}
+
+\section{The sequence that prints the boot-time warning}
+
+Taskman uses a deliberate \emph{``just try it and see''} strategy:
+rather than carefully checking whether there is room, it \textbf{tries
+the tear, and if it fails, recovers}. That failure is exactly what the
+debug kernel prints. There are two flavours.
+
+\subsection{Flavour A --- the 2\,MiB line: ``notepad full, get a new one''}
+
+\begin{enumerate}
+    \item A process needs another 2\,MiB page (say, \texttt{malloc}
+          grew its heap).
+    \item Taskman tries to tear a 2\,MiB \textbf{page} off that
+          process's current 16\,MiB \textbf{notepad}.
+    \item But the notepad is already used up --- all eight pages torn,
+          watermark at the very bottom.
+    \item seL4's fit-check (\emph{``does 2\,MiB fit in what is left?''})
+          finds 0 bytes left, so it \textbf{rejects} the tear and
+          returns an error code.
+    \item The debug kernel prints:
+\begin{lstlisting}
+Untyped Retype: Insufficient memory (1 * 2097152 bytes needed, 0 bytes available)
+\end{lstlisting}
+    \item Taskman catches the error, concludes ``this notepad is
+          empty,'' tears a \textbf{fresh 16\,MiB notepad} off a box,
+          and re-does the page tear there --- which succeeds.
+\end{enumerate}
+
+The process gets its page. The rejected tear in step~4 \textbf{did
+nothing at all} --- no memory touched, watermark unmoved --- it merely
+returned ``no.'' Taskman \emph{expected} it; the rejection is the
+signal to grab a new notepad.
+
+\subsection{Flavour B --- the 16\,MiB line: ``box empty of notepads, next box''}
+
+This is the level up, and it happens \emph{inside} step~6 above (or at
+a fresh spawn):
+
+\begin{enumerate}
+    \item Taskman needs a fresh 16\,MiB \textbf{notepad}.
+    \item It tries to tear one off the \textbf{box} it is currently
+          working from.
+    \item But that box is used up --- every full 16\,MiB notepad has
+          already been torn from it (perhaps a 5\,MiB sliver remains,
+          not enough for a 16\,MiB notepad).
+    \item seL4's fit-check (\emph{``does 16\,MiB fit?''}) says no, and
+          rejects.
+    \item The debug kernel prints:
+\begin{lstlisting}
+Untyped Retype: Insufficient memory (1 * 16777216 bytes needed, 0 bytes available)
+\end{lstlisting}
+    \item Taskman catches it, advances its ``which box am I tearing
+          from'' cursor to the \textbf{next box}, and retries there ---
+          which succeeds.
+\end{enumerate}
+
+Again: expected, harmless, recovered. The box simply told taskman ``I
+am out,'' and taskman moved on.
+
+\section{Why the kernel prints it at all}
+
+seL4 ships in two builds --- \textbf{debug} and \textbf{release}.
+QSOE/L runs the \textbf{debug} build: it provides the diagnostics and
+the \texttt{seL4\_DebugHalt} used to power the board off. The debug
+kernel prints a \emph{userError} line \textbf{every time a retype is
+rejected}, as a courtesy --- it is meant to catch real user-space
+bugs.
+
+The catch is that \textbf{seL4 cannot tell the difference between ``a
+real bug'' and ``a deliberate probe.''} Taskman's whole strategy
+\emph{is} to probe: try a tear it knows might fail, and use the failure
+as the ``time to grow'' signal. So the kernel dutifully announces every
+one of those intentional probes.
+
+And because a \textbf{rejected retype changes nothing} --- no bytes
+touched, no watermark moved; it is a pure no-op that returns an error
+--- the message is \emph{pure narration}. Nothing is wrong. On a
+\textbf{release} kernel these lines would simply not exist.
+
+\section{The one-sentence mental model}
+
+\begin{quote}
+Taskman tears memory off notepads, and notepads off boxes, using a
+\emph{``try it, and if it is full, grab the next one and retry''}
+rhythm --- and the debug kernel politely announces ``this one is
+full!'' every single time taskman hits an empty notepad or box on
+purpose.
+\end{quote}
+
+That is the entire story. Because each new process needs a fresh
+notepad (and occasionally empties a box), these lines cluster around
+\textbf{spawns} --- which is simply when taskman does the most tearing.
