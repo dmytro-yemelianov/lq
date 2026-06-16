@@ -947,18 +947,36 @@ static void print_banner(void)
     sel4_debug_puts("+\n\n");
 }
 
-static seL4_CPtr find_largest_ram_untyped(seL4_BootInfo *bi)
+/* Pick the master-pool untyped: the largest non-device untyped whose
+ * size does NOT exceed TM_MASTER_UT_MAX_BITS.  We deliberately avoid the
+ * board's biggest untypeds here: seL4 hands every boot untyped marked
+ * "fully used" (MAX_FREE_INDEX), so the first retype from one lazily
+ * clears the entire block.  Handing the master pool a multi-GiB untyped
+ * made the primary-endpoint retype clear gigabytes (~18 s on the FU740);
+ * capping the size keeps that one-time clear to ~1 s.  The big untypeds
+ * remain available through the pp_ut pool, which draws them ascending so
+ * a typical workload never has to clear them at all.
+ *
+ * Falls back to the overall largest if (pathologically) every untyped
+ * exceeds the cap -- correctness over boot speed in that corner. */
+static seL4_CPtr find_master_ram_untyped(seL4_BootInfo *bi)
 {
     unsigned n = bi->untyped.end - bi->untyped.start;
-    unsigned best = (unsigned)-1;
-    unsigned best_bits = 0;
+    unsigned best_capped = (unsigned)-1, best_capped_bits = 0;
+    unsigned best_any    = (unsigned)-1, best_any_bits    = 0;
     for (unsigned i = 0; i < n; ++i) {
         if (bi->untypedList[i].isDevice) continue;
-        if (bi->untypedList[i].sizeBits > best_bits) {
-            best_bits = bi->untypedList[i].sizeBits;
-            best = i;
+        unsigned bits = bi->untypedList[i].sizeBits;
+        if (bits > best_any_bits) {
+            best_any_bits = bits;
+            best_any = i;
+        }
+        if (bits <= TM_MASTER_UT_MAX_BITS && bits > best_capped_bits) {
+            best_capped_bits = bits;
+            best_capped = i;
         }
     }
+    unsigned best = (best_capped != (unsigned)-1) ? best_capped : best_any;
     if (best == (unsigned)-1) return 0;
     return bi->untyped.start + best;
 }
@@ -1065,7 +1083,7 @@ int main(seL4_BootInfo *bi)
         }
     }
 
-    seL4_CPtr ut = find_largest_ram_untyped(bi);
+    seL4_CPtr ut = find_master_ram_untyped(bi);
     if (ut == 0) {
         tm_crash("no RAM untyped");
     }
@@ -1074,7 +1092,16 @@ int main(seL4_BootInfo *bi)
      * block wide.  Without this taskman would only ever touch the single
      * largest untyped (here 128 MiB of a 512 MiB board), exhausting it
      * after a handful of spawns while the rest sat idle.  pp_ut_acquire
-     * carves blocks across the whole list. */
+     * carves blocks across the whole list.
+     *
+     * The master untyped (`ut`) is excluded: it is the master pool's
+     * dedicated block, and the master allocation path has no
+     * grow-on-exhaustion fallback, so it must not be shared with pp_ut
+     * carving.  The list is in bootinfo (ascending-address) order, which
+     * is effectively ascending size, so pp_ut draws the small untypeds
+     * first and reaches the board's multi-GiB blocks (whose first carve
+     * triggers seL4's whole-block lazy clear) only under real memory
+     * pressure. */
     {
         seL4_CPtr pool[TM_RAM_UT_MAX];
         int       pool_n = 0;
@@ -1082,6 +1109,7 @@ int main(seL4_BootInfo *bi)
         for (unsigned i = 0; i < dn && pool_n < TM_RAM_UT_MAX; ++i) {
             if (bi->untypedList[i].isDevice) continue;
             if (bi->untypedList[i].sizeBits < TM_PP_UT_BITS) continue;
+            if (bi->untyped.start + i == ut) continue;   /* master's own block */
             pool[pool_n++] = bi->untyped.start + i;
         }
         tm_pput_pool_init(pool, pool_n);

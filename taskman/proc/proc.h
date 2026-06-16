@@ -48,6 +48,19 @@
 #define TM_PP_UT_FREE_MAX   64
 #define TM_RAM_UT_MAX       32
 
+/* Master-pool untyped size cap (2^28 = 256 MiB).  taskman's master pool
+ * (s_untyped: primary endpoint, dispatcher reply, scheduling contexts,
+ * taskman-self objects) draws from a single boot untyped.  seL4 hands
+ * every boot untyped marked MAX_FREE_INDEX ("fully used"), so the FIRST
+ * retype from it lazily clears the WHOLE block (seL4 never zeroes RAM at
+ * boot).  Picking the largest untyped (the board's multi-GiB monster)
+ * for the master pool therefore cleared gigabytes on the primary-endpoint
+ * retype -- ~18 s on the FU740's 4 GiB block.  Cap the master untyped at
+ * 256 MiB so that first clear is ~1 s; the multi-GiB untypeds stay in the
+ * pp_ut pool (drawn ascending, so a typical workload never touches them)
+ * and are cleared only if memory pressure actually reaches them. */
+#define TM_MASTER_UT_MAX_BITS  28
+
 /* Per-process recycle list for munmap'd Mega_Page frames (see the
  * mmap_free[] field below).  Sized to a process's plausible peak of
  * concurrently-freed-but-not-yet-remapped megapages; qsh's args-page
