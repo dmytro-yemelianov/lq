@@ -22,8 +22,10 @@ off_t lseek(int fd, off_t offset, int whence)
     seL4_CPtr slot = (seL4_CPtr)qsoe_state_coid_to_slot(fd);
     if (!slot) { qsoe_errno = EBADF; return (off_t)-1; }
 
-    seL4_Word mr0 = (seL4_Word)whence;
-    seL4_Word mr1 = (seL4_Word)offset;
+    /* libressrv tm_req_io_lseek_t order: offset is body word 0 (MR0),
+     * whence is body word 1 (MR1).  taskman's own handlers parse the same. */
+    seL4_Word mr0 = (seL4_Word)offset;
+    seL4_Word mr1 = (seL4_Word)whence;
     seL4_Word mr2 = 0, mr3 = 0;
     seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_LSEEK, 0, 0, 2);
     seL4_MessageInfo_t reply = qsoe_sys_call(slot, tag,

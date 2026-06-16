@@ -35,10 +35,15 @@ void tm_sysfs_populate(void)
             board = 0;
     }
 
-    /* cmdline -- LQ has no /chosen/bootargs tag in syscfg yet; pass NULL
-     * so /sys/cmdline reads as an empty line until the boot cmdline is
-     * plumbed into syscfg. */
-    tm_sysfs_init((const char *)board, /*cmdline=*/0,
+    /* cmdline -- /chosen/bootargs, emitted into syscfg by syscfg.c.  init
+     * reads it back from /sys/cmdline to pick the mainfs device + driver.
+     * NULL (absent) makes /sys/cmdline an empty line, as before. */
+    const void *cmdline = 0;
+    unsigned    clen    = 0;
+    if (tm_syscfg_find(TM_SYSCFG_TAG_CMDLINE, &cmdline, &clen) != 0)
+        cmdline = 0;
+
+    tm_sysfs_init((const char *)board, (const char *)cmdline,
                   QSOE_VERSION_STRING, QSOE_BUILD_DATE);
 }
 

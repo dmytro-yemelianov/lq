@@ -62,8 +62,12 @@ if [[ "$MACHINE" == *aia=aplic-imsic* ]]; then
     fi
 fi
 
-# Default device set.  Each toggle below appends to QEMUOPTS.
-ATTACH_NVME=1
+# Default device set.  Each toggle below appends to QEMUOPTS.  QSOE/L
+# boots off a virtio-mmio disk: under QEMU it has no NVMe (seL4 has no AIA,
+# so PCIe MSI-X can't be delivered).  NVMe stays available behind `-nvme`
+# for AIA experiments once seL4 grows IMSIC/APLIC.
+ATTACH_VIRTIO=1
+ATTACH_NVME=0
 
 # Pass-through to QEMU for anything after `--`.
 PASSTHROUGH=()
@@ -75,9 +79,11 @@ for arg in "$@"; do
         continue
     fi
     case "$arg" in
-        --)       seen_dashdash=1 ;;
-        -gdb)     GDB=1 ;;
-        -no-nvme) ATTACH_NVME=0 ;;
+        --)         seen_dashdash=1 ;;
+        -gdb)       GDB=1 ;;
+        -no-virtio) ATTACH_VIRTIO=0 ;;
+        -nvme)      ATTACH_NVME=1 ;;
+        -no-nvme)   ATTACH_NVME=0 ;;
         -h|--help)
             grep '^# ' "$0" | sed 's/^# //'
             exit 0 ;;
@@ -97,13 +103,31 @@ fi
 QEMUOPTS=(-machine "$MACHINE" -nographic -m "$MEM" -smp "$CPUS"
           -bios default -kernel "$IMAGE")
 
+# MAINFS names the block device init mounts as the root filesystem; the
+# storage choice below sets it, and it is passed to the kernel on the
+# command line so init can pick the matching driver.
+MAINFS=
+
 # ---------------------------------------------------------------------
-# NVMe — mirror NQ.  The backing store is a GPT image (8 x 16 MiB,
-# p8 = fs-qrv) shared by both variants and built by the umbrella's
-# `make nvme` (host_tools/mkgpt.py); emu.sh never lays it itself.  The
-# controller hangs behind a PCIe root port (Type-1 bridge) so the MSI-X
-# path is exercised, like the FU740.  `FLAT=1 ./emu.sh` puts it directly
-# on bus 0 instead.
+# virtio-mmio block disk (QSOE/L default).  Raw whole-disk qrvfs built by
+# the umbrella's `make virtio`; force-legacy so the device presents the
+# version-1 interface devb-virtio drives.  Served as /dev/vblk0; fs-qrv
+# mounts it.
+# ---------------------------------------------------------------------
+if [[ $ATTACH_VIRTIO -eq 1 ]]; then
+    VIRTIO_IMG="$TOP/../build/virtio.img"
+    make -C "$TOP/.." virtio          # idempotent; the umbrella owns the image
+    QEMUOPTS+=(-global "virtio-mmio.force-legacy=true"
+               -drive "file=$VIRTIO_IMG,if=none,format=raw,id=vblk0"
+               -device "virtio-blk-device,drive=vblk0")
+    MAINFS="/dev/vblk0"
+fi
+
+# ---------------------------------------------------------------------
+# NVMe — mirror NQ (opt-in via `-nvme`; needs AIA, so only useful once
+# seL4 grows IMSIC/APLIC).  GPT image (8 x 16 MiB, p8 = fs-qrv) built by
+# the umbrella's `make nvme`.  Controller behind a PCIe root port unless
+# `FLAT=1`.
 # ---------------------------------------------------------------------
 if [[ $ATTACH_NVME -eq 1 ]]; then
     NVME_IMG="$TOP/../build/nvme.img"
@@ -115,6 +139,13 @@ if [[ $ATTACH_NVME -eq 1 ]]; then
         QEMUOPTS+=(-device "pcie-root-port,id=rp0,bus=pcie.0,chassis=1"
                    -device "nvme,drive=nvm0,serial=qsoe-test,bus=rp0")
     fi
+    MAINFS="/dev/nvme0n1p8"
+fi
+
+# Kernel command line -> FDT /chosen/bootargs -> /sys/cmdline: name the
+# main fs so init mounts it (and selects the matching block driver).
+if [[ -n "$MAINFS" ]]; then
+    QEMUOPTS+=(-append "mainfs=$MAINFS")
 fi
 
 # ---------------------------------------------------------------------

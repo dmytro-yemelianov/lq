@@ -29,6 +29,7 @@
 #include <qsoe_invoke.h>
 
 extern char *getcwd(char *buf, unsigned long size);
+extern int close(int fd);
 
 #define PATH_BUF_BYTES 256
 
@@ -103,8 +104,6 @@ static int canon_inplace(char *buf, unsigned in_len, unsigned *out_len)
 int open(const char *path, int flags, ...);
 int open(const char *path, int flags, ...)
 {
-    (void)flags;  /* mode (variadic) and flags ignored for now */
-
     if (!path) { qsoe_errno = EINVAL; return -1; }
 
     /* Stage 1 — assemble an absolute path. */
@@ -159,5 +158,30 @@ int open(const char *path, int flags, ...)
     int fd = qsoe_state_alloc_coid(0);
     if (fd < 0) { qsoe_errno = ENOMEM; return -1; }
     qsoe_state_bind_coid(fd, cap_slot);
+
+    /* mr1 != 0: the path resolved to an EXTERNAL resmgr (a libressrv
+     * server, not one of taskman's synthetic handlers).  taskman minted
+     * the connection cap but cannot run the server's acquire(); send
+     * _IO_CONNECT on the fd ourselves so the per-open handle exists before
+     * the first read/lseek.  taskman-internal handlers already staged their
+     * per-fd state during TM_REQ_OPEN and need no _IO_CONNECT. */
+    if (mr1) {
+        unsigned char cbuf[sizeof(tm_req_io_connect_t) + 128];
+        tm_req_io_connect_t *cc = (tm_req_io_connect_t *)cbuf;
+        cc->type        = _IO_CONNECT;
+        cc->plen        = alen;
+        cc->flags       = (unsigned long)flags;
+        cc->mode        = 0;
+        cc->_reserved[0] = 0;
+        for (unsigned i = 0; i < alen; ++i)
+            cbuf[sizeof(tm_req_io_connect_t) + i] = (unsigned char)abs[i];
+        int st = MsgSend(fd, cbuf,
+                         (int)(sizeof(tm_req_io_connect_t) + alen), 0, 0);
+        if (st != 0) {              /* acquire() rejected the open */
+            close(fd);
+            qsoe_errno = st;
+            return -1;
+        }
+    }
     return fd;
 }

@@ -808,10 +808,12 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     /* ---------- pathmgr / IO ---------- */
     case TM_REQ_OPEN: {
         seL4_CPtr slot = 0;
-        int rc = tm_io_open(caller, (unsigned)mr0, &slot);
+        int is_external = 0;
+        int rc = tm_io_open(caller, (unsigned)mr0, &slot, &is_external);
         if (rc) { err = (seL4_Word)(-rc); break; }
         *out_mr0 = slot;
-        reply_len = 1;
+        *out_mr1 = (seL4_Word)is_external;   /* libc sends _IO_CONNECT if set */
+        reply_len = 2;
         break;
     }
     case TM_REQ_CLOSE: {
@@ -866,9 +868,10 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_LSEEK: {
-        /* MR0 = whence, MR1 = signed 64-bit offset. */
+        /* libressrv tm_req_io_lseek_t order: MR0 = signed 64-bit offset,
+         * MR1 = whence (was swapped pre-unification). */
         long off = 0;
-        int rc = tm_lseek(caller, badge, (int)mr0, (long)mr1, &off);
+        int rc = tm_lseek(caller, badge, (int)mr1, (long)mr0, &off);
         if (rc) { err = (seL4_Word)(-rc); break; }
         *out_mr0 = (seL4_Word)off;
         reply_len = 1;

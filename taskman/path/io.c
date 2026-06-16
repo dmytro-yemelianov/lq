@@ -23,8 +23,10 @@
 /* TM_REQ_OPEN body.  Walks the path manager, picks the right resmgr,
  * mints a badged Send-cap into the caller's CSpace, attaches per-fd
  * state where the handler needs it (cpiofs stashes data+size). */
-int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot)
+int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot,
+               int *out_is_external)
 {
+    if (out_is_external) *out_is_external = 0;
     if (path_len == 0 || path_len >= 128) return -EINVAL;
 
     static char s_open_path[128];
@@ -41,6 +43,13 @@ int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot)
     seL4_CPtr slot = 0;
     rc = tm_connect_attach(caller, obj.server_pid, obj.server_chid, 0, &slot);
     if (rc) return rc;
+
+    /* An external resmgr (a libressrv server, not one of taskman's own
+     * synthetic handlers) creates its per-open handle on _IO_CONNECT.
+     * taskman minted the cap but can't run the server's acquire(); tell
+     * libc so it sends _IO_CONNECT on the fd before the first read. */
+    if (out_is_external)
+        *out_is_external = (obj.handler_kind == PATHMGR_HANDLER_EXTERNAL);
 
     /* Per-fd state for cpiofs: stash (data, size) of the resolved
      * file so subsequent IO_READ can resume from the right offset. */

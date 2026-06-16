@@ -191,12 +191,19 @@ int tm_syscfg_build(const void *fdt_blob)
         if (ncpus) (void)emit_u32(TM_SYSCFG_TAG_NUM_CPUS, ncpus);
     }
 
-    /* /chosen/boot-hartid (RISC-V convention). */
+    /* /chosen/boot-hartid (RISC-V convention) + /chosen/bootargs (the
+     * kernel command line, which init reads back from /sys/cmdline to pick
+     * the mainfs device + its block driver). */
     int chosen = tm_fdt_path(fdt_blob, "/chosen");
     if (chosen >= 0) {
         uint32_t v;
         if (tm_fdt_prop_u32(fdt_blob, chosen, "boot-hartid", &v) == 0) {
             (void)emit_u32(TM_SYSCFG_TAG_BOOT_HART, v);
+        }
+        const char *bootargs = 0;
+        if (tm_fdt_prop_str(fdt_blob, chosen, "bootargs", &bootargs) == 0 &&
+            bootargs && bootargs[0]) {
+            (void)emit_asciz(TM_SYSCFG_TAG_CMDLINE, bootargs);
         }
     }
 
