@@ -354,69 +354,85 @@ int tm_lseek(pid_t caller, seL4_Word badge, int whence, long offset,
  * cpiofs implements directories today; the console doesn't (it's
  * a character device).  Reply payload encodes one entry: a single
  * d_type byte followed by the NUL-terminated name. */
+/* On-wire directory record: byte-identical to libc's struct dirent
+ * (libc/include/bits/dirent.h).  taskman is -nostdinc, so we mirror the
+ * layout here -- the libc readdir() client casts the reply bytes straight
+ * to struct dirent, so fields and offsets must match exactly.  This is the
+ * libressrv _IO_READDIR framing (fs-qrv emits the same records), so the one
+ * client speaks to both taskman's internal dirs and external resmgrs. */
+#define TM_DIRENT_NAME_MAX 256   /* d_name[] -- matches libc struct dirent  */
+#define TM_DIRENT_ALIGN      8   /* record stride == sizeof(off_t); keeps   */
+                                 /* each record's d_ino/d_off 8-byte aligned */
+
+struct tm_dirent {
+    unsigned long  d_ino;          /* ino_t  */
+    long           d_off;          /* off_t  */
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[TM_DIRENT_NAME_MAX];
+};
+
+/* Pack one entry as a struct dirent record at p; return its byte length.
+ * d_ino/d_off are synthetic monotonic values -- POSIX requires neither
+ * stability nor uniqueness for these read-only listings, only d_ino != 0
+ * (a zero inode reads as a deleted slot to some getdents consumers). */
+static unsigned pack_dirent(unsigned char *p, int d_type,
+                            const char *name, unsigned namelen)
+{
+    static unsigned long s_seq;          /* synthetic d_ino/d_off source */
+    unsigned hdr = (unsigned)__builtin_offsetof(struct tm_dirent, d_name);
+    unsigned reclen = hdr + namelen + 1;   /* + NUL terminator */
+    reclen = (reclen + (TM_DIRENT_ALIGN - 1)) & ~(unsigned)(TM_DIRENT_ALIGN - 1);
+
+    for (unsigned i = 0; i < reclen; ++i) p[i] = 0;   /* no stale padding */
+    struct tm_dirent *de = (struct tm_dirent *)p;
+    ++s_seq;
+    de->d_ino    = s_seq;
+    de->d_off    = (long)s_seq;
+    de->d_reclen = (unsigned short)reclen;
+    de->d_type   = (unsigned char)d_type;
+    for (unsigned i = 0; i < namelen; ++i) de->d_name[i] = name[i];
+    de->d_name[namelen] = 0;
+    return reclen;
+}
+
 int tm_readdir(pid_t caller, seL4_Word badge, unsigned *out_bytes)
 {
     (void)caller;
     pid_t srv_pid = 0;
     int   srv_chid = 0;
     if (tm_channel_by_badge(badge, &srv_pid, &srv_chid) != 0) return -EBADF;
+    if (srv_pid != QSOE_PID_TASKMAN) return -ENOSYS;
 
-    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CONSOLE_CHID) {
+    char name[TM_DIRENT_NAME_MAX];
+    unsigned namelen = 0;
+    int d_type = 0;
+    int rc;
+
+    /* Each per-kind handler yields one entry per call (cursor in the
+     * connection ctx).  We frame that single entry as a struct dirent
+     * record; the buffered client refills once per entry.  fs-qrv packs
+     * many records per reply -- same record format, same client. */
+    switch (srv_chid) {
+    case TM_CONSOLE_CHID:
         return -ENOTDIR;
+    case TM_CPIOFS_CHID:
+        rc = tm_cpiofs_readdir(badge, name, &namelen, &d_type); break;
+    case TM_PMDIR_CHID:
+        rc = tm_pmdir_readdir(badge, name, &namelen, &d_type); break;
+    case TM_SYSFS_CHID:
+        rc = tm_sysfs_readdir(badge, name, &namelen, &d_type); break;
+    case TM_PROCFS_CHID:
+        rc = tm_procfs_readdir(badge, name, &namelen, &d_type); break;
+    default:
+        return -ENOSYS;
     }
-    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_CPIOFS_CHID) {
-        unsigned char *p = (unsigned char *)&qsoe_ipcbuf->msg[4];
-        char name[256];
-        unsigned namelen = 0;
-        int d_type = 0;
-        int rc = tm_cpiofs_readdir(badge, name, &namelen, &d_type);
-        if (rc) return rc;
-        p[0] = (unsigned char)d_type;
-        for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];
-        p[1 + namelen] = 0;
-        *out_bytes = 1 + namelen + 1;
-        return 0;
-    }
-    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_PMDIR_CHID) {
-        unsigned char *p = (unsigned char *)&qsoe_ipcbuf->msg[4];
-        char name[256];
-        unsigned namelen = 0;
-        int d_type = 0;
-        int rc = tm_pmdir_readdir(badge, name, &namelen, &d_type);
-        if (rc) return rc;
-        p[0] = (unsigned char)d_type;
-        for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];
-        p[1 + namelen] = 0;
-        *out_bytes = 1 + namelen + 1;
-        return 0;
-    }
-    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_SYSFS_CHID) {
-        unsigned char *p = (unsigned char *)&qsoe_ipcbuf->msg[4];
-        char name[256];
-        unsigned namelen = 0;
-        int d_type = 0;
-        int rc = tm_sysfs_readdir(badge, name, &namelen, &d_type);
-        if (rc) return rc;
-        p[0] = (unsigned char)d_type;
-        for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];
-        p[1 + namelen] = 0;
-        *out_bytes = 1 + namelen + 1;
-        return 0;
-    }
-    if (srv_pid == QSOE_PID_TASKMAN && srv_chid == TM_PROCFS_CHID) {
-        unsigned char *p = (unsigned char *)&qsoe_ipcbuf->msg[4];
-        char name[256];
-        unsigned namelen = 0;
-        int d_type = 0;
-        int rc = tm_procfs_readdir(badge, name, &namelen, &d_type);
-        if (rc) return rc;
-        p[0] = (unsigned char)d_type;
-        for (unsigned i = 0; i < namelen; ++i) p[1 + i] = (unsigned char)name[i];
-        p[1 + namelen] = 0;
-        *out_bytes = 1 + namelen + 1;
-        return 0;
-    }
-    return -ENOSYS;
+    if (rc) return rc;
+    if (namelen >= TM_DIRENT_NAME_MAX) namelen = TM_DIRENT_NAME_MAX - 1;
+
+    *out_bytes = pack_dirent((unsigned char *)&qsoe_ipcbuf->msg[4],
+                             d_type, name, namelen);
+    return 0;
 }
 
 /* ACCESS: probe path existence.  v0.7 reduces to "does this path

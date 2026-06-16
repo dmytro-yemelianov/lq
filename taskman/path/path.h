@@ -88,12 +88,13 @@ int tm_pipe_create(pid_t caller, seL4_CPtr *out_read_slot,
 
 /* READDIR: fetch one directory entry from the connection at `badge`.
  *
- * Reply payload written to msg[4..]:
- *   [0]            d_type (1 byte: DT_REG=8, DT_DIR=4)
- *   [1..]          NUL-terminated d_name
+ * Reply payload written to msg[4..] is one libressrv-framing struct dirent
+ * record (libc/include/bits/dirent.h): d_ino, d_off, d_reclen, d_type,
+ * NUL-terminated d_name, the whole record rounded up to 8 bytes.  This is
+ * the same record fs-qrv emits, so one libc readdir() client serves both.
  *
- * *out_bytes is set to (1 + name_len + 1), the total byte count in
- * msg[4..].  Label = ENOENT past the end of the directory; label =
+ * *out_bytes is set to the record's d_reclen (its total byte count in
+ * msg[4..]).  Label = ENOENT past the end of the directory; label =
  * ENOTDIR if the connection was opened on a regular file. */
 int tm_readdir(pid_t caller, seL4_Word badge, unsigned *out_bytes);
 

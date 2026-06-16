@@ -24,7 +24,7 @@ static int lq_procfs_get(int pid, struct tm_procfs_proc *out)
     if (p == 0 || !p->in_use) return 0;
     out->pid   = (int)p->pid;
     out->ppid  = (int)p->parent_pid;
-    out->state = (p->exit_state >= 2) ? 1 : 0;   /* 2 = terminated/zombie */
+    out->state = (p->exit_state >= TM_EXIT_ZOMBIE) ? 1 : 0;  /* zombie flag */
     unsigned i = 0;
     while (p->name[i] != '\0' && i < TM_PROCFS_NAME_MAX - 1) {
         out->name[i] = p->name[i];

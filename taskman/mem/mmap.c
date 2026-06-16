@@ -347,6 +347,7 @@ static int devmap_map_into(tm_process_t *proc, tm_devmap_t *d,
             taskman_free_slot(cp);
             return -ENOMEM;
         }
+        proc->devframe_va[proc->devframe_count] = va;
         proc->devframes[proc->devframe_count++] = cp;
     }
 
@@ -442,11 +443,48 @@ static int find_mmap_idx(tm_process_t *proc, unsigned long va)
     return -1;
 }
 
+/* Tear down any MAP_PHYS device frames this process mapped in
+ * [vaddr, vaddr+len).  Returns the number released.  Device frames live in
+ * proc->devframes[] (copied caps onto the shared device-frame registry),
+ * NOT in the anonymous-RAM tracker -- so a munmap of a device VA lands
+ * here instead of failing the mmap[] lookup.  Only this process's copy and
+ * its mapping go away; the registry's underlying frame is shared and
+ * stays.  (The L0 PT a 4 KiB-granule device frame hung is left mapped --
+ * a small, bounded residue, matching the device-UT cap-reclaim follow-up.) */
+static int munmap_devframes(tm_process_t *proc, unsigned long vaddr,
+                            unsigned long len)
+{
+    int n = 0;
+    for (int i = 0; i < proc->devframe_count; /* compaction advances i */) {
+        unsigned long va = proc->devframe_va[i];
+        if (va >= vaddr && va < vaddr + len) {
+            (void) qsoe_riscv_page_unmap(proc->devframes[i]);
+            (void) qsoe_cnode_delete(s_cnode_root, proc->devframes[i],
+                                     TM_DEPTH_TASKMAN);
+            taskman_free_slot(proc->devframes[i]);
+            int last = --proc->devframe_count;        /* swap-with-last */
+            proc->devframes[i]    = proc->devframes[last];
+            proc->devframe_va[i]  = proc->devframe_va[last];
+            proc->devframes[last] = 0;
+            ++n;
+        } else {
+            ++i;
+        }
+    }
+    return n;
+}
+
 int tm_munmap_serve(pid_t caller, unsigned long vaddr, unsigned long len)
 {
     tm_process_t *proc = tm_process_lookup(caller);
     if (!proc) return -ESRCH;
     if (len == 0) return -EINVAL;
+
+    /* MAP_PHYS device frames first: they aren't in the RAM tracker, and a
+     * device VA need not be Mega_Page-aligned (4 KiB-granule regions), so
+     * resolve them before the anonymous-RAM alignment rules below. */
+    if (munmap_devframes(proc, vaddr, len) > 0) return 0;
+
     if (vaddr & (QSOE_MEGA_PAGE - 1)) return -EINVAL;
 
     /* Round up to Mega_Page; matches what mmap rounded up at alloc. */

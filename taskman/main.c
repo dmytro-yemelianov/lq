@@ -282,8 +282,16 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
                 if (!p || !p->in_use) continue;
                 /* Main thread: named after the process, like the prior
                  * one-row-per-process output. */
-                char pstate = (char)(p->exit_state ? QSOE_TSTATE_ZOMBIE
-                                                   : QSOE_TSTATE_RUNNING);
+                /* Detached daemons (procmgr_detach -> exit_state==1) are
+                 * alive and serving; only a terminated process is a real
+                 * zombie.  seL4 doesn't surface the main thread's scheduler
+                 * state to taskman, so a live attached process reads as
+                 * RUNNING and a detached one as DETACHED ('d'). */
+                char pstate = (p->exit_state >= TM_EXIT_ZOMBIE)
+                                  ? QSOE_TSTATE_ZOMBIE
+                              : (p->exit_state == TM_EXIT_DETACHED)
+                                  ? QSOE_TSTATE_DETACHED
+                                  : QSOE_TSTATE_RUNNING;
                 si_emit_thread(dst, recsz, want, skip, &idx, &got,
                                /*tid=*/1, (int)p->pid, pstate, p->name);
                 /* Then this process's ThreadCreate'd threads. */

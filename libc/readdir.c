@@ -1,11 +1,15 @@
 /*
  * readdir.c — POSIX readdir().
  *
- * Sends TM_REQ_READDIR via the DIR's fd, parses the reply payload
- * into a static `struct dirent`, returns &it.  POSIX permits a
- * single per-DIR slot reused on each call; v0.7 isn't multi-
- * threaded inside a process so a file-scope static is fine — when
- * we grow real threads readdir_r is the MT-safe variant.
+ * Buffered getdents-style client, matching libressrv's _IO_READDIR
+ * framing: each TM_REQ_READDIR reply carries one or more packed
+ * `struct dirent` records (taskman's internal dirs emit one per reply;
+ * fs-qrv packs many).  We cache a reply batch in the DIR's buf[] and
+ * hand records out one at a time, refilling when it drains.  The records
+ * are full struct dirent images, so we return a pointer straight into
+ * the buffer — POSIX permits the returned storage to be reused on the
+ * next call, and a single shared DIR is fine until real threads land
+ * (readdir_r is the MT-safe variant then).
  */
 
 #include <dirent.h>
@@ -17,53 +21,44 @@
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
 
-static struct dirent s_ent;
-
 struct dirent *readdir(DIR *d)
 {
     if (!d) { qsoe_errno = EINVAL; return 0; }
-    seL4_CPtr slot = (seL4_CPtr)qsoe_state_coid_to_slot(d->fd);
-    if (!slot) { qsoe_errno = EBADF; return 0; }
 
-    seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_READDIR, 0, 0, 0);
-    seL4_MessageInfo_t reply = qsoe_sys_call(slot, tag,
-                                              &mr0, &mr1, &mr2, &mr3);
-    seL4_Word err = seL4_MessageInfo_get_label(reply);
-    if (err != 0) {
-        /* ENOENT = end-of-directory.  POSIX: return NULL, errno
-         * unchanged.  Anything else: NULL + errno set. */
-        if (err != (seL4_Word)ENOENT) qsoe_errno = (int)err;
-        return 0;
+    if (d->buf_pos >= d->buf_end) {
+        /* Buffer drained — fetch the next batch. */
+        seL4_CPtr slot = (seL4_CPtr)qsoe_state_coid_to_slot(d->fd);
+        if (!slot) { qsoe_errno = EBADF; return 0; }
+
+        seL4_Word mr0 = 0, mr1 = 0, mr2 = 0, mr3 = 0;
+        seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_READDIR, 0, 0, 0);
+        seL4_MessageInfo_t reply = qsoe_sys_call(slot, tag,
+                                                  &mr0, &mr1, &mr2, &mr3);
+        seL4_Word err = seL4_MessageInfo_get_label(reply);
+        if (err != 0) {
+            /* ENOENT = end-of-directory.  POSIX: return NULL, errno
+             * unchanged.  Anything else: NULL + errno set. */
+            if (err != (seL4_Word)ENOENT) qsoe_errno = (int)err;
+            return 0;
+        }
+
+        unsigned bytes = (unsigned)mr0;
+        if (bytes == 0) return 0;                    /* end of directory */
+        if (bytes > sizeof d->buf) bytes = sizeof d->buf;
+
+        const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+        unsigned char *dst = (unsigned char *)d->buf;
+        for (unsigned i = 0; i < bytes; ++i) dst[i] = src[i];
+        d->buf_pos = 0;
+        d->buf_end = (int)bytes;
     }
 
-    unsigned bytes = (unsigned)mr0;
-    if (bytes < 2) { qsoe_errno = EIO; return 0; }   /* need d_type + NUL */
-    const unsigned char *p = (const unsigned char *)&qsoe_ipcbuf->msg[4];
-
-    /* Zero the dirent first so trailing bytes in d_name don't leak
-     * stale data across calls. */
-    unsigned char *dst = (unsigned char *)&s_ent;
-    for (unsigned i = 0; i < sizeof s_ent; ++i) dst[i] = 0;
-
-    s_ent.d_type = p[0];
-    /* d_ino / d_off / d_reclen: synthesised — taskman doesn't track
-     * stable inode numbers for cpiofs entries beyond the data ptr,
-     * and POSIX doesn't require d_ino to be unique across hosts.
-     * d->tell gets used by telldir(); we bump it monotonically. */
-    s_ent.d_ino    = (++d->tell);
-    s_ent.d_off    = d->tell;
-    s_ent.d_reclen = (unsigned short)sizeof s_ent;
-
-    /* Copy NUL-terminated name (bytes after the d_type byte) into
-     * d_name.  d_name is 256 bytes; taskman bounds entry name to
-     * the same limit. */
-    unsigned i = 0;
-    while (i + 1 < bytes && i < sizeof s_ent.d_name - 1) {
-        s_ent.d_name[i] = (char)p[1 + i];
-        if (p[1 + i] == 0) break;
-        ++i;
-    }
-    s_ent.d_name[i] = 0;
-    return &s_ent;
+    /* Records are 8-byte-aligned struct dirent images (the server rounds
+     * d_reclen to sizeof(off_t) and buf starts 8-aligned), so we can hand
+     * back a pointer straight into the buffer. */
+    struct dirent *de = (struct dirent *)((char *)d->buf + d->buf_pos);
+    if (de->d_reclen == 0) { qsoe_errno = EIO; return 0; }  /* avoid a spin */
+    d->buf_pos += de->d_reclen;
+    d->tell = de->d_off;
+    return de;
 }

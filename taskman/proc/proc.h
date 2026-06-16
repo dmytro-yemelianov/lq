@@ -72,6 +72,14 @@
  * PCI ECAM is 8 Mega_Pages; a driver also maps its BAR(s).  32 is ample. */
 #define TM_MAX_DEVFRAMES    32
 
+/* exit_state: a process's lifecycle stage, as seen by waitpid() and the
+ * ps/sysinfo + /proc state columns.  0 is the live, attached default. */
+enum {
+    TM_EXIT_LIVE     = 0,   /* running, still attached to its parent       */
+    TM_EXIT_DETACHED = 1,   /* procmgr_detach: alive daemon, parent reaped */
+    TM_EXIT_ZOMBIE   = 2,   /* terminated, awaiting its waitpid() reap     */
+};
+
 /* Per-process object CNode (v0.10 slot reclamation).
  *
  * taskman holds a cap to every object it retypes for a process; in a
@@ -234,8 +242,11 @@ typedef struct {
      * survives -- it is the registry's, shared with other mappers).
      * Kept apart from mmap[] so the anon-megapage munmap/recycle path
      * never mistakes a shared device frame for reclaimable RAM. */
-    seL4_CPtr devframes[TM_MAX_DEVFRAMES];
-    int       devframe_count;
+    seL4_CPtr     devframes[TM_MAX_DEVFRAMES];
+    unsigned long devframe_va[TM_MAX_DEVFRAMES];  /* VA each cap maps; lets
+                                                   * munmap find device frames
+                                                   * (they aren't in mmap[]) */
+    int           devframe_count;
 
     /* v0.13 RELRO page registry (see tm_mprot_entry_t).  Populated at
      * spawn for pages in any loaded object's PT_GNU_RELRO range; consulted

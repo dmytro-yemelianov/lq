@@ -613,7 +613,7 @@ int tm_process_detach(pid_t pid, int status)
     if (!p) return -ESRCH;
     if (p->exit_state != 0) return 0;
 
-    p->exit_state  = 1;
+    p->exit_state  = TM_EXIT_DETACHED;
     p->exit_status = status;
 
     if (p->waiter_reply_slot != 0) {
@@ -830,7 +830,7 @@ int tm_process_terminate(pid_t target, int status)
      * never run the teardown again -- just succeed. */
     if (p->exit_state != 0) return 0;
 
-    p->exit_state  = 2;
+    p->exit_state  = TM_EXIT_ZOMBIE;
     p->exit_status = status;
     int delivered = 0;
     if (p->waiter_reply_slot != 0) {
