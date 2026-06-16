@@ -776,6 +776,35 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
 
+    case TM_REQ_MSG_XFER: {
+        /* Bulk-IPC bounce copy (doc/plans/bulk_ipc.txt).  The calling
+         * SERVER drives PULL (during MsgReceive) and PUSH (during
+         * MsgReply); `caller` is the server, mr1 is the connection badge
+         * (scoid) the server received -- resolve it to the blocked
+         * client's pid via the connection registry. */
+        unsigned dir       = (unsigned)mr0;
+        pid_t    client_pid = tm_connection_client_pid((seL4_Word)mr1);
+        if (client_pid == 0) { err = (seL4_Word)ESRCH; break; }
+        long r;
+        if (dir == TM_MSG_XFER_PULL) {
+            unsigned long client_src = (unsigned long)mr2;   /* client send buf */
+            unsigned long server_dst = (unsigned long)mr3;   /* server recv buf */
+            unsigned long len     = (unsigned long)qsoe_ipcbuf->msg[4];
+            unsigned long crbuf   = (unsigned long)qsoe_ipcbuf->msg[5];
+            unsigned long crbytes = (unsigned long)qsoe_ipcbuf->msg[6];
+            r = tm_msg_xfer_pull(caller, client_pid, client_src, server_dst,
+                                 len, crbuf, crbytes);
+        } else {
+            unsigned long server_src = (unsigned long)mr2;   /* server reply buf */
+            unsigned long len        = (unsigned long)mr3;
+            r = tm_msg_xfer_push(caller, client_pid, server_src, len);
+        }
+        if (r < 0) { err = (seL4_Word)(-r); break; }
+        *out_mr0 = (seL4_Word)r;        /* bytes copied */
+        reply_len = 1;
+        break;
+    }
+
     /* ---------- pathmgr / IO ---------- */
     case TM_REQ_OPEN: {
         seL4_CPtr slot = 0;

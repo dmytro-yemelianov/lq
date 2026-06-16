@@ -133,6 +133,16 @@ int tm_connection_badge_by_slot(pid_t client_pid, seL4_CPtr slot,
     return 0;
 }
 
+/* Resolve a connection badge (the scoid a server's MsgReceive sees) to
+ * the client pid that owns the connection.  Backs bulk IPC, where the
+ * server relays its receive badge so taskman can reach the blocked
+ * sender's buffers.  Returns 0 if the badge names no live connection. */
+pid_t tm_connection_client_pid(seL4_Word badge)
+{
+    tm_connection_t *cn = connection_find_by_badge(badge);
+    return cn ? cn->client_pid : 0;
+}
+
 int tm_channel_by_badge(seL4_Word badge, pid_t *out_pid, int *out_chid)
 {
     tm_connection_t *cn = connection_find_by_badge(badge);

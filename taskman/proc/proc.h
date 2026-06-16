@@ -483,6 +483,29 @@ int           tm_spawn_read_args(tm_process_t *proc, unsigned long args_va,
  * MAP_ANONYMOUS zero-fill.  Returns 0 on success, negative errno. */
 int           tm_zero_megaframe(seL4_CPtr frame);
 
+/* v0.13 bulk-IPC bounce copy (doc/plans/bulk_ipc.txt).  Copies `len`
+ * bytes between two processes' buffers, one Mega_Page chunk at a time,
+ * by cap-copying + scratch-mapping each side's frame (taskman holds the
+ * caps in proc->mmap[]).  Buffers may have any in-megaframe offset and
+ * must be heap/mmap-backed (not image/stack).  Returns bytes copied or
+ * negative errno (-EFAULT if a VA isn't backed by a tracked frame). */
+long          tm_bulk_copy(tm_process_t *src_proc, unsigned long src_va,
+                            tm_process_t *dst_proc, unsigned long dst_va,
+                            unsigned long len);
+
+/* TM_REQ_MSG_XFER backends.  PULL copies the blocked client's send buffer
+ * into the calling server's receive buffer and stashes the client's reply
+ * buffer; PUSH copies the server's reply buffer into that stashed client
+ * reply buffer.  `server_pid` is the dispatch caller; `client_pid` is the
+ * blocked sender (the server's MsgReceive badge).  Return bytes or -errno. */
+long          tm_msg_xfer_pull(pid_t server_pid, pid_t client_pid,
+                               unsigned long client_src_va,
+                               unsigned long server_dst_va, unsigned long len,
+                               unsigned long client_rbuf_va,
+                               unsigned long client_rbytes);
+long          tm_msg_xfer_push(pid_t server_pid, pid_t client_pid,
+                               unsigned long server_src_va, unsigned long len);
+
 /* v0.7 cred + ppid query — backs POSIX getpid/getppid/getuid/etc. */
 int           tm_proc_self_info(pid_t caller_pid,
                                  pid_t *out_pid, pid_t *out_ppid,
@@ -588,6 +611,10 @@ int tm_connection_badge_by_slot(pid_t client_pid, seL4_CPtr slot,
 
 /* Used by main.c's dispatcher to route IO_* by badge. */
 int tm_channel_by_badge(seL4_Word badge, pid_t *out_pid, int *out_chid);
+
+/* Resolve a connection badge (scoid) to the owning client pid; 0 if none.
+ * Used by bulk IPC to map a server's MsgReceive badge to the sender. */
+pid_t tm_connection_client_pid(seL4_Word badge);
 
 /* ----------- threads ----------- */
 

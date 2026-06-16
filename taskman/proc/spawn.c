@@ -581,6 +581,159 @@ int tm_zero_megaframe(seL4_CPtr frame)
     return 0;
 }
 
+/* ---- v0.13 bulk-IPC bounce copy (doc/plans/bulk_ipc.txt) ------------- */
+
+/* A SECOND 2 MiB scratch VA so one copy can map the source and the
+ * destination frame at the same time (TM_SCRATCH_MEGA_VADDR is the
+ * source slot, shared with tm_spawn_read_args / tm_zero_megaframe).
+ * Both VAs sit under the scratch L1 PT that ensure_scratch_pt() installs
+ * for the L2[1] gigabyte, so no extra page-table setup is needed. */
+#define TM_SCRATCH_MEGA_VADDR_B  0x40400000UL   /* 2nd 2 MiB scratch slot */
+
+/* Hard ceiling on a single bulk transfer (mirrors NQ's bulk IPC cap). */
+#define TM_MSG_BULK_MAX          (16UL * 1024 * 1024)
+
+/* cnode depth of taskman's flat root CNode (matches tm_spawn_read_args). */
+#define TM_BULK_CNODE_DEPTH      64
+
+static seL4_CPtr s_bulk_slot_src;   /* scratch cap slot for the source frame */
+static seL4_CPtr s_bulk_slot_dst;   /* scratch cap slot for the dest   frame */
+
+long tm_bulk_copy(tm_process_t *src_proc, unsigned long src_va,
+                  tm_process_t *dst_proc, unsigned long dst_va,
+                  unsigned long len)
+{
+    if (!src_proc || !dst_proc) return -EINVAL;
+    if (len == 0) return 0;
+    if (len > TM_MSG_BULK_MAX) return -E2BIG;
+    if (ensure_scratch_pt() != 0) return -ENOMEM;
+    if (!s_bulk_slot_src) s_bulk_slot_src = s_next_slot++;
+    if (!s_bulk_slot_dst) s_bulk_slot_dst = s_next_slot++;
+
+    unsigned long done = 0;
+    while (done < len) {
+        unsigned long sva = src_va + done;
+        unsigned long dva = dst_va + done;
+        seL4_CPtr fs = tm_process_find_frame(src_proc, sva);
+        seL4_CPtr fd = tm_process_find_frame(dst_proc, dva);
+        if (!fs || !fd) {
+            tm_err("tm_bulk_copy: unmapped VA (src pid %ld va=%08lx -> %lu, "
+                   "dst pid %ld va=%08lx -> %lu)",
+                   (long)src_proc->pid, sva, (unsigned long)fs,
+                   (long)dst_proc->pid, dva, (unsigned long)fd);
+            return -EFAULT;
+        }
+        /* Chunk = bytes left in whichever megaframe (src or dst) ends
+         * first -- the two buffers may carry independent in-page offsets. */
+        unsigned long so   = sva & (QSOE_MEGA_PAGE - 1);
+        unsigned long dof  = dva & (QSOE_MEGA_PAGE - 1);
+        unsigned long chunk = len - done;
+        if (chunk > QSOE_MEGA_PAGE - so)  chunk = QSOE_MEGA_PAGE - so;
+        if (chunk > QSOE_MEGA_PAGE - dof) chunk = QSOE_MEGA_PAGE - dof;
+
+        seL4_Word err = qsoe_cnode_copy(s_cnode_root, s_bulk_slot_src,
+                                         TM_BULK_CNODE_DEPTH, s_cnode_root, fs,
+                                         TM_BULK_CNODE_DEPTH, QSOE_RIGHTS_ALL);
+        if (err) return -ENOMEM;
+        err = qsoe_cnode_copy(s_cnode_root, s_bulk_slot_dst,
+                              TM_BULK_CNODE_DEPTH, s_cnode_root, fd,
+                              TM_BULK_CNODE_DEPTH, QSOE_RIGHTS_ALL);
+        if (err) {
+            qsoe_cnode_delete(s_cnode_root, s_bulk_slot_src, TM_BULK_CNODE_DEPTH);
+            return -ENOMEM;
+        }
+
+        err = qsoe_riscv_page_map(s_bulk_slot_src, seL4_CapInitThreadVSpace,
+                                  TM_SCRATCH_MEGA_VADDR, QSOE_RIGHTS_ALL,
+                                  QSOE_VM_ATTR_DEFAULT);
+        if (!err)
+            err = qsoe_riscv_page_map(s_bulk_slot_dst, seL4_CapInitThreadVSpace,
+                                      TM_SCRATCH_MEGA_VADDR_B, QSOE_RIGHTS_ALL,
+                                      QSOE_VM_ATTR_DEFAULT);
+        if (err) {
+            qsoe_riscv_page_unmap(s_bulk_slot_src);
+            qsoe_cnode_delete(s_cnode_root, s_bulk_slot_src, TM_BULK_CNODE_DEPTH);
+            qsoe_cnode_delete(s_cnode_root, s_bulk_slot_dst, TM_BULK_CNODE_DEPTH);
+            return -ENOMEM;
+        }
+
+        qmemcpy((void *)(TM_SCRATCH_MEGA_VADDR_B + dof),
+                (const void *)(TM_SCRATCH_MEGA_VADDR + so), chunk);
+        __asm__ volatile ("fence rw, rw" ::: "memory");
+
+        qsoe_riscv_page_unmap(s_bulk_slot_src);
+        qsoe_riscv_page_unmap(s_bulk_slot_dst);
+        qsoe_cnode_delete(s_cnode_root, s_bulk_slot_src, TM_BULK_CNODE_DEPTH);
+        qsoe_cnode_delete(s_cnode_root, s_bulk_slot_dst, TM_BULK_CNODE_DEPTH);
+        done += chunk;
+    }
+    return (long)done;
+}
+
+/* Per-client stash of the blocked sender's reply buffer, recorded at
+ * PULL and consumed at PUSH.  A client is blocked in exactly one MsgSend
+ * at a time, so keying by client pid is unambiguous. */
+#define TM_BULK_PENDING_MAX  16
+static struct {
+    int           in_use;
+    pid_t         client_pid;
+    unsigned long rbuf_va;
+    unsigned long rbytes;
+} s_bulk_pending[TM_BULK_PENDING_MAX];
+
+static int bulk_pending_find(pid_t client_pid)
+{
+    for (int i = 0; i < TM_BULK_PENDING_MAX; ++i)
+        if (s_bulk_pending[i].in_use && s_bulk_pending[i].client_pid == client_pid)
+            return i;
+    return -1;
+}
+
+long tm_msg_xfer_pull(pid_t server_pid, pid_t client_pid,
+                      unsigned long client_src_va, unsigned long server_dst_va,
+                      unsigned long len, unsigned long client_rbuf_va,
+                      unsigned long client_rbytes)
+{
+    tm_process_t *client = tm_process_lookup(client_pid);
+    tm_process_t *server = tm_process_lookup(server_pid);
+    if (!client || !server) return -ESRCH;
+
+    long r = tm_bulk_copy(client, client_src_va, server, server_dst_va, len);
+    if (r < 0) return r;
+
+    int slot = bulk_pending_find(client_pid);
+    if (slot < 0) {
+        for (int i = 0; i < TM_BULK_PENDING_MAX; ++i)
+            if (!s_bulk_pending[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) return -EAGAIN;       /* too many concurrent bulk receives */
+    s_bulk_pending[slot].in_use     = 1;
+    s_bulk_pending[slot].client_pid = client_pid;
+    s_bulk_pending[slot].rbuf_va    = client_rbuf_va;
+    s_bulk_pending[slot].rbytes     = client_rbytes;
+    return r;
+}
+
+long tm_msg_xfer_push(pid_t server_pid, pid_t client_pid,
+                      unsigned long server_src_va, unsigned long len)
+{
+    int slot = bulk_pending_find(client_pid);
+    if (slot < 0) return -ESRCH;        /* no matching PULL on record */
+
+    tm_process_t *client = tm_process_lookup(client_pid);
+    tm_process_t *server = tm_process_lookup(server_pid);
+    if (!client || !server) { s_bulk_pending[slot].in_use = 0; return -ESRCH; }
+
+    unsigned long n = len;
+    if (n > s_bulk_pending[slot].rbytes) n = s_bulk_pending[slot].rbytes;
+    long r = 0;
+    if (n > 0)
+        r = tm_bulk_copy(server, server_src_va, client,
+                         s_bulk_pending[slot].rbuf_va, n);
+    s_bulk_pending[slot].in_use = 0;    /* one reply per blocked send */
+    return r;
+}
+
 /* Walk PT_LOAD segments of `elf_blob` and map each page into the
  * child VSpace at (load_offset + p_vaddr).  Pages allocated from
  * taskman's untyped via alloc_object; bytes copied through

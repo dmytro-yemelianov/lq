@@ -110,6 +110,61 @@ void qsoe_libc_init(void *ipcbuf, pid_t self_pid)
 /* IPC-buffer byte capacity: 120 words × 8 bytes. */
 #define QSOE_MSG_MAX_BYTES (seL4_MsgMaxLength * 8)
 
+/* ---- Bulk-IPC transport (doc/plans/bulk_ipc.txt) ----------------------
+ *
+ * seL4 IPC moves only the message registers (QSOE_MSG_MAX_BYTES).  A
+ * MsgSend/MsgReply whose send OR reply exceeds that routes through
+ * taskman's bounce copy (TM_REQ_MSG_XFER): MsgSend ships a 4-word
+ * descriptor instead of the bytes; the server's MsgReceive PULLs the
+ * payload from the client and MsgReply PUSHes the reply back.  The whole
+ * buffer is copied verbatim (no word0/type split -- the inline path's
+ * 32-bit-label type convention can't carry raw 64-bit data, and a copied
+ * word0 is in fact more faithful than the truncating inline path). */
+#define QSOE_MSG_INLINE_MAX   QSOE_MSG_MAX_BYTES   /* > this => bulk path   */
+/* OR'd into the seL4 label to mark a bulk request.  App message types
+ * occupy the low bits and must stay below this bit (they are small enums;
+ * the inline path already truncates the label to 32 bits). */
+#define QSOE_MSG_BULK_LABEL   0x40000000u
+/* rcvid bit telling MsgReply the receive was bulk (so it PUSHes the reply
+ * before answering).  Disjoint from QSOE_RCVID_SAVED (bit 31). */
+#define QSOE_RCVID_BULK       0x40000000
+#define QSOE_RCVID_PID_MASK   0x3fffffff   /* strip BULK + SAVED bits */
+
+/* PULL: ask taskman to copy the blocked client's send buffer (client_src)
+ * into our receive buffer (local_dst), and stash the client's reply
+ * buffer for the matching PUSH.  Returns bytes copied or -1 (errno set). */
+static long bulk_xfer_pull(pid_t client_pid, unsigned long client_src,
+                           unsigned long local_dst, unsigned long len,
+                           unsigned long client_rbuf, unsigned long client_rbytes)
+{
+    qsoe_ipcbuf->msg[4] = (seL4_Word)len;
+    qsoe_ipcbuf->msg[5] = (seL4_Word)client_rbuf;
+    qsoe_ipcbuf->msg[6] = (seL4_Word)client_rbytes;
+    seL4_Word mr0 = TM_MSG_XFER_PULL, mr1 = (seL4_Word)client_pid;
+    seL4_Word mr2 = (seL4_Word)client_src, mr3 = (seL4_Word)local_dst;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_MSG_XFER, 0, 0, 7);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err) { qsoe_errno = (int)err; return -1; }
+    return (long)mr0;
+}
+
+/* PUSH: ask taskman to copy our reply buffer (local_src) into the client's
+ * stashed reply buffer.  Returns bytes copied or -1 (errno set). */
+static long bulk_xfer_push(pid_t client_pid, unsigned long local_src,
+                           unsigned long len)
+{
+    seL4_Word mr0 = TM_MSG_XFER_PUSH, mr1 = (seL4_Word)client_pid;
+    seL4_Word mr2 = (seL4_Word)local_src, mr3 = (seL4_Word)len;
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_MSG_XFER, 0, 0, 4);
+    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                                              &mr0, &mr1, &mr2, &mr3);
+    seL4_Word err = seL4_MessageInfo_get_label(reply);
+    if (err) { qsoe_errno = (int)err; return -1; }
+    return (long)mr0;
+}
+
 /* v0.4 deferred cancellation point. Each libqsoe IPC entry checks
  * the current thread's cancel_pending flag and, if set, terminates
  * the thread with status (void *)-1 — QNX's PTHREAD_CANCELED. */
@@ -181,6 +236,26 @@ int MsgSend(int coid, const void *smsg, int sbytes,
     if (sbytes < 0 || rbytes < 0) { qsoe_errno = EINVAL; return -1; }
     seL4_CPtr send = qsoe_state_coid_to_slot(coid);
     if (!send) { qsoe_errno = EBADF; return -1; }
+
+    /* Bulk path: either direction exceeds the message-register capacity.
+     * Ship a descriptor {send buf, sbytes, reply buf, rbytes}; taskman
+     * (driven by the server) copies the bytes.  Requires real caller
+     * buffers (the legacy NULL/in-place mode is only ever small). */
+    if ((sbytes > (int)QSOE_MSG_INLINE_MAX || rbytes > (int)QSOE_MSG_INLINE_MAX) &&
+        smsg && smsg != (const void *)qsoe_ipcbuf &&
+        rmsg && rmsg != (void *)qsoe_ipcbuf) {
+        seL4_Word mr0 = (seL4_Word)(uintptr_t)smsg;
+        seL4_Word mr1 = (seL4_Word)sbytes;
+        seL4_Word mr2 = (seL4_Word)(uintptr_t)rmsg;
+        seL4_Word mr3 = (seL4_Word)rbytes;
+        seL4_MessageInfo_t tag =
+            seL4_MessageInfo_new(QSOE_MSG_BULK_LABEL, 0, 0, 4);
+        seL4_MessageInfo_t reply = qsoe_sys_call(send, tag,
+                                                 &mr0, &mr1, &mr2, &mr3);
+        /* The reply payload was PUSHed straight into rmsg by taskman
+         * during the server's MsgReply; only the status rides the label. */
+        return (int)seL4_MessageInfo_get_label(reply);
+    }
 
     /* Request word 0 = type -> seL4 label; words 1+ = body -> MRs. */
     unsigned label;
@@ -292,6 +367,47 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
      * The app reads its own struct's `type` field -- it never sees the
      * label or qsoe_ipcbuf. */
     unsigned label = (unsigned)seL4_MessageInfo_get_label(tag);
+
+    /* Bulk receive: the message is a descriptor, not the payload.  PULL
+     * the client's send buffer into the caller's `msg` buffer via taskman
+     * and stash the client's reply buffer for the matching MsgReply.  The
+     * descriptor MRs are {client send buf, sbytes, client reply buf,
+     * rbytes}; the badge is the client pid. */
+    if (label & QSOE_MSG_BULK_LABEL) {
+        unsigned long c_sbuf   = (unsigned long)mr0;
+        unsigned long c_sbytes = (unsigned long)mr1;
+        unsigned long c_rbuf   = (unsigned long)mr2;
+        unsigned long c_rbytes = (unsigned long)mr3;
+        unsigned long want = ((unsigned long)bytes < c_sbytes)
+                             ? (unsigned long)bytes : c_sbytes;
+        if (msg && msg != (void *)qsoe_ipcbuf && want > 0) {
+            long copied = bulk_xfer_pull((pid_t)badge, c_sbuf,
+                                         (unsigned long)(uintptr_t)msg, want,
+                                         c_rbuf, c_rbytes);
+            if (copied < 0) return -1;   /* errno set by bulk_xfer_pull */
+        } else {
+            /* No buffer to fill, but still record the reply target so a
+             * (small or empty) MsgReply can complete the client. */
+            (void)bulk_xfer_pull((pid_t)badge, c_sbuf,
+                                 (unsigned long)(uintptr_t)msg, 0,
+                                 c_rbuf, c_rbytes);
+        }
+        if (info) {
+            info->nd        = ND_LOCAL_NODE;
+            info->pid       = (pid_t)badge;
+            info->chid      = chid;
+            info->scoid     = (int)badge;
+            info->coid      = 0;
+            info->msglen    = (int)c_sbytes;
+            info->srcmsglen = (int)c_sbytes;
+            info->dstmsglen = bytes;
+            info->priority  = 0;
+            info->flags     = 0;
+            info->label     = 0;
+        }
+        return (int)(QSOE_RCVID_BULK | (unsigned)badge);
+    }
+
     qsoe_ipcbuf->msg[0] = mr0;
     qsoe_ipcbuf->msg[1] = mr1;
     qsoe_ipcbuf->msg[2] = mr2;
@@ -372,6 +488,27 @@ int MsgReply(int rcvid, int status, const void *msg, int bytes)
 {
     qsoe_cancel_point();
     if (bytes < 0) { qsoe_errno = EINVAL; return -1; }
+
+    /* Bulk reply: the matching MsgReceive was bulk, so PUSH the reply
+     * payload into the client's reply buffer (taskman holds its address)
+     * before answering.  Then the seL4 reply carries only the status --
+     * the client's MsgSend already has its data once it unblocks. */
+    if ((unsigned)rcvid & QSOE_RCVID_BULK) {
+        pid_t client_pid = (pid_t)((unsigned)rcvid & QSOE_RCVID_PID_MASK);
+        if (msg && msg != (const void *)qsoe_ipcbuf && bytes > 0) {
+            if (bulk_xfer_push(client_pid, (unsigned long)(uintptr_t)msg,
+                               (unsigned long)bytes) < 0)
+                return -1;   /* errno set by bulk_xfer_push */
+        } else {
+            /* Empty/no-payload reply: clear the stash so taskman doesn't
+             * leak the pending entry. */
+            (void)bulk_xfer_push(client_pid, 0, 0);
+        }
+        seL4_MessageInfo_t btag =
+            seL4_MessageInfo_new((unsigned)status, 0, 0, 0);
+        qsoe_sys_send(QSOE_CAP_REPLY, btag, 0, 0, 0, 0);
+        return 0;
+    }
 
     /* The reply is PURE PAYLOAD: the whole caller buffer (from word 0)
      * becomes the reply body MRs.  `status` is the reply metadata -> the

@@ -636,6 +636,10 @@ int tm_process_waitpid(pid_t waiter, pid_t child,
 
     if (c->exit_state != 0) {
         *out_status = c->exit_status;
+        /* Reap the zombie: its resources were freed at termination; only
+         * the record slot + pid lingered for this retrieval. */
+        c->in_use = 0;
+        tm_pid_free(child);
         return 0;
     }
 
@@ -822,14 +826,18 @@ int tm_process_terminate(pid_t target, int status)
     tm_process_t *p = tm_process_lookup(target);
     if (!p) return -ESRCH;
 
-    if (p->exit_state == 0) {
-        p->exit_state  = 2;
-        p->exit_status = status;
-        if (p->waiter_reply_slot != 0) {
-            seL4_CPtr slot = p->waiter_reply_slot;
-            p->waiter_reply_slot = 0;
-            deliver_waiter_reply(slot, /*label=*/0, status);
-        }
+    /* Already terminated (a retained zombie): resources are long gone, so
+     * never run the teardown again -- just succeed. */
+    if (p->exit_state != 0) return 0;
+
+    p->exit_state  = 2;
+    p->exit_status = status;
+    int delivered = 0;
+    if (p->waiter_reply_slot != 0) {
+        seL4_CPtr slot = p->waiter_reply_slot;
+        p->waiter_reply_slot = 0;
+        deliver_waiter_reply(slot, /*label=*/0, status);
+        delivered = 1;
     }
 
     tm_thread_t  *gthreads  = tm_threads_array();
@@ -988,8 +996,22 @@ int tm_process_terminate(pid_t target, int status)
         p->objcnode_next = 0;
     }
 
-    p->in_use = 0;
-    tm_pid_free(target);
+    /* Reaping policy.  The resources above are reclaimed unconditionally;
+     * what remains is the record slot + pid.  Free them now only if the
+     * exit status has nowhere left to be retrieved -- it was already
+     * delivered to a parked waiter, or the parent is gone/detached (an
+     * orphan nobody will reap).  Otherwise leave a ZOMBIE (in_use stays
+     * set; only exit_state/exit_status/parent_pid/pid linger) so the live
+     * parent's later waitpid() can retrieve the status, which reaps it.
+     * Without this, a parent that waitpid()s AFTER its child has already
+     * exited got ECHILD instead of the child's status. */
+    tm_process_t *par = tm_process_lookup(p->parent_pid);
+    int parent_can_reap = (par && par->exit_state == 0 &&
+                           p->parent_pid != QSOE_PID_TASKMAN);
+    if (delivered || !parent_can_reap) {
+        p->in_use = 0;
+        tm_pid_free(target);
+    }
     return 0;
 }
 

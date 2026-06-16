@@ -73,4 +73,25 @@
  *   MR1 = tid of the system thread to bind the Notification to. */
 #define TM_REQ_CHANNEL_BIND_THREAD (TM_REQ_VARIANT_BASE + 2u)  /* LQ variant op 2 */
 
+/* LQ-private taskman opcode: bulk-IPC bounce copy (see
+ * doc/plans/bulk_ipc.txt).  seL4 IPC moves only ~1 KiB of message
+ * registers, so MsgSend/MsgReply payloads above QSOE_MSG_INLINE_MAX route
+ * here: the server hands taskman the client's and its own buffer VAs and
+ * taskman -- which holds the frame caps -- maps both into scratch and
+ * memcpy's between them.  Lives here, not in the shared table, because
+ * the copy is built on seL4 frame caps + scratch mapping (NQ does bulk in
+ * its own kernel; this hook has no NQ analogue).
+ *
+ *   MR0 = direction (TM_MSG_XFER_PULL / _PUSH).
+ *   MR1 = client pid (the blocked sender; the server's MsgReceive badge).
+ *   PULL: MR2 = client send-buf VA, MR3 = server recv-buf VA,
+ *         MR4 = bytes, MR5 = client reply-buf VA, MR6 = client reply bytes.
+ *         taskman copies client->server and stashes the reply buffer.
+ *   PUSH: MR2 = server reply-buf VA, MR3 = reply bytes.  taskman copies
+ *         server->the stashed client reply buffer and clears the stash.
+ *   Reply: MR0 = bytes actually copied. */
+#define TM_REQ_MSG_XFER         (TM_REQ_VARIANT_BASE + 3u)  /* LQ variant op 3 */
+#define TM_MSG_XFER_PULL        0u   /* client send-buf  -> server recv-buf */
+#define TM_MSG_XFER_PUSH        1u   /* server reply-buf -> client reply-buf */
+
 #endif /* QSOE_SLOTS_H */

@@ -101,7 +101,10 @@ int ConnectServerInfo(pid_t pid, int coid, struct _server_info *info)
     info->dstmsglen = 0;
     info->priority  = 0;
     info->flags     = 0;
-    return 0;
+    /* QNX contract: ConnectServerInfo returns the MATCHED coid (it scans
+     * upward from `coid` on a miss).  taskman resolved this slot, so the
+     * match is the coid the caller passed -- echo it back, not 0. */
+    return coid;
 }
 
 int ConnectClientInfo(int scoid, struct _client_info *info, int ngroups)

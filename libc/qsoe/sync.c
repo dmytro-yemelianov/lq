@@ -84,10 +84,46 @@ static int sync_wake(volatile void *addr, int max_n, int mode)
 
 /* ---- public API ---------------------------------------------------- */
 
+/* owner sentinel for a destroyed sync object (see <sys/_synctypes.h>:
+ * "-2  destroyed mutex").  SyncDestroy plants it; SyncMutexLock rejects
+ * it with EINVAL, matching QNX's behavior on a destroyed mutex. */
+#define QSOE_SYNC_DESTROYED  ((unsigned long)-2)
+
 long SyncTypeCreate_r(unsigned type, sync_t *s,
                        const struct _sync_attr *attr)
 {
     if (!s) return -EINVAL;
+
+    /* Validate the requested type (QNX: EINVAL on an unknown type). */
+    switch (type) {
+    case QSOE_SYNC_MUTEX_FREE:
+    case QSOE_SYNC_COND:
+    case QSOE_SYNC_SEM:
+    case QSOE_SYNC_MUTEX_NONRECURSIVE:
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    if (attr) {
+        /* Mutexes: the protocol must be a known PTHREAD_PRIO_* analogue
+         * (QNX: EINVAL otherwise). */
+        if (type == QSOE_SYNC_MUTEX_FREE ||
+            type == QSOE_SYNC_MUTEX_NONRECURSIVE) {
+            if (attr->protocol != QSOE_PRIO_NONE &&
+                attr->protocol != QSOE_PRIO_INHERIT &&
+                attr->protocol != QSOE_PRIO_PROTECT)
+                return -EINVAL;
+        }
+        /* Condvars carry a clockid (QSOE extension to QNX's attr); reject
+         * anything outside the defined CLOCK_* range. */
+        if (type == QSOE_SYNC_COND) {
+            if (attr->clockid < CLOCK_REALTIME ||
+                attr->clockid > CLOCK_THREAD_CPUTIME_ID)
+                return -EINVAL;
+        }
+    }
+
     /* For v0.8 the type just gates which field set the caller will
      * use; we don't actually keep per-sync_t state in taskman until
      * a wait fires.  Initialise both fields so a Lock after Create
@@ -97,7 +133,6 @@ long SyncTypeCreate_r(unsigned type, sync_t *s,
     if (type == QSOE_SYNC_SEM && attr && attr->count > 0) {
         s->count = attr->count;
     }
-    (void)type;
     return 0;
 }
 
@@ -117,8 +152,12 @@ int SyncDestroy(sync_t *s)
      * eagerly torn down here.  When a real cross-process Sync*
      * arrives (shm-mapped sync_t), this will free the registration. */
     if (!s) { qsoe_errno = EINVAL; return -1; }
-    s->owner = 0;
+    /* Plant the destroyed sentinel so a later operation on this object
+     * fails with EINVAL rather than silently succeeding (a destroyed
+     * mutex looks "free" if we just zero it).  A fresh SyncTypeCreate at
+     * the same address clears it. */
     s->count = 0;
+    s->owner = QSOE_SYNC_DESTROYED;
     return 0;
 }
 
@@ -127,6 +166,10 @@ int SyncDestroy(sync_t *s)
 int SyncMutexLock(sync_t *s)
 {
     if (!s) { qsoe_errno = EINVAL; return -1; }
+    if (__atomic_load_n(&s->owner, __ATOMIC_ACQUIRE) == QSOE_SYNC_DESTROYED) {
+        qsoe_errno = EINVAL;            /* locking a destroyed mutex */
+        return -1;
+    }
     unsigned long my_tid = (unsigned long)qsoe_curthr()->tid;
 
     for (;;) {
