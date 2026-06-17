@@ -59,25 +59,31 @@ over a seL4 endpoint.
   (`TM_REQ_MMAP` / `TM_REQ_MUNMAP`).
 - **Spawn, not fork.** Process creation only via `posix_spawn(3)`.
 
-## Current state — v0.12
+## Current state — v0.13
 
-**PCIe enumeration on real silicon.** Building on the v0.11 first-boot,
-QSOE/L's `pci-server` now walks the full SiFive Unmatched (FU740)
-DesignWare PCIe topology under seL4 — 11 devices across buses 0..7,
-including a Samsung NVMe SSD and an NVIDIA GK208 GPU with its HDMI-audio
-function. Serial input works on the board, and every process runs a
-per-process signal thread. Everything below also runs under QEMU `virt`.
+**Writable storage on real silicon, and the first mounted filesystem.**
+Building on the v0.12 PCIe-on-silicon line, real `Sched*` lets `devb-nvme`
+come up over MSI-X on the SiFive Unmatched (the Samsung NVMe enumerates and
+`/dev/nvme0n1p*` appears); under QEMU a polled virtio-mmio driver stands in
+(seL4 has no AIA, so no NVMe there). On either backend the qrvfs server
+**mounts a real filesystem at `/usr`**, taskman **spawns binaries and
+`#!`-scripts straight off it**, and `/sbin/init` hands the system to an
+on-disk `/usr/sbin/sysinit/level1.sh`. Everything also runs under QEMU
+`virt`.
 
 ```
-QSOE/L Operating System version v0.12
-[init] starting pci-server...
-[pci-server] scan complete: 11 devices across buses 0..7
-[init] starting devc-sersifive...
-[devc-sersifive] /dev/ser1 registered (chid=2)
-[/]# lspci
-06:00.0 NVM controller [0108]: 144d:a80a (rev 00)
-07:00.0 VGA compatible controller [0300]: 10de:128b (rev a1)
-07:00.1 Multimedia controller [0403]: 10de:0e0f (rev a1)
+QSOE/L Operating System version v0.13
+[init] starting devb-virtio...
+devb-virtio: /dev/vblk0 ready (16 MiB)
+[init] mounting /dev/vblk0 at /usr...
+fs-qrv: mounted qrvfs at /usr (dev=/dev/vblk0)
+Sysinit: level1 running (on-disk init from /usr).
+[/]# ls /usr/bin
+test_syncspace  test_msgpass  suite  time
+[/]# /usr/bin/time ls /usr
+bin  sbin
+
+real  0.163371s
 [/]#
 ```
 
@@ -121,6 +127,24 @@ What's working:
   tagged blob (`_MEMORY`, `_CPUS`, `_PLIC`, `_PCI_ECAM`, …); user-space
   queries via `<qsoe/hwinfo.h>`.
 
+New in v0.13:
+
+- **Storage stack** — real `Sched*` (POSIX→MCS-SchedContext adapter),
+  `alloc_phys`, QNX global channels, and real `mprotect` together bring
+  `devb-nvme` up over MSI-X on the FU740; `/dev/nvme0n1p*` appears.
+- **First mounted filesystem** — external libressrv resource managers work
+  on LQ (`open` sends `_IO_CONNECT`, `readdir` uses getdents framing); the
+  `fs-qrv` qrvfs server mounts `/usr` over `devb-nvme` (board) or the new
+  polled `devb-virtio` `/dev/vblk0` (QEMU).
+- **spawn-from-fs** — taskman loads binaries and `#!`-scripts that aren't
+  in the boot cpio off the mounted filesystem, so `/sbin/init` hands off to
+  an editable on-disk `level1.sh`. Resmgr `dup` (`F_DUPFD`/`dup2`) refcounts
+  shared handles, so a shell can relocate a script fd.
+- **Diagnostics** — `--debug[=N]` boot cmdline; at TRACE, one `tm_msg
+  0x<type>` line per incoming message. `ps` shows detached daemons as `d`.
+- **Misc** — bulk IPC, `ConnectServerInfo`, zombie-reap fix, an FU740
+  boot-stall fix (master-pool untyped cap), and `TimerCreate`/`Destroy`.
+
 New in v0.12:
 
 - **FU740 PCIe** — taskman parses the `sifive,fu740-pcie` DesignWare host
@@ -159,10 +183,11 @@ New since v0.9 (the v0.10 MCS line and v0.11):
 
 What's deliberately not implemented: `fork()`, `select()`, `brk()`.
 
-Still ahead: serial RX on the FU740 PLIC (the console accepts output but
-hangs on input on real hardware); shell pipelines; a storage stack
-(`devb-nvme`, `fs-qrv`); MCS-native timers. The shape of the work is
-sketched in the umbrella's top-level documentation.
+Still ahead (v0.14+): the shared `quser/test/suite/` fully green on LQ;
+the `setuid`/`setgid` privilege check; a writable filesystem (qrvfs is
+read-only today); wall-clock `CLOCK_REALTIME`; MCS-native timers; shell
+pipelines. The umbrella roadmap (`ROADMAP.md` in the top-level `os` repo)
+sketches the path to the unified 1.0.
 
 ## Build and run
 

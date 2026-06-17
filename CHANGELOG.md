@@ -5,6 +5,71 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.13] — 2026-06-17
+
+**Milestone: writable storage on real silicon, and QSOE/L's first mounted
+filesystem.** Real `Sched*` unblocked `devb-nvme` over MSI-X on the SiFive
+Unmatched (the Samsung NVMe enumerates and `/dev/nvme0n1p*` appears), and
+under QEMU — where seL4 has no AIA, hence no NVMe — a polled virtio-mmio
+driver gives the same effect. On either backend, the qrvfs server (`fs-qrv`)
+now **mounts a real filesystem at `/usr`**, taskman **spawns binaries and
+`#!`-scripts straight off it**, and `/sbin/init` hands the system off to an
+on-disk `/usr/sbin/sysinit/level1.sh`. Built on the v0.12 PCIe-on-silicon
+line.
+
+### Storage stack (the headline)
+- **Real `Sched*`** — `TM_REQ_SCHED_SET/GET` + a libc `SchedSet`/`SchedGet`
+  seam: a thin POSIX→MCS-SchedContext adapter (QNX priority 0..255
+  identity-mapped to seL4; `SCHED_RR` budget<period, `SCHED_FIFO`
+  budget==period). devb-nvme's IST can elevate, so the driver initializes
+  over the existing real MSI-X path. (FU740, board-confirmed.)
+- **`alloc_phys`** (`TM_REQ_ALLOC_PHYS`) — maps a page and reports its PA,
+  for the DesignWare MSI target and DMA buffers. Was unimplemented
+  (silently returned VA=0); now real via `RISCV_Page_GetAddress`.
+- **Global channels** (`QSOE_CHF_GLOBAL`, QNX `_NTO_CHF_GLOBAL`) — a
+  pid-independent channel resolvable by chid alone, so `pci-server` can
+  deliver an MSI pulse to a driver's channel. (Skimmer's pool is already
+  global; the flag is a no-op there.)
+- **Real `mprotect`** (`TM_REQ_MPROTECT`) — RELRO is now enforced; rtld's
+  RELRO pass is no longer an inert stub.
+
+### First mounted filesystem
+- **devb-virtio** — a polled virtio-mmio (legacy/v1) whole-disk block
+  driver serving `/dev/vblk0`, the QEMU storage backend for QSOE/L.
+- **External resource managers on LQ** — `open()` of an external path now
+  sends `_IO_CONNECT` to the serving resmgr, `readdir` speaks libressrv's
+  packed-`struct dirent` (getdents) framing, and `lseek` is unified — so
+  `fs-qrv` mounts qrvfs at `/usr`. `init.sh` picks the block driver by the
+  `mainfs=` cmdline prefix.
+- **spawn-from-fs** — taskman loads a binary or shebang script absent from
+  the boot cpio off a mounted resmgr: it drives the resmgr through the
+  in-taskman IPC seam into a `pp_ut`-bracketed megaframe scratch window,
+  then feeds the existing ELF loader. This is what lets `/sbin/init` exec
+  the on-disk staged init.
+- **Resource-manager dup support** — the framework refcounts/clones per-open
+  handles across `F_DUPFD`/`dup2`, so a shell relocating an on-disk script's
+  fd keeps reading it.
+
+### Boot & diagnostics
+- **`--debug[=N]`** parsed from `/chosen/bootargs` (also surfaced at
+  `/sys/cmdline`); at TRACE, taskman logs one `tm_msg 0x<type>` line per
+  incoming message, to gauge how IPC-heavy an operation is.
+- **FU740 boot-stall fix** — cap the master-pool untyped: seL4's first
+  retype lazily zeroes the whole untyped, an ~18s stall at boot.
+- **Bulk IPC** (`TM_REQ_MSG_XFER`), `ConnectServerInfo`, a process-reap /
+  zombie fix, and sync-argument validation.
+- **`ps`** reports detached daemons as `d` (a new `QSOE_TSTATE_DETACHED`)
+  rather than a misleading `Z` (zombie).
+- **`TimerCreate`/`TimerDestroy`** — libc-local per-process timer objects.
+
+### Deferred to v0.14
+- Shared `quser/test/suite/` to fully green on LQ (~147/150; a few
+  pre-existing pure-key-semaphore and server-fault cases remain).
+- `setuid`/`setgid` privilege check — the `euid==0` gate in `tm_set_cred`.
+- The standing v0.14 backlog: wall-clock / `CLOCK_REALTIME`, `posix_spawn`
+  file-actions, the writable-FS cluster, the `-Werror` warning sweep, the
+  ~20s FU740 boot delay profiling, and SBI-SRST reboot.
+
 ## [v0.12] — 2026-06-15
 
 **Milestone: PCIe enumeration on real silicon.** QSOE/L's `pci-server`
