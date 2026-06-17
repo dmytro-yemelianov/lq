@@ -123,6 +123,48 @@ int MsgSend(int coid, const void *smsg, int sbytes,
     return 0;
 }
 
+/* taskman-internal: like MsgSend, but RETURNS the reply STATUS (the seL4
+ * label a server sets via MsgReply, which the public MsgSend discards).
+ * The reply payload is left in qsoe_ipcbuf->msg[] verbatim -- count at
+ * msg[0], data from msg[4] -- for the caller to read directly.  Used by
+ * spawn-from-fs, where taskman is the resmgr client and must see the
+ * server's errno (ENOENT on a bad open, etc.).  Returns the status
+ * (0 = EOK, >0 = server errno) or -EBADF for an unbound coid. */
+int tm_msg_call(int coid, const void *smsg, int sbytes)
+{
+    if (sbytes < (int) sizeof(unsigned long)) return -EINVAL;
+    seL4_CPtr send = qsoe_state_coid_to_slot(coid);
+    if (!send) return -EBADF;
+
+    /* QSOE/L resmgr wire (identical to the libc seam's MsgSend, which the
+     * IN_TASKMAN MsgSend above does NOT follow): request word 0 = type ->
+     * seL4 label; words 1+ = body -> message registers.  The server
+     * reconstructs req[0] from the label.  The reply status rides the
+     * label back; the reply payload (count @ msg[0], data @ msg[4]) stays
+     * in the IPC buffer for the caller to read. */
+    const unsigned long *req = smsg;
+    unsigned label  = (unsigned) req[0];
+    unsigned body   = (unsigned) sbytes - (unsigned) sizeof(unsigned long);
+    unsigned nwords = pack_bytes(&req[1], body);
+
+    seL4_Word mr0 = qsoe_ipcbuf->msg[0];
+    seL4_Word mr1 = qsoe_ipcbuf->msg[1];
+    seL4_Word mr2 = qsoe_ipcbuf->msg[2];
+    seL4_Word mr3 = qsoe_ipcbuf->msg[3];
+
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(label, 0, 0, nwords);
+    seL4_MessageInfo_t reply = qsoe_sys_call(send, tag, &mr0, &mr1, &mr2, &mr3);
+
+    /* Stage the four fast-path reply MRs back into msg[0..3]; words 4+ of
+     * the reply are already in the IPC buffer's msg[] array. */
+    qsoe_ipcbuf->msg[0] = mr0;
+    qsoe_ipcbuf->msg[1] = mr1;
+    qsoe_ipcbuf->msg[2] = mr2;
+    qsoe_ipcbuf->msg[3] = mr3;
+
+    return (int) seL4_MessageInfo_get_label(reply);
+}
+
 int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
 {
     qsoe_cancel_point();

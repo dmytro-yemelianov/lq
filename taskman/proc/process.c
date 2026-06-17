@@ -116,6 +116,8 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
     char name[64];
     unsigned long elf_size = 0;
     const void *elf = 0;
+    tm_fs_load_t fs_ctx;
+    int fs_loaded = 0;
 
     if (path[0] == '/') {
         if (path_len < 2 || path_len > sizeof name) return -EINVAL;
@@ -138,16 +140,33 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
             elf = tm_cpio_lookup(name, &elf_size);
         }
     }
-    if (!elf) return -ENOENT;
+    if (!elf) {
+        /* Not in the boot cpio -- try a mounted filesystem (fs-qrv).
+         * taskman reads the image off the resmgr into a scratch window in
+         * its own VSpace; the bytes feed tm_spawn like any cpio image.
+         * Needs the absolute path (a bare name has no fs namespace to
+         * resolve); path is path_len bytes, so NUL-terminate a copy. */
+        if (path[0] == '/' && path_len < sizeof name) {
+            char fp[64];
+            for (unsigned i = 0; i < path_len; ++i) fp[i] = path[i];
+            fp[path_len] = 0;
+            if (tm_spawn_fs_load(fp, &elf, &elf_size, &fs_ctx) == 0)
+                fs_loaded = 1;
+        }
+        if (!fs_loaded) return -ENOENT;
+    }
 
     pid_t new_pid = tm_pid_alloc();
-    if (!new_pid) return -ENOMEM;
+    if (!new_pid) {
+        if (fs_loaded) tm_spawn_fs_unload(&fs_ctx);
+        return -ENOMEM;
+    }
 
-    /* elf_name passed to tm_spawn is the basename — that's what
-     * spawn_name_eq cares about, and shebang code uses it for the
-     * synthesised script_path argument. */
-    const char *basename = name;
-    for (const char *p = name; *p; ++p) if (*p == '/') basename = p + 1;
+    /* Pass the full cpio-style name (leading '/' stripped) as elf_name:
+     * tm_spawn derives the process name from its basename, and the shebang
+     * path builds script_path as '/' + elf_name -- which must be the full
+     * path so an interpreter (qsh) can reopen an on-disk script through
+     * pathmgr, e.g. "/usr/sbin/sysinit/level1.sh". */
 
     /* Bracket the spawn's object retypes with a per-process untyped so
      * the whole image is reclaimable on exit (see tm_pput_*).  Staged
@@ -156,13 +175,17 @@ int tm_process_create_by_name(const char *path, unsigned path_len,
     seL4_CPtr staging[TM_PP_UT_PER_PROC];
     int       staging_n = 0;
     if (tm_pput_spawn_begin(staging, &staging_n) != 0) {
+        if (fs_loaded) tm_spawn_fs_unload(&fs_ctx);
         tm_pid_free(new_pid);
         return -ENOMEM;
     }
 
     int sr = tm_spawn(elf, elf_size, new_pid, s_primary_ep,
-                       argc, argv, envc, envp, basename);
+                       argc, argv, envc, envp, name);
     tm_pput_end();
+    /* tm_spawn has copied the image into the child; release the fs read
+     * buffer (Revokes its pp_ut block) whichever way the spawn went. */
+    if (fs_loaded) tm_spawn_fs_unload(&fs_ctx);
     if (sr) {
         tm_pput_release_list(staging, staging_n);
         tm_pid_free(new_pid);

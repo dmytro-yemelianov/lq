@@ -72,6 +72,7 @@ ATTACH_NVME=0
 # Pass-through to QEMU for anything after `--`.
 PASSTHROUGH=()
 GDB=0
+DEBUGARG=
 seen_dashdash=0
 for arg in "$@"; do
     if [[ $seen_dashdash -eq 1 ]]; then
@@ -79,11 +80,12 @@ for arg in "$@"; do
         continue
     fi
     case "$arg" in
-        --)         seen_dashdash=1 ;;
-        -gdb)       GDB=1 ;;
-        -no-virtio) ATTACH_VIRTIO=0 ;;
-        -nvme)      ATTACH_NVME=1 ;;
-        -no-nvme)   ATTACH_NVME=0 ;;
+        --)            seen_dashdash=1 ;;
+        -gdb)          GDB=1 ;;
+        -no-virtio)    ATTACH_VIRTIO=0 ;;
+        -nvme)         ATTACH_NVME=1 ;;
+        -no-nvme)      ATTACH_NVME=0 ;;
+        --debug|--debug=*)  DEBUGARG="$arg" ;;  # -> taskman via /chosen/bootargs
         -h|--help)
             grep '^# ' "$0" | sed 's/^# //'
             exit 0 ;;
@@ -142,10 +144,14 @@ if [[ $ATTACH_NVME -eq 1 ]]; then
     MAINFS="/dev/nvme0n1p8"
 fi
 
-# Kernel command line -> FDT /chosen/bootargs -> /sys/cmdline: name the
-# main fs so init mounts it (and selects the matching block driver).
-if [[ -n "$MAINFS" ]]; then
-    QEMUOPTS+=(-append "mainfs=$MAINFS")
+# Kernel command line -> FDT /chosen/bootargs -> /sys/cmdline: names the
+# main fs so init mounts it (and selects the matching block driver), plus
+# any --debug[=N] which taskman parses to raise its log verbosity.
+BOOTARGS=
+[[ -n "$MAINFS"   ]] && BOOTARGS="mainfs=$MAINFS"
+[[ -n "$DEBUGARG" ]] && BOOTARGS="${BOOTARGS:+$BOOTARGS }$DEBUGARG"
+if [[ -n "$BOOTARGS" ]]; then
+    QEMUOPTS+=(-append "$BOOTARGS")
 fi
 
 # ---------------------------------------------------------------------

@@ -21,6 +21,7 @@
 #include "syscfg.h"
 #include "fdt.h"
 #include "../sel4_syscalls.h"
+#include <tm_log.h>           /* tm_log_apply_cmdline (--debug parsing) */
 
 static unsigned char s_blob[TM_SYSCFG_MAX];
 static unsigned      s_blob_len;
@@ -204,6 +205,9 @@ int tm_syscfg_build(const void *fdt_blob)
         if (tm_fdt_prop_str(fdt_blob, chosen, "bootargs", &bootargs) == 0 &&
             bootargs && bootargs[0]) {
             (void)emit_asciz(TM_SYSCFG_TAG_CMDLINE, bootargs);
+            /* Raise log verbosity if the cmdline carries --debug[=N]
+             * (--debug=2+ -> TRACE: a line per incoming message). */
+            (void)tm_log_apply_cmdline(bootargs);
         }
     }
 

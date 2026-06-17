@@ -21,6 +21,10 @@
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
 
+/* Defined in dup2.c: notify an external resmgr of a cap-copy dup so it
+ * refcounts the shared connection. */
+extern void qsoe_dup_notify(int newfd, int oldfd);
+
 /* Tell taskman to CNode_Copy oldfd_slot into newfd_slot.  Shared
  * mechanism with dup2.c; inlined here to avoid an internal header
  * just for one helper. */
@@ -56,6 +60,10 @@ static int fcntl_dupfd(int fd, int start_fd, int set_cloexec)
     }
     qsoe_state_bind_coid(newfd, newslot);
     qsoe_state_set_coid_flags(newfd, set_cloexec ? FD_CLOEXEC : 0);
+    /* Notify an external resmgr the connection is now shared (see dup2.c)
+     * so closing one fd doesn't free its handle from under the other --
+     * what lets a shell relocate an on-disk script's fd off /usr. */
+    qsoe_dup_notify(newfd, fd);
     return newfd;
 }
 

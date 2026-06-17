@@ -409,6 +409,28 @@ void tm_pput_release_list(seL4_CPtr *list, int n);
  * at boot with every RAM untyped >= one block wide). */
 void tm_pput_pool_init(const seL4_CPtr *uts, int n);
 
+/* In-taskman status-returning IPC send (qsoe/msg.c): like MsgSend but
+ * returns the server's reply status; the payload is left in the IPC
+ * buffer (count at msg[0], data from msg[4]). */
+int tm_msg_call(int coid, const void *smsg, int sbytes);
+
+/* Spawn-from-filesystem (proc/spawn.c).  A binary not in the boot cpio is
+ * read off a mounted resmgr (fs-qrv) into a scratch window in taskman's
+ * own VSpace, then handed to tm_spawn.  ctx records the pp_ut block + the
+ * mapped megaframes so tm_spawn_fs_unload reclaims them once tm_spawn has
+ * copied the image into the child.  out_blob points into taskman's VSpace
+ * and is valid only until tm_spawn_fs_unload. */
+#define TM_FS_MAX_MF  8           /* read-buffer cap: 8 * 2 MiB = 16 MiB */
+typedef struct {
+    seL4_CPtr mf[TM_FS_MAX_MF];   /* mapped megaframe caps                */
+    int       nmf;
+    seL4_CPtr pput[TM_PP_UT_PER_PROC];   /* read-buffer pp_ut block(s)    */
+    int       pput_n;
+} tm_fs_load_t;
+int  tm_spawn_fs_load(const char *path, const void **out_blob,
+                      unsigned long *out_size, tm_fs_load_t *ctx);
+void tm_spawn_fs_unload(tm_fs_load_t *ctx);
+
 /* ----------- MCS scheduling + reply objects (v0.10, process.c) ----------- */
 
 /* SchedControl base + node count (from bootinfo.schedcontrol), set by

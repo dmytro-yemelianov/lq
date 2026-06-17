@@ -98,6 +98,9 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     (void)mr3;
     pid_t caller = (pid_t)badge;
     unsigned label = (unsigned)seL4_MessageInfo_get_label(info);
+    /* --debug=4 (TRACE): one short line per incoming message so an operator
+     * can see how IPC-heavy an operation is, e.g. "tm_msg 0x302". */
+    tm_trace("tm_msg 0x%x\n", label);
     seL4_Word err = 0;
     seL4_Word reply_len = 0;
     *out_mr0 = 0;

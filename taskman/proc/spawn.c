@@ -20,6 +20,9 @@
 #include <tm_elf.h>
 #include <tm_reloc.h>
 #include <tm_script.h>
+#include <sys/qsoe.h>          /* ConnectAttach/Detach, ND_LOCAL_NODE      */
+#include <qsoe/tm_msgs.h>      /* _IO_*, tm_req_io_*, TM_IO_MAX, TM_PATH_MAX */
+#include <tm_pathmgr.h>        /* tm_pathmgr_resolve, PATHMGR_HANDLER_*    */
 
 /* ELF64 minimal types — just enough to walk PHDRs. */
 typedef unsigned char  u8;
@@ -142,6 +145,7 @@ static void qmemset(void *dst, int v, unsigned long n)
  * defined in proc/process.c (and used below to retype PT objects).
  * `alloc_object` is defined further down in this file. */
 static seL4_CPtr alloc_object(seL4_Word type, seL4_Word size_bits);
+static unsigned long qstrlen(const char *s);
 
 /* Allocate + install the L1 and L0 page tables that back the 2-MiB
  * region containing TM_SCRATCH_VADDR.  The kernel-prepared mappings
@@ -207,6 +211,181 @@ static int scratch_map(seL4_CPtr frame)
 static int scratch_unmap(seL4_CPtr frame)
 {
     return (int)qsoe_riscv_page_unmap(frame);
+}
+
+/* ====================================================================
+ * Spawn-from-filesystem (proc.h tm_fs_load_t / tm_spawn_fs_*).
+ *
+ * A binary not in the boot cpio is read off a mounted resmgr (fs-qrv) the
+ * way any client would: ConnectAttach to the serving channel, _IO_CONNECT
+ * (open), an _IO_READ loop into a scratch window in taskman's OWN VSpace,
+ * _IO_CLOSE, detach.  The bytes then feed the normal ELF loader.  No
+ * deadlock: the read chain taskman -> fs-qrv -> devb never calls back into
+ * taskman.  Mirrors NQ's sys/spawn.c fs_read_image, but uses the in-
+ * taskman <sys/qsoe.h> IPC seam + a pp_ut-bracketed megaframe buffer. */
+
+/* The read buffer sits at a free L2 root slot, clear of the image (L2[0])
+ * and TM_SCRATCH_VADDR (L2[1], which tm_spawn uses at the same time to copy
+ * the image into the child).  A 2 MiB megaframe maps at the L1 level, so
+ * this window needs only an L1 PT -- installed once from the master pool so
+ * it survives the per-read pp_ut Revoke. */
+#define FS_SCRATCH_VADDR   0x80000000UL     /* L2[2] of taskman's vspace    */
+#define FS_OPEN_RDONLY     0
+#define FS_REPLY_DATA_WORD 4                 /* reply payload at msg[4]      */
+
+static int s_fs_scratch_pt_ready;
+
+static int ensure_fs_scratch_pt(void)
+{
+    if (s_fs_scratch_pt_ready) return 0;
+    /* Allocate the L1 PT with s_cur_pput clear (caller ensures this) so it
+     * comes from the master pool, not a per-read pp_ut block -- it must
+     * persist for taskman's lifetime, like the TM_SCRATCH_VADDR PTs. */
+    seL4_CPtr l1 = taskman_alloc_and_retype(seL4_RISCV_PageTableObject, 0);
+    if (!l1) { tm_err("spawn: fs scratch L1 retype failed"); return -ENOMEM; }
+    seL4_Word err = qsoe_riscv_pagetable_map(l1, seL4_CapInitThreadVSpace,
+                                             FS_SCRATCH_VADDR,
+                                             QSOE_VM_ATTR_DEFAULT);
+    if (err) {
+        tm_err("spawn: fs scratch L1 map failed err=%lu", (unsigned long) err);
+        return -ENOMEM;
+    }
+    s_fs_scratch_pt_ready = 1;
+    return 0;
+}
+
+/* Map megaframes (from the active pp_ut block) until the read window covers
+ * [0, need).  Megaframes land at FS_SCRATCH_VADDR + k*2 MiB under the one
+ * L1 PT. */
+static int fs_grow(tm_fs_load_t *ctx, unsigned long need)
+{
+    while ((unsigned long) ctx->nmf * QSOE_MEGA_PAGE < need) {
+        if (ctx->nmf >= TM_FS_MAX_MF) {
+            tm_err("spawn: fs image exceeds %d-megaframe cap", TM_FS_MAX_MF);
+            return -EFBIG;
+        }
+        seL4_CPtr mf = taskman_alloc_and_retype(seL4_RISCV_Mega_Page, 0);
+        if (!mf) { tm_err("spawn: fs megaframe retype failed"); return -ENOMEM; }
+        seL4_Word err = qsoe_riscv_page_map(
+            mf, seL4_CapInitThreadVSpace,
+            FS_SCRATCH_VADDR + (unsigned long) ctx->nmf * QSOE_MEGA_PAGE,
+            QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
+        if (err) {
+            tm_err("spawn: fs megaframe map failed err=%lu", (unsigned long) err);
+            return -ENOMEM;
+        }
+        ctx->mf[ctx->nmf++] = mf;
+    }
+    return 0;
+}
+
+/* Best-effort _IO_CLOSE so the server frees its per-open handle. */
+static void fs_close(int coid)
+{
+    tm_req_io_hdr_t cl;
+    cl.type = _IO_CLOSE;
+    cl._reserved[0] = cl._reserved[1] = cl._reserved[2] = cl._reserved[3] = 0;
+    (void) tm_msg_call(coid, &cl, (int) sizeof cl);
+    ConnectDetach(coid);
+}
+
+int tm_spawn_fs_load(const char *path, const void **out_blob,
+                     unsigned long *out_size, tm_fs_load_t *ctx)
+{
+    ctx->nmf = 0;
+    ctx->pput_n = 0;
+
+    /* Resolve to the serving resmgr.  Only an external resmgr (a mounted
+     * fs) is fed here -- taskman-served paths (cpio/sys/proc) were already
+     * tried and missed by the caller. */
+    tm_pathmgr_obj_t obj;
+    unsigned consumed = 0;
+    if (tm_pathmgr_resolve(path, &obj, &consumed) != 0)
+        return -ENOENT;
+    if (obj.handler_kind != PATHMGR_HANDLER_EXTERNAL || obj.server_pid <= 0)
+        return -ENOENT;
+
+    /* L1 PT first, while s_cur_pput is still clear (master-pool, permanent). */
+    if (ensure_fs_scratch_pt() != 0)
+        return -ENOMEM;
+
+    int coid = ConnectAttach(ND_LOCAL_NODE, obj.server_pid, obj.server_chid,
+                             0, 0);
+    if (coid < 0) {
+        tm_err("spawn: fs ConnectAttach(pid=%d chid=%d) failed",
+               (int) obj.server_pid, obj.server_chid);
+        return -EIO;
+    }
+
+    /* Per-read pp_ut block: read-buffer megaframes draw from it and are
+     * reclaimed leak-free by tm_spawn_fs_unload's Revoke. */
+    if (tm_pput_spawn_begin(ctx->pput, &ctx->pput_n) != 0) {
+        ConnectDetach(coid);
+        return -ENOMEM;
+    }
+
+    /* _IO_CONNECT: open the file (full resolved path). */
+    static unsigned char ob[sizeof(tm_req_io_connect_t) + TM_PATH_MAX];
+    tm_req_io_connect_t *oc = (tm_req_io_connect_t *) ob;
+    unsigned plen = (unsigned) qstrlen(path);
+    if (plen >= TM_PATH_MAX) plen = TM_PATH_MAX - 1;
+    oc->type  = _IO_CONNECT;
+    oc->plen  = plen;
+    oc->flags = FS_OPEN_RDONLY;
+    oc->mode  = 0;
+    oc->_reserved[0] = 0;
+    for (unsigned i = 0; i < plen; ++i)
+        ob[sizeof(tm_req_io_connect_t) + i] = (unsigned char) path[i];
+    int st = tm_msg_call(coid, ob, (int) (sizeof(tm_req_io_connect_t) + plen));
+    if (st != 0) goto fail;          /* server errno (ENOENT, ...) */
+
+    /* _IO_READ loop into the scratch window; a zero-byte read is EOF.
+     * CRITICAL: grow the buffer (which issues seL4 retype/map invocations
+     * that reuse the IPC buffer) BEFORE each read, never between the read
+     * and the copy -- otherwise a fresh-megaframe alloc clobbers the reply
+     * data still sitting in msg[]. */
+    unsigned long total = 0;
+    for (;;) {
+        if (fs_grow(ctx, total + TM_IO_MAX) != 0) goto fail;
+        tm_req_io_read_t rd;
+        rd.type = _IO_READ;
+        rd.count = TM_IO_MAX;
+        rd._reserved[0] = rd._reserved[1] = rd._reserved[2] = 0;
+        st = tm_msg_call(coid, &rd, (int) sizeof rd);
+        if (st != 0) { tm_err("spawn: fs read rc=%d at %lu", st, total); goto fail; }
+        unsigned long n = qsoe_ipcbuf->msg[0];          /* count @ word0 */
+        if (n == 0) break;
+        if (n > TM_IO_MAX) n = TM_IO_MAX;
+        /* No IPC between here and the copy -- msg[] holds the reply data. */
+        unsigned char *dst = (unsigned char *) (FS_SCRATCH_VADDR + total);
+        const unsigned char *src =
+            (const unsigned char *) &qsoe_ipcbuf->msg[FS_REPLY_DATA_WORD];
+        for (unsigned long i = 0; i < n; ++i) dst[i] = src[i];
+        total += n;
+    }
+
+    fs_close(coid);
+    tm_pput_end();          /* clear context so the spawn uses its own block */
+    *out_blob = (const void *) FS_SCRATCH_VADDR;
+    *out_size = total;
+    return 0;
+
+fail:
+    fs_close(coid);
+    tm_pput_end();
+    tm_spawn_fs_unload(ctx);
+    return -EIO;
+}
+
+void tm_spawn_fs_unload(tm_fs_load_t *ctx)
+{
+    for (int i = 0; i < ctx->nmf; ++i)
+        (void) qsoe_riscv_page_unmap(ctx->mf[i]);
+    ctx->nmf = 0;
+    if (ctx->pput_n > 0) {
+        tm_pput_release_list(ctx->pput, ctx->pput_n);
+        ctx->pput_n = 0;
+    }
 }
 
 /* The shared spawn state — defined in proc/process.c, declared

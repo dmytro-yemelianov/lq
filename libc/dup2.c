@@ -22,6 +22,28 @@
 #include <sel4_types.h>
 #include <qsoe_invoke.h>
 
+/* After a cap-copy dup (TM_REQ_DUP_CAP), the new fd shares the old fd's
+ * single connection (same cap, same server-side scoid).  An external
+ * resmgr must learn of the share so it refcounts the open -- otherwise the
+ * first close frees the resmgr's handle out from under the survivor (the
+ * bug that broke a shell relocating a script fd off /usr).  Internal
+ * (taskman/cpiofs) fds don't need this; taskman keys per-connection.  Send
+ * _IO_DUP on newfd, naming oldfd as the source. */
+void qsoe_dup_notify(int newfd, int oldfd)
+{
+    struct _server_info si;
+    /* ConnectServerInfo returns the matched coid (>=0) on success, -1 on
+     * error -- NOT 0-on-success.  Only an external resmgr (server pid !=
+     * taskman) keeps a libressrv handle that needs the dup refcount. */
+    if (ConnectServerInfo(0, oldfd, &si) < 0 || si.pid == QSOE_PID_TASKMAN)
+        return;
+    tm_req_io_dup_t dr;
+    dr.type = _IO_DUP;
+    dr.src_coid = (unsigned long) oldfd;
+    dr._reserved[0] = dr._reserved[1] = dr._reserved[2] = 0;
+    (void) MsgSend(newfd, &dr, (int) sizeof dr, 0, 0);
+}
+
 int dup2(int oldfd, int newfd)
 {
     unsigned long oldslot = qsoe_state_coid_to_slot(oldfd);
@@ -48,5 +70,6 @@ int dup2(int oldfd, int newfd)
     }
 
     qsoe_state_force_bind_coid(newfd, newslot);
+    qsoe_dup_notify(newfd, oldfd);
     return newfd;
 }
