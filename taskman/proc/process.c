@@ -15,6 +15,7 @@
 #include "../qsoe_invoke.h"
 #include "../path/cpiofs.h"  /* tm_cpio_lookup */
 #include <tm_log.h>
+#include <tm_cred.h>          /* tm_cred_change_permitted */
 #include <qsoe/slots.h>
 #include <cpio.h>
 
@@ -679,7 +680,7 @@ int tm_process_waitpid(pid_t waiter, pid_t child,
 
 int tm_proc_self_info(pid_t caller_pid,
                       pid_t *out_pid, pid_t *out_ppid,
-                      tm_cred_t *out_cred)
+                      struct _cred_info *out_cred)
 {
     tm_process_t *p = tm_process_lookup(caller_pid);
     if (!p) return -ESRCH;
@@ -697,15 +698,17 @@ int tm_chdir(pid_t caller_pid, unsigned path_len)
     if (!p) return -ESRCH;
     if (path_len == 0 || path_len >= sizeof p->cwd) return -ENAMETOOLONG;
 
-    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
-    /* v0.7 accepts absolute paths only.  Relative paths need full
-     * cwd-relative resolution which lands when we have a real fs. */
+    /* Pure-payload frame: the path rides at word 1 (msg[1..]); the
+     * dispatcher mirrored MR0..3 into msg[0..3] on entry. */
+    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[1];
+    /* Absolute paths only.  Relative paths need full cwd-relative
+     * resolution which lands when we have a real fs. */
     if (src[0] != '/') return -EINVAL;
 
-    /* Copy into the process's cwd, NUL-terminating.  No existence /
-     * is-a-directory check yet: cpiofs is too flat to know about
-     * directories, and pathmgr's "/" catch-all would lie if we asked.
-     * Once a real fs lands, validate here. */
+    /* Existence / is-a-directory validation happens client-side in libc
+     * chdir() via stat() (it resolves through the fs the same way open()
+     * does); by the time we get here the path is known good.  Record it
+     * as the per-process cwd. */
     for (unsigned i = 0; i < path_len; ++i) p->cwd[i] = (char)src[i];
     p->cwd[path_len] = 0;
     return 0;
@@ -763,21 +766,32 @@ int tm_umask(pid_t caller_pid, int set, unsigned *out_old)
     return 0;
 }
 
+/* "Leave this field alone" sentinel -- equals TM_CRED_KEEP on the wire
+ * (libc/include/qsoe/tm_msgs.h); named constant so the value never appears
+ * as a bare literal. */
+#define CRED_KEEP 0xFFFFFFFFu
+
 int tm_set_cred(pid_t caller_pid,
                 unsigned ruid_new, unsigned euid_new, unsigned suid_new,
                 unsigned rgid_new, unsigned egid_new, unsigned sgid_new)
 {
     tm_process_t *p = tm_process_lookup(caller_pid);
     if (!p) return -ESRCH;
-    /* 0xFFFFFFFF = "leave alone".  v0.8 verifies p->cred.euid == 0
-     * (or that the new values match current ones) before applying;
-     * v0.7 is single-user-root so every call succeeds. */
-    if (ruid_new != 0xFFFFFFFFu) p->cred.ruid = (uid_t)ruid_new;
-    if (euid_new != 0xFFFFFFFFu) p->cred.euid = (uid_t)euid_new;
-    if (suid_new != 0xFFFFFFFFu) p->cred.suid = (uid_t)suid_new;
-    if (rgid_new != 0xFFFFFFFFu) p->cred.rgid = (gid_t)rgid_new;
-    if (egid_new != 0xFFFFFFFFu) p->cred.egid = (gid_t)egid_new;
-    if (sgid_new != 0xFFFFFFFFu) p->cred.sgid = (gid_t)sgid_new;
+
+    /* Privilege gate (the v0.8 promise) -- OS-independent policy shared with
+     * NQ via libtaskman: a non-root euid may only set ids it already holds,
+     * so it cannot setuid(0).  Benign while all-root; load-bearing once login
+     * drops privileges. */
+    if (!tm_cred_change_permitted(&p->cred, ruid_new, euid_new, suid_new,
+                                  rgid_new, egid_new, sgid_new))
+        return -EPERM;
+
+    if (ruid_new != CRED_KEEP) p->cred.ruid = (uid_t)ruid_new;
+    if (euid_new != CRED_KEEP) p->cred.euid = (uid_t)euid_new;
+    if (suid_new != CRED_KEEP) p->cred.suid = (uid_t)suid_new;
+    if (rgid_new != CRED_KEEP) p->cred.rgid = (gid_t)rgid_new;
+    if (egid_new != CRED_KEEP) p->cred.egid = (gid_t)egid_new;
+    if (sgid_new != CRED_KEEP) p->cred.sgid = (gid_t)sgid_new;
     return 0;
 }
 

@@ -154,6 +154,22 @@ int open(const char *path, int flags, ...)
     seL4_Word err = seL4_MessageInfo_get_label(reply);
     if (err != 0) { qsoe_errno = (int)err; return -1; }
 
+    /* If taskman followed a cross-fs symlink (/etc -> /usr/conf etc.) it
+     * returned the rewritten path in msg[4..] with mr2 = its length.
+     * Capture it NOW, before any further IPC reuses the buffer; this is the
+     * path the external resmgr must see on _IO_CONNECT (it keys on the path
+     * string).  No rewrite (mr2 == 0) -> use the canonical path we sent. */
+    char     conn_path[128];
+    unsigned conn_len;
+    if (mr2 > 0 && (unsigned)mr2 < sizeof conn_path) {
+        const unsigned char *rs = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+        conn_len = (unsigned)mr2;
+        for (unsigned i = 0; i < conn_len; ++i) conn_path[i] = (char)rs[i];
+    } else {
+        conn_len = alen;
+        for (unsigned i = 0; i < alen; ++i) conn_path[i] = abs[i];
+    }
+
     seL4_CPtr cap_slot = (seL4_CPtr)mr0;
     int fd = qsoe_state_alloc_coid(0);
     if (fd < 0) { qsoe_errno = ENOMEM; return -1; }
@@ -169,14 +185,14 @@ int open(const char *path, int flags, ...)
         unsigned char cbuf[sizeof(tm_req_io_connect_t) + 128];
         tm_req_io_connect_t *cc = (tm_req_io_connect_t *)cbuf;
         cc->type        = _IO_CONNECT;
-        cc->plen        = alen;
+        cc->plen        = conn_len;
         cc->flags       = (unsigned long)flags;
         cc->mode        = 0;
         cc->_reserved[0] = 0;
-        for (unsigned i = 0; i < alen; ++i)
-            cbuf[sizeof(tm_req_io_connect_t) + i] = (unsigned char)abs[i];
+        for (unsigned i = 0; i < conn_len; ++i)
+            cbuf[sizeof(tm_req_io_connect_t) + i] = (unsigned char)conn_path[i];
         int st = MsgSend(fd, cbuf,
-                         (int)(sizeof(tm_req_io_connect_t) + alen), 0, 0);
+                         (int)(sizeof(tm_req_io_connect_t) + conn_len), 0, 0);
         if (st != 0) {              /* acquire() rejected the open */
             close(fd);
             qsoe_errno = st;

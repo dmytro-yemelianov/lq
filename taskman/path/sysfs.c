@@ -43,7 +43,10 @@ void tm_sysfs_populate(void)
     if (tm_syscfg_find(TM_SYSCFG_TAG_CMDLINE, &cmdline, &clen) != 0)
         cmdline = 0;
 
-    tm_sysfs_init((const char *)board, (const char *)cmdline,
+    /* OS identity at /sys/osname.  QSOE/L == "Liedtke" (the seL4 kernel);
+     * see the naming convention.  Read by getty's banner / uname(1) instead
+     * of hardcoding the name. */
+    tm_sysfs_init("QSOE/L", (const char *)board, (const char *)cmdline,
                   QSOE_VERSION_STRING, QSOE_BUILD_DATE);
 }
 

@@ -28,9 +28,12 @@ LIBC := ../../libc
 SEAM := $(CURDIR)
 O    := $(CURDIR)/../build/libc
 
-# seL4 kernel runs on rv64imac, soft-float lp64 ABI, medany code model;
-# the libc body must be built with the same arch/ABI as the rest of LQ.
-ARCHFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
+# Userland uses the hard-float ABI (lp64d) with F/D so libc.so uses the
+# hardware FPU.  seL4 saves per-thread FP context (KernelHaveFPU, ON by
+# default for RISC-V), so U-mode FP is safe.  The seL4 kernel itself stays
+# integer-only lp64 (its own build).  Must match quser/common.mk + the
+# NQ libc ABI, since quser binaries are shared between both systems.
+ARCHFLAGS := -march=rv64imafdc_zicsr_zifencei -mabi=lp64d -mcmodel=medany
 
 # Seam sources:
 #   * Top-level lq/libc/*.c -- POSIX entry points (open/close/read/...).

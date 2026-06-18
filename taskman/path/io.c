@@ -10,6 +10,7 @@
 #include "path.h"
 #include "pathmgr.h"
 #include "cpiofs.h"
+#include <tm_cpio.h>
 #include "pmdir.h"
 #include "sysfs.h"
 #include "procfs.h"
@@ -24,9 +25,10 @@
  * mints a badged Send-cap into the caller's CSpace, attaches per-fd
  * state where the handler needs it (cpiofs stashes data+size). */
 int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot,
-               int *out_is_external)
+               int *out_is_external, unsigned *out_rwlen)
 {
     if (out_is_external) *out_is_external = 0;
+    if (out_rwlen) *out_rwlen = 0;
     if (path_len == 0 || path_len >= 128) return -EINVAL;
 
     static char s_open_path[128];
@@ -34,9 +36,30 @@ int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot,
     for (unsigned i = 0; i < path_len; ++i) s_open_path[i] = (char)src[i];
     s_open_path[path_len] = 0;
 
+    /* Expand a leading cross-fs symlink (/etc -> /usr/conf, /home ->
+     * /usr/home) so the resolve lands on the right server AND the external
+     * resmgr (fs-qrv) receives the rewritten path on the _IO_CONNECT libc
+     * sends next: the server keys on the path string, so it must see
+     * /usr/conf/passwd, not /etc/passwd.  One level only. */
+    static char s_eff[128];
+    const char *eff = s_open_path;
+    /* First the in-memory tree (virtual links like /dev/tty), then the
+     * cpio (real link inodes /etc -> /usr/conf, /home -> /usr/home). */
+    if (tm_pathmgr_expand_symlink(s_open_path, s_eff, sizeof s_eff) == 1) {
+        eff = s_eff;
+    } else {
+        const void   *cpio = 0;
+        unsigned long clen = 0;
+        tm_cpiofs_get_cpio(&cpio, &clen);
+        if (tm_pathmgr_expand_symlink_cpio((const uint8_t *)cpio, clen,
+                                           s_open_path, s_eff,
+                                           sizeof s_eff) == 1)
+            eff = s_eff;
+    }
+
     tm_pathmgr_obj_t obj;
     unsigned consumed = 0;
-    int rc = tm_pathmgr_resolve(s_open_path, &obj, &consumed);
+    int rc = tm_pathmgr_resolve(eff, &obj, &consumed);
     if (rc) return rc;
 
     /* ConnectAttach mints a badged Send cap on (server_pid, server_chid). */
@@ -50,6 +73,15 @@ int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot,
      * libc so it sends _IO_CONNECT on the fd before the first read. */
     if (out_is_external)
         *out_is_external = (obj.handler_kind == PATHMGR_HANDLER_EXTERNAL);
+
+    /* If a symlink fired, return the rewritten path to libc (in the reply's
+     * msg[4..]); libc uses it as the _IO_CONNECT path to the resmgr. */
+    if (eff != s_open_path && out_rwlen) {
+        unsigned elen = 0; while (eff[elen]) ++elen;
+        unsigned char *rdst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+        for (unsigned i = 0; i < elen; ++i) rdst[i] = (unsigned char)eff[i];
+        *out_rwlen = elen;
+    }
 
     /* Per-fd state for cpiofs: stash (data, size) of the resolved
      * file so subsequent IO_READ can resume from the right offset. */
@@ -288,40 +320,55 @@ int tm_fstat(pid_t caller, seL4_Word badge, unsigned *out_bytes)
     return -ENOSYS;
 }
 
-/* READLINK: resolve via pathmgr.  QSOE v0.7 has no symbolic links,
- * so any path that resolves successfully isn't a symlink and the
- * POSIX-correct answer is EINVAL.  Misses fall out as ENOENT.
- * cpiofs is the only resmgr that owns actual paths today; its
- * probe distinguishes ENOENT from "exists but not a symlink". */
+/* READLINK: symlinks live in the boot cpio -- the cross-fs mount links
+ * (/etc -> /usr/conf, /home -> /usr/home) and bin/sh -> qsh.  Look the
+ * entry up WITHOUT following it (the shared find_file is exact-match, not
+ * resolve): a symlink replies its target, a non-symlink EINVAL, a miss
+ * ENOENT.  The pathmgr tree carries no symlink for these now -- the cpio
+ * inode is the single source of truth. */
+#define TM_READLINK_PATH_MAX 128   /* path + target reply buffer cap (bytes) */
 int tm_readlink(pid_t caller, unsigned path_len, unsigned *out_bytes)
 {
     (void)caller;
     *out_bytes = 0;
-    if (path_len == 0 || path_len >= 128) return -EINVAL;
+    if (path_len == 0 || path_len >= TM_READLINK_PATH_MAX) return -EINVAL;
 
-    static char s_path[128];
-    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+    /* Pure-payload frame: the path argument rides contiguously right after
+     * the header word, i.e. at reply/request word 1 (msg[1..]).  The
+     * dispatcher mirrored MR0..3 into msg[0..3] on entry, so msg[1..] is
+     * the full path even for the part that arrived in registers. */
+    static char s_path[TM_READLINK_PATH_MAX];
+    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[1];
     for (unsigned i = 0; i < path_len; ++i) s_path[i] = (char)src[i];
     s_path[path_len] = 0;
 
-    tm_pathmgr_obj_t obj;
-    unsigned consumed = 0;
-    int rc = tm_pathmgr_resolve(s_path, &obj, &consumed);
-    if (rc) return rc;
+    const void   *cpio = 0;
+    unsigned long clen = 0;
+    tm_cpiofs_get_cpio(&cpio, &clen);
+    if (!cpio || clen == 0) return -ENOENT;
 
-    if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CPIOFS) {
-        const char *name = s_path + consumed;
-        while (*name == '/') ++name;
-        if (*name == 0) return -EINVAL;   /* "/" is a dir, not a link */
-        if (tm_cpiofs_probe(name) != 0) return -ENOENT;
-        return -EINVAL;                    /* exists but not a symlink */
-    }
-    if (obj.handler_kind == PATHMGR_HANDLER_TASKMAN_CONSOLE ||
-        obj.handler_kind == PATHMGR_HANDLER_TASKMAN_NULL ||
-        obj.handler_kind == PATHMGR_HANDLER_TASKMAN_ZERO) {
-        return -EINVAL;                    /* device nodes aren't symlinks */
-    }
-    return -EINVAL;
+    /* cpio names are slash-free at the root ("etc", not "/etc"); a caller
+     * may pass "//etc" (ls joins "/" + "etc"), so skip ALL leading slashes. */
+    const char *name = s_path;
+    while (*name == '/') ++name;
+    if (*name == 0) return -EINVAL;          /* "/" is a dir, not a link */
+
+    tm_cpio_file_info_t info;
+    if (!tm_cpio_find_file((const uint8_t *)cpio, clen, name, &info))
+        return -ENOENT;
+    if ((info.mode & TM_CPIO_S_IFMT) != TM_CPIO_S_IFLNK)
+        return -EINVAL;                      /* exists but not a symlink */
+
+    /* Target = the entry data (filesize bytes, no NUL in the archive).
+     * Write it at reply word 1 (msg[1..]) so the reply is contiguous --
+     * length at word 0, target from word 1.  The READLINK dispatch case
+     * lifts msg[1..3] into the reply's MR1..3. */
+    unsigned tlen = info.filesize;
+    if (tlen >= TM_READLINK_PATH_MAX) tlen = TM_READLINK_PATH_MAX - 1;
+    unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[1];
+    for (unsigned i = 0; i < tlen; ++i) dst[i] = info.data[i];
+    *out_bytes = tlen;
+    return 0;
 }
 
 /* LSEEK: route by badge → channel → resmgr.  cpiofs holds the

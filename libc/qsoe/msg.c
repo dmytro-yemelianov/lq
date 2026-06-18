@@ -292,6 +292,103 @@ int MsgSend(int coid, const void *smsg, int sbytes,
     return status;
 }
 
+/* ---- MsgSendv / MsgSendvnc -- the vector (scatter/gather) forms ---------
+ *
+ * Skimmer (NQ) backs MsgSendv with an in-kernel sys_msg_sendv -- its
+ * byte-copy IPC scatter-gathers IOVs in the kernel.  seL4 has no such
+ * primitive (fixed message registers), but MsgSend already linearizes
+ * every message through pack_bytes/unpack_bytes over the flat IPC buffer.
+ * So a vector send is simply: GATHER the send IOVs into one contiguous
+ * request image (word 0 = type -> seL4 label, the rest -> message regs),
+ * one qsoe_sys_call, then SCATTER the pure-payload reply words back into
+ * the recv IOVs.  This makes LQ's transport API a superset-match of NQ's,
+ * which QNX userland needs (MsgSendv is a core QNX call).
+ *
+ * Inline frames only (gathered request / reply <= QSOE_MSG_MAX_BYTES);
+ * a larger vector transfer returns -E2BIG (use MsgSend's single-buffer
+ * bulk path for those).  The core returns the reply status (>=0) or a
+ * negative errno -- the _r convention; the public wrappers map negatives
+ * to errno + (-1), matching NQ. */
+static long msg_sendv_core(int coid, const iov_t *siov, size_t sparts,
+                           iov_t *riov, size_t rparts)
+{
+    seL4_CPtr send = qsoe_state_coid_to_slot(coid);
+    if (!send) return -EBADF;
+
+    /* Gather sends into one contiguous request image. */
+    unsigned long sbuf[QSOE_MSG_MAX_BYTES / sizeof(unsigned long)];
+    unsigned char *sb = (unsigned char *)sbuf;
+    unsigned slen = 0;
+    for (size_t i = 0; i < sparts; ++i) {
+        const unsigned char *s = siov[i].iov_base;
+        unsigned n = (unsigned)siov[i].iov_len;
+        if (slen + n > sizeof sbuf) return -E2BIG;
+        for (unsigned k = 0; k < n; ++k) sb[slen + k] = s[k];
+        slen += n;
+    }
+    if (slen < sizeof(unsigned long)) return -EINVAL;   /* need the type word */
+
+    /* Word 0 = type -> label; the remainder = body -> message registers. */
+    unsigned label  = (unsigned)sbuf[0];
+    unsigned nwords = pack_bytes(sb + sizeof(unsigned long),
+                                 slen - (unsigned)sizeof(unsigned long));
+
+    seL4_Word mr0 = qsoe_ipcbuf->msg[0];
+    seL4_Word mr1 = qsoe_ipcbuf->msg[1];
+    seL4_Word mr2 = qsoe_ipcbuf->msg[2];
+    seL4_Word mr3 = qsoe_ipcbuf->msg[3];
+    seL4_MessageInfo_t tag = seL4_MessageInfo_new(label, 0, 0, nwords);
+    seL4_MessageInfo_t reply = qsoe_sys_call(send, tag, &mr0, &mr1, &mr2, &mr3);
+
+    int status = (int)seL4_MessageInfo_get_label(reply);
+    qsoe_ipcbuf->msg[0] = mr0;
+    qsoe_ipcbuf->msg[1] = mr1;
+    qsoe_ipcbuf->msg[2] = mr2;
+    qsoe_ipcbuf->msg[3] = mr3;
+
+    /* Scatter the reply (pure payload, contiguous from word 0) into riov. */
+    unsigned avail = (unsigned)seL4_MessageInfo_get_length(reply)
+                     * (unsigned)sizeof(unsigned long);
+    if (avail > QSOE_MSG_MAX_BYTES) avail = QSOE_MSG_MAX_BYTES;
+    const unsigned char *r = (const unsigned char *)qsoe_ipcbuf->msg;
+    unsigned off = 0;
+    for (size_t i = 0; i < rparts; ++i) {
+        unsigned char *d = riov[i].iov_base;
+        unsigned n = (unsigned)riov[i].iov_len;
+        for (unsigned k = 0; k < n && off < avail; ++k) d[k] = r[off++];
+    }
+    return status;
+}
+
+long MsgSendv_r(int coid, const iov_t *siov, size_t sparts,
+                iov_t *riov, size_t rparts)
+{
+    return msg_sendv_core(coid, siov, sparts, riov, rparts);
+}
+
+long MsgSendv(int coid, const iov_t *siov, size_t sparts,
+              iov_t *riov, size_t rparts)
+{
+    qsoe_cancel_point();
+    long r = msg_sendv_core(coid, siov, sparts, riov, rparts);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
+    return r;
+}
+
+long MsgSendvnc_r(int coid, const iov_t *siov, size_t sparts,
+                  iov_t *riov, size_t rparts)
+{
+    return msg_sendv_core(coid, siov, sparts, riov, rparts);
+}
+
+long MsgSendvnc(int coid, const iov_t *siov, size_t sparts,
+                iov_t *riov, size_t rparts)
+{
+    long r = msg_sendv_core(coid, siov, sparts, riov, rparts);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
+    return r;
+}
+
 int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
 {
     qsoe_cancel_point();

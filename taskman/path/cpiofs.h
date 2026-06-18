@@ -22,6 +22,9 @@
 /* Boot-time setup: hand cpiofs the embedded CPIO blob. */
 void tm_cpiofs_set_cpio(const void *start, unsigned long len);
 
+/* Read back the raw CPIO blob (for the shared libtaskman readers). */
+void tm_cpiofs_get_cpio(const void **start, unsigned long *len);
+
 /* Look up `name` in the CPIO archive with one level of symlink
  * resolution.  `name` is unprefixed (e.g. "bin/sh", not "/bin/sh").
  * If the entry is a symlink (S_IFLNK mode), its target is resolved

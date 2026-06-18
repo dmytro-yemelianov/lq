@@ -25,7 +25,7 @@
  * the IPC buffer's msg[4]; path_len in mr0.  Returns 0 + writes
  * the caller-side connection slot into *out_slot. */
 int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot,
-               int *out_is_external);
+               int *out_is_external, unsigned *out_rwlen);
 
 /* CLOSE: tear down `caller`'s connection at the given slot. */
 /* Resmgr-side close notification.  Dispatches by badge to the

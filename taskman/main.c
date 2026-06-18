@@ -95,9 +95,18 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
             seL4_Word *out_mr2, seL4_Word *out_mr3,
             int *out_no_reply)
 {
-    (void)mr3;
     pid_t caller = (pid_t)badge;
     unsigned label = (unsigned)seL4_MessageInfo_get_label(info);
+    /* Mirror the request's first four message registers into the IPC
+     * buffer so a handler can read the whole request contiguously from
+     * msg[0..] (words 0-3 here, words 4+ already in the buffer).  Existing
+     * handlers that read mr0..mr3 as parameters are unaffected -- this is
+     * purely additive, and it lets pure-payload handlers (e.g. readlink)
+     * receive a variable-length argument right after the header word. */
+    qsoe_ipcbuf->msg[0] = mr0;
+    qsoe_ipcbuf->msg[1] = mr1;
+    qsoe_ipcbuf->msg[2] = mr2;
+    qsoe_ipcbuf->msg[3] = mr3;
     /* --debug=4 (TRACE): one short line per incoming message so an operator
      * can see how IPC-heavy an operation is, e.g. "tm_msg 0x302". */
     tm_trace("tm_msg 0x%x\n", label);
@@ -737,7 +746,7 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
          *   mr3 = egid    | (sgid << 32)
          */
         pid_t pid = 0, ppid = 0;
-        tm_cred_t cred;
+        struct _cred_info cred;
         int rc = tm_proc_self_info(caller, &pid, &ppid, &cred);
         if (rc) { err = (seL4_Word)(-rc); break; }
         *out_mr0 = ((seL4_Word)(uint32_t)pid)  | ((seL4_Word)(uint32_t)ppid      << 32);
@@ -820,11 +829,15 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
     case TM_REQ_OPEN: {
         seL4_CPtr slot = 0;
         int is_external = 0;
-        int rc = tm_io_open(caller, (unsigned)mr0, &slot, &is_external);
+        unsigned rwlen = 0;
+        int rc = tm_io_open(caller, (unsigned)mr0, &slot, &is_external, &rwlen);
         if (rc) { err = (seL4_Word)(-rc); break; }
         *out_mr0 = slot;
         *out_mr1 = (seL4_Word)is_external;   /* libc sends _IO_CONNECT if set */
-        reply_len = 2;
+        *out_mr2 = (seL4_Word)rwlen;         /* symlink-rewritten path len, 0 = unchanged */
+        /* When a symlink rewrote the path, it sits in msg[4..]; the reply
+         * must cover those words (the +4 accounts for the register MRs). */
+        reply_len = (rwlen > 0) ? (4 + (rwlen + 7) / 8) : 3;
         break;
     }
     case TM_REQ_CLOSE: {
@@ -874,8 +887,15 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         unsigned bytes = 0;
         int rc = tm_readlink(caller, (unsigned)mr0, &bytes);
         if (rc) { err = (seL4_Word)(-rc); break; }
-        *out_mr0 = (seL4_Word)bytes;
-        reply_len = 4 + (bytes + 7) / 8;
+        /* Pure-payload reply: length @ word0, target @ word1.. (tm_readlink
+         * wrote the target to msg[1..]).  Lift words 1..3 into MR1..3 so
+         * the client sees [length, target] contiguous from word 0; any tail
+         * past word 3 is already in msg[4..]. */
+        *out_mr0  = (seL4_Word)bytes;
+        *out_mr1  = qsoe_ipcbuf->msg[1];
+        *out_mr2  = qsoe_ipcbuf->msg[2];
+        *out_mr3  = qsoe_ipcbuf->msg[3];
+        reply_len = 1 + (bytes + 7) / 8;
         break;
     }
     case TM_REQ_LSEEK: {
@@ -1250,6 +1270,15 @@ int main(seL4_BootInfo *bi)
     if (tm_pathmgr_symlink("/dev/tty", "/dev/console") != 0) {
         tm_crash("pathmgr symlink /dev/tty failed");
     }
+
+    /* Cross-fs config/home links (/etc -> /usr/conf, /home -> /usr/home)
+     * are NOT registered here -- they are real symlink inodes in the boot
+     * cpio (declared via `ln -sf` in the modpkg recipe), so they appear in
+     * `ls -la /` and readlink/lstat work directly.  Resolution follows
+     * them at open time via tm_pathmgr_expand_symlink_cpio (path/io.c).
+     * The cpio is the single source of truth -- no in-memory node, so no
+     * duplicate entry in the readdir merge. */
+
     /* /dev/null and /dev/zero — POSIX-essential pseudo-devices,
      * each backed by a trivial taskman-internal resmgr (sys/devnull.c
      * and sys/devzero.c).  Different chids so path/io.c dispatch

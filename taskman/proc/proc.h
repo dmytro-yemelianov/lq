@@ -108,13 +108,10 @@ enum {
 #define TM_FAULT_PID_MASK     (TM_FAULT_BADGE_FLAG - 1)
 #define TM_SIG_SEGV           11
 
-/* Per-process credentials (v0.7).  Same six fields as QNX/QRV's
- * _cred_info — ruid/euid/suid + rgid/egid/sgid.  Inherited from
- * parent at posix_spawn; pid 1 (taskman) starts as root (all zero). */
-typedef struct {
-    uid_t ruid, euid, suid;
-    gid_t rgid, egid, sgid;
-} tm_cred_t;
+/* Per-process credentials use the canonical shared `struct _cred_info`
+ * (<sys/qsoe.h>) -- the SAME type NQ + libtaskman use, so there is one
+ * cred shape across both kernels.  (Was a private LQ `tm_cred_t` with an
+ * identical first six fields; unified 2026-06-18.) */
 
 /* Scheduling (v0.13).  QSOE adopts the QNX priority model verbatim:
  * priorities 0..255, higher number = higher priority, 0 reserved for the
@@ -257,7 +254,7 @@ typedef struct {
 
     /* v0.7 cred — inherited from parent at spawn, settable via
      * setuid/setgid later. */
-    tm_cred_t cred;
+    struct _cred_info cred;
 
     /* v0.7 current working directory.  Stored as an absolute path,
      * NUL-terminated; "/" for the freshly-spawned init and inherited
@@ -542,7 +539,7 @@ long          tm_msg_xfer_push(pid_t server_pid, pid_t client_pid,
 /* v0.7 cred + ppid query — backs POSIX getpid/getppid/getuid/etc. */
 int           tm_proc_self_info(pid_t caller_pid,
                                  pid_t *out_pid, pid_t *out_ppid,
-                                 tm_cred_t *out_cred);
+                                 struct _cred_info *out_cred);
 
 /* v0.7 cwd accessors.  path bytes for chdir come in via msg[4..]
  * (length in path_len); getcwd writes the cwd into msg[4..] and

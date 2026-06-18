@@ -493,7 +493,7 @@ $(RTLD_SO):
 	    O=$(RTLD_BUILD) \
 	    LIBC_INC=$(LIBC_INCLUDE) \
 	    EXTRA_CPPFLAGS=-DQSOE_KERNEL_SEL4 \
-	    ARCHFLAGS="-march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany" \
+	    ARCHFLAGS="-march=rv64imafdc_zicsr_zifencei -mabi=lp64d -mcmodel=medany" \
 	    all
 
 libtaskman: $(LIBTASKMAN_A)

@@ -22,6 +22,16 @@ void tm_cpiofs_set_cpio(const void *start, unsigned long len)
     s_cpio_len   = len;
 }
 
+/* Expose the raw CPIO blob so the shared libtaskman readers
+ * (tm_cpio_find_file / tm_pathmgr_expand_symlink_cpio) can run over the
+ * same bytes -- used by readlink and the open-time symlink expansion. */
+void tm_cpiofs_get_cpio(const void **start, unsigned long *len);
+void tm_cpiofs_get_cpio(const void **start, unsigned long *len)
+{
+    if (start) *start = s_cpio_start;
+    if (len)   *len   = s_cpio_len;
+}
+
 /* Walk the CPIO manually, looking for `name`.  On match, returns the
  * entry's data pointer, file size, and POSIX mode.  Returns -1 if not
  * found.  We need this (instead of relying on cpio_get_file) because

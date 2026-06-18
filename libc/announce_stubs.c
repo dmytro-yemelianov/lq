@@ -16,8 +16,10 @@
  *
  * Not stubbed here (intentionally):
  *   - main          : the user image's entry; comes from qsh.
- *   - __environ     : data; defined as a NULL pointer alongside the
- *                     announcing function stubs below.
+ *   - __environ     : now real in the shared libc (libc/qsoe/environ.c),
+ *                     with environ weak-aliased to it.
+ *   - tolower & the ctype family : now real in the shared libc
+ *                     (libc/ctype/ctype.c).
  *
  * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qsoe.net>
  * SPDX-License-Identifier: Apache-2.0
@@ -44,22 +46,15 @@ extern int *__errno_location(void);
     }                                                                      \
 } while (0)
 
-/* --- envp pointer -- libc body references this from getenv(),
- *     exec*(), etc.  Defined as NULL so empty-environment behaviour
- *     is correct; the dyn-link path doesn't fill it yet. */
-char **__environ = 0;
+/* __environ now lives in the shared libc (libc/qsoe/environ.c), which
+ * defines it as a valid empty environment and weak-aliases `environ` to
+ * it; defining it here too would multiply-define the symbol. */
 
 /* --- POSIX file-descriptor + tty stubs ----------------------------- */
 
 /* ioctl() lives in the shared libc body (libc/qsoe/ioctl.c) --
- * termios fake-success + announcing fallthrough for both kernels. */
-
-int tcdrain(int fd)
-{
-    ANNOUNCE_ONCE("tcdrain", "0 (no-op)");
-    (void)fd;
-    return 0;
-}
+ * termios fake-success + announcing fallthrough for both kernels.
+ * tcdrain() is now real in the shared libc (libc/1/tcdrain.c). */
 
 /* --- process / signal stubs ---------------------------------------- */
 
@@ -76,84 +71,16 @@ int execve(const char *path, char *const argv[], char *const envp[])
 
 /* --- stdio variants ------------------------------------------------ */
 
-int dprintf(int fd, const char *fmt, ...)
-{
-    ANNOUNCE_ONCE("dprintf", "vfprintf-via-stderr");
-    /* Best-effort: route through stderr so output isn't lost.  Real
-     * dprintf would write to fd directly. */
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    (void)fd;
-    return n;
-}
+/* dprintf() / vdprintf() are now real in the shared libc
+ * (libc/stdio/dprintf.c) -- they write straight to the fd.
+ * vsprintf() likewise became real + shared (libc/stdio/vsprintf.c);
+ * leaving it LQ-only here left NQ's crypt() calling a NULL vsprintf. */
 
-int vsprintf(char *str, const char *fmt, va_list ap)
-{
-    ANNOUNCE_ONCE("vsprintf", "via vsnprintf(8KiB cap)");
-    /* No real buffer-size bound at this API; cap at 8 KiB and hope
-     * the caller doesn't blow it.  Real vsprintf would inherit the
-     * caller's stack. */
-    return vsnprintf(str, 8192, fmt, ap);
-}
-
-/* --- wide-char / ctype stubs --------------------------------------- */
-
-int tolower(int c)
-{
-    ANNOUNCE_ONCE("tolower", "ASCII fold");
-    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
-    return c;
-}
-
-wint_t towlower(wint_t wc)
-{
-    ANNOUNCE_ONCE("towlower", "ASCII fold (BMP-only)");
-    if (wc >= L'A' && wc <= L'Z') return wc + (L'a' - L'A');
-    return wc;
-}
-
-wint_t towupper(wint_t wc)
-{
-    ANNOUNCE_ONCE("towupper", "ASCII fold (BMP-only)");
-    if (wc >= L'a' && wc <= L'z') return wc - (L'a' - L'A');
-    return wc;
-}
-
-int iswctype(wint_t wc, wctype_t desc)
-{
-    ANNOUNCE_ONCE("iswctype", "0 (no classification)");
-    (void)wc; (void)desc;
-    return 0;
-}
-
-wctype_t wctype(const char *name)
-{
-    ANNOUNCE_ONCE("wctype", "0 (no class)");
-    (void)name;
-    return 0;
-}
-
-int mbtowc(wchar_t *pwc, const char *s, size_t n)
-{
-    ANNOUNCE_ONCE("mbtowc", "ASCII pass-through");
-    (void)n;
-    if (!s) return 0;
-    if (pwc) *pwc = (wchar_t)(unsigned char)*s;
-    return *s ? 1 : 0;
-}
-
-/* --- locale -------------------------------------------------------- */
-
-#include <locale.h>
-
-char *__nl_langinfo_l(int item, locale_t loc)
-{
-    ANNOUNCE_ONCE("__nl_langinfo_l", "\"\" (empty)");
-    (void)item; (void)loc;
-    return (char *)"";
-}
+/* tolower / the byte ctype family, the wide-char family (towlower,
+ * towupper, iswctype, wctype) and mbtowc are now REAL in the shared libc:
+ * libc/ctype/ (musl Unicode classification + case) and libc/multibyte/
+ * (UTF-8).  __nl_langinfo_l is real in libc/qsoe/nl_langinfo.c (C/English
+ * locale).  All formerly stubbed here. */
 
 /* --- Sync* reentrant variants -------------------------------------- */
 /* The non-_r versions exist in libc.so; some _r reentrant variants
