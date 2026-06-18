@@ -551,4 +551,18 @@ qsoe_riscv_asidpool_assign(seL4_CPtr asid_pool, seL4_CPtr vspace)
  */
 #define TM_REQ_DUP_CAP  (TM_REQ_VARIANT_BASE + 0u)  /* LQ variant op 0 */
 
+/*
+ * LQ-private wire opcode: push a thread's short name into taskman's
+ * g_threads table so ps(1) -H can label it.  On NQ the kernel TCB holds
+ * the name (SYS_THREAD_CTL) and sysinfo reads it back, so NQ needs no
+ * such message; on LQ taskman owns the ps thread table and can't see
+ * libc's process-local ThreadCtl(TCTL_NAME) write -- this opcode is the
+ * bridge.  Lives in the variant-private space (>= TM_REQ_VARIANT_BASE).
+ *
+ * Wire: MR0 = tid (caller's pid comes from the connection badge); the
+ * NUL-terminated name (<= QSOE thread-name cap) is packed little-endian
+ * into MR1..MR2.  No reply payload; the label carries the status.
+ */
+#define TM_REQ_THREAD_SETNAME  (TM_REQ_VARIANT_BASE + 4u)  /* LQ variant op 4 */
+
 #endif /* QSOE_INVOKE_H */

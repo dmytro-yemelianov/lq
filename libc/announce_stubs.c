@@ -46,16 +46,6 @@ extern int *__errno_location(void);
     }                                                                      \
 } while (0)
 
-/* __environ now lives in the shared libc (libc/qsoe/environ.c), which
- * defines it as a valid empty environment and weak-aliases `environ` to
- * it; defining it here too would multiply-define the symbol. */
-
-/* --- POSIX file-descriptor + tty stubs ----------------------------- */
-
-/* ioctl() lives in the shared libc body (libc/qsoe/ioctl.c) --
- * termios fake-success + announcing fallthrough for both kernels.
- * tcdrain() is now real in the shared libc (libc/1/tcdrain.c). */
-
 /* --- process / signal stubs ---------------------------------------- */
 
 int execve(const char *path, char *const argv[], char *const envp[])
@@ -64,40 +54,4 @@ int execve(const char *path, char *const argv[], char *const envp[])
     (void)path; (void)argv; (void)envp;
     errno = ENOSYS;
     return -1;
-}
-
-/* raise() lives in the shared libc body (libc/qsoe/posix_stubs.c)
- * since 2026-06-05 -- one announcing stub for both kernels. */
-
-/* --- stdio variants ------------------------------------------------ */
-
-/* dprintf() / vdprintf() are now real in the shared libc
- * (libc/stdio/dprintf.c) -- they write straight to the fd.
- * vsprintf() likewise became real + shared (libc/stdio/vsprintf.c);
- * leaving it LQ-only here left NQ's crypt() calling a NULL vsprintf. */
-
-/* tolower / the byte ctype family, the wide-char family (towlower,
- * towupper, iswctype, wctype) and mbtowc are now REAL in the shared libc:
- * libc/ctype/ (musl Unicode classification + case) and libc/multibyte/
- * (UTF-8).  __nl_langinfo_l is real in libc/qsoe/nl_langinfo.c (C/English
- * locale).  All formerly stubbed here. */
-
-/* --- Sync* reentrant variants -------------------------------------- */
-/* The non-_r versions exist in libc.so; some _r reentrant variants
- * aren't wired yet.  Forward each to its non-reentrant counterpart and
- * announce.  Declarations come from <sys/qsoe.h> included at the top.
- * (SyncCondvarWait_r / SyncCondvarSignal_r are now real in qsoe/sync.c.) */
-
-long SyncDestroy_r(sync_t *s)
-{
-    ANNOUNCE_ONCE("SyncDestroy_r", "via SyncDestroy");
-    return SyncDestroy(s);
-}
-
-/* --- threads ------------------------------------------------------- */
-
-long ThreadDetach_r(int tid)
-{
-    ANNOUNCE_ONCE("ThreadDetach_r", "via ThreadDetach");
-    return ThreadDetach(tid);
 }

@@ -64,6 +64,12 @@ void qsoe_libc_init(void *ipcbuf, pid_t self_pid)
      * 0x1FE000 for every child, so we substitute that here). */
     if (!ipcbuf) ipcbuf = (void *)0x1FE000UL;
 
+    /* taskman starts the main thread with tp pointing at a freshly
+     * zeroed TCB page (spawn.c CHILD_TCB_BASE), not at the static
+     * qsoe_main_tcb -- so the live main TCB reads tid 0 until we stamp
+     * the convention here.  Without it pthread_self()->tid is 0 and
+     * ThreadCtl(TCTL_NAME) labels "tid 0" (taskman can't match it). */
+    qsoe_curthr()->tid      = 1;   /* main thread, by convention (see state.c) */
     qsoe_curthr()->ipcbuf   = ipcbuf;
     qsoe_curthr()->self_pid = self_pid;
     /* The main thread receives with the well-known reply object taskman

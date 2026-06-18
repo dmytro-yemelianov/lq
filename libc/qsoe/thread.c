@@ -23,6 +23,7 @@
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
 #include <qsoe/tm_msgs.h>
+#include <limits.h>     /* CHAR_BIT -- thread-name byte pack for taskman */
 #include "state.h"
 
 #include "sel4_types.h"
@@ -190,16 +191,27 @@ int ThreadDestroy(int tid, int priority, void *status)
     return 0;
 }
 
-int ThreadDetach(int tid)
+/* Reentrant core: 0 on success, NEGATIVE errno on failure -- never touch
+ * qsoe_errno.  pthread_detach (shared libc) calls this and maps the rc to
+ * its POSIX return; ThreadDetach() below is the errno-setting wrapper.
+ * Matches NQ's ThreadDetach_r so one pthread layer serves both kernels. */
+long ThreadDetach_r(int tid)
 {
     qsoe_tcb_t *t = (tid == 0) ? qsoe_curthr() : qsoe_tcb_of_tid(tid);
-    if (!t) { qsoe_errno = ESRCH; return -1; }
+    if (!t) return -ESRCH;
     t->detached = 1;
     /* If the thread has already exited, mark its slot reaped now —
      * nobody will Join. The seL4 TCB cap and frames stay until
      * process-level cleanup (v0.4.1+); the slot's vaddr range stays
      * claimed (monotonic allocator). */
     if (t->exited && t != &qsoe_main_tcb) t->reaped = 1;
+    return 0;
+}
+
+int ThreadDetach(int tid)
+{
+    long r = ThreadDetach_r(tid);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
     return 0;
 }
 
@@ -237,11 +249,32 @@ int ThreadCtl(int cmd, void *data)
     case QSOE_TCTL_NAME: {
         if (!data) { qsoe_errno = EINVAL; return -1; }
         const char *src = (const char *)data;
-        for (int i = 0; i < 15; ++i) {
-            t->name[i] = src[i];
-            if (!src[i]) { t->name[i+1] = 0; return 0; }
+        const unsigned cap = (unsigned)sizeof t->name;   /* incl. NUL */
+
+        /* Process-local copy: this is what pthread_getname_np() reads
+         * back.  Fully zeroed first so the bytes past the terminator are
+         * defined (they ride the wire below). */
+        for (unsigned i = 0; i < cap; ++i) t->name[i] = '\0';
+        for (unsigned i = 0; i < cap - 1 && src[i]; ++i) t->name[i] = src[i];
+
+        /* Propagate to taskman so ps(1) -H can label the thread: seL4
+         * has no place to store a useful name, and taskman can't observe
+         * this local write.  Pack the name little-endian into MR1..MR2
+         * (cap == 2 * one word; see the taskman-side static_assert) and
+         * fire the variant-private message.  Best-effort -- a thread
+         * taskman doesn't track (a process's main thread) just no-ops
+         * with ESRCH, which we ignore. */
+        seL4_Word mr0 = (seL4_Word)t->tid;
+        seL4_Word mr1 = 0, mr2 = 0, mr3 = 0;
+        for (unsigned b = 0; b < cap; ++b) {
+            seL4_Word *w = (b / sizeof(seL4_Word)) ? &mr2 : &mr1;
+            unsigned   bi = b % sizeof(seL4_Word);
+            *w |= (seL4_Word)(unsigned char)t->name[b] << (bi * CHAR_BIT);
         }
-        t->name[15] = 0;
+        seL4_MessageInfo_t tag =
+            seL4_MessageInfo_new(TM_REQ_THREAD_SETNAME, 0, 0, 3);
+        (void) qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
+                             &mr0, &mr1, &mr2, &mr3);
         return 0;
     }
     case QSOE_TCTL_RUNMASK: {

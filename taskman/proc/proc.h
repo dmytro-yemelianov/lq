@@ -151,6 +151,13 @@ enum {
  * (caller writes path/argv/envp into a mmap'd page; taskman reads
  * it via cap-copy + scratch-map at TM_REQ_SPAWN time).  `va_page`
  * is the start of the Mega_Page (2 MiB-aligned). */
+
+/* Per-thread name length for ps(1) -H rows (incl. NUL).  Matches the
+ * 16-char cap of libc's qsoe_tcb_t.name.  Declared up here because both
+ * tm_process_t (main-thread label) and tm_thread_t (worker labels) use
+ * it. */
+#define TM_THREAD_NAME_LEN  16
+
 typedef struct {
     unsigned long va_page;
     seL4_CPtr     frame;
@@ -279,6 +286,12 @@ typedef struct {
      * Captured at spawn from elf_name; NUL-terminated, truncated. */
     char      name[32];
 
+    /* ps(1) -H label for the main thread (tid 1).  The main thread lives
+     * here in the process record, not in g_threads, so it can't be tagged
+     * via tm_thread_find; ThreadCtl(TCTL_NAME) from the main thread lands
+     * here instead.  "" until set -> ps falls back to the process name. */
+    char      main_name[TM_THREAD_NAME_LEN];
+
     /* v0.10 per-process untyped blocks (see TM_PP_UT_* above).  Every
      * image frame / page table / mmap megapage is retyped from one of
      * these; on exit each is Revoked + returned to the reuse free-list,
@@ -299,10 +312,6 @@ typedef struct {
      * teardown once the TCB is gone. */
     seL4_CPtr fault_ep;
 } tm_process_t;
-
-/* Per-thread name length for ps(1) -H rows (incl. NUL).  Matches the
- * 16-char cap of libc's qsoe_tcb_t.name. */
-#define TM_THREAD_NAME_LEN  16
 
 typedef struct {
     int       in_use;

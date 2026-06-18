@@ -179,8 +179,10 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
  * seL4 binds at most one Notification per TCB, and the signal channel
  * is the first channel a process creates (in __qsoe_syschan_init, before
  * main), so the main TCB's current binding IS this channel's: unbind it
- * cleanly, then bind to the system thread.  Also tags the thread name so
- * ps(1) -H labels it. */
+ * cleanly, then bind to the system thread.  The "sigthread" ps(1) -H
+ * label is no longer set here: the system thread names itself through
+ * ThreadCtl(TCTL_NAME) -> TM_REQ_THREAD_SETNAME, the same path every
+ * other thread uses. */
 int tm_channel_bind_thread(pid_t owner_pid, int chid, int tid)
 {
     tm_process_t *owner = tm_process_lookup(owner_pid);
@@ -200,11 +202,6 @@ int tm_channel_bind_thread(pid_t owner_pid, int chid, int tid)
     if (qsoe_tcb_bind_notification(t->tcb_master, c->ntfn_master) != 0)
         return -EINVAL;
 
-    static const char sigthread_name[] = "sigthread";  /* ps(1) -H label */
-    unsigned i = 0;
-    for (; i < TM_THREAD_NAME_LEN - 1 && sigthread_name[i]; ++i)
-        t->name[i] = sigthread_name[i];
-    t->name[i] = '\0';
     return 0;
 }
 

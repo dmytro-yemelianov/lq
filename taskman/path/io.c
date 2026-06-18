@@ -231,7 +231,9 @@ int tm_unlink(pid_t caller, unsigned path_len)
     if (path_len == 0 || path_len >= 128) return -EINVAL;
 
     static char s_path[128];
-    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+    /* Contiguous frame (shared libc unlink via MsgSendv): the request is
+     * {type, plen} + path, so the path lands at msg[1] (plen is msg[0]). */
+    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[1];
     for (unsigned i = 0; i < path_len; ++i) s_path[i] = (char)src[i];
     s_path[path_len] = 0;
 
@@ -492,7 +494,10 @@ int tm_access(pid_t caller, unsigned path_len)
     if (path_len == 0 || path_len >= 128) return -EINVAL;
 
     static char s_path[128];
-    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[4];
+    /* Contiguous frame (shared libc access via MsgSendv): the request is
+     * {type, plen, mode} + path, so the path lands at msg[2] (plen=msg[0],
+     * mode=msg[1]). */
+    const unsigned char *src = (const unsigned char *)&qsoe_ipcbuf->msg[2];
     for (unsigned i = 0; i < path_len; ++i) s_path[i] = (char)src[i];
     s_path[path_len] = 0;
 

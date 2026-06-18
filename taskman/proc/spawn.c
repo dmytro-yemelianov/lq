@@ -1657,6 +1657,10 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             ++ni;
         }
         prec->name[ni] = '\0';
+        /* Main-thread ps(1) label starts empty (the main thread tags
+         * itself "main" via ThreadCtl at startup); clear it here so a
+         * reused process slot never shows a stale label. */
+        prec->main_name[0] = '\0';
     }
     /* Hand the dyn-link L1 PT to the worker-region allocator (same
      * L2[1] slot covers libc.so/rtld AND the worker region at 0x40000000). */

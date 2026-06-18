@@ -138,14 +138,19 @@ int ConnectClientInfo(int scoid, struct _client_info *info, int ngroups)
     return 0;
 }
 
-int ConnectFlags(pid_t pid, int coid, unsigned mask, unsigned bits)
+/* Reentrant core: return the connection's PRIOR flag word (>= 0) on
+ * success, or a NEGATIVE errno on failure -- never touch qsoe_errno.
+ * This is the contract the OS-independent fcntl() relies on for
+ * F_GETFD / F_SETFD; it matches NQ's ConnectFlags_r exactly so one fcntl
+ * body can serve both kernels.  ConnectFlags() below is the errno-setting
+ * wrapper. */
+long ConnectFlags_r(pid_t pid, int coid, unsigned mask, unsigned bits)
 {
-    if (!self_only(pid)) { qsoe_errno = ENOSYS; return -1; }
+    if (!self_only(pid)) return -ENOSYS;
 
     unsigned long slot = qsoe_state_coid_to_slot(coid);
-    if (slot == 0) { qsoe_errno = EBADF; return -1; }
+    if (slot == 0) return -EBADF;
 
-    unsigned old = 0;
     seL4_Word mr0 = (seL4_Word)slot;
     seL4_Word mr1 = (seL4_Word)mask;
     seL4_Word mr2 = (seL4_Word)bits;
@@ -155,7 +160,13 @@ int ConnectFlags(pid_t pid, int coid, unsigned mask, unsigned bits)
     seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
                                               &mr0, &mr1, &mr2, &mr3);
     seL4_Word err = seL4_MessageInfo_get_label(reply);
-    if (err != 0) { qsoe_errno = (int)err; return -1; }
-    old = (unsigned)mr0;
-    return (int)old;
+    if (err != 0) return -(long)err;
+    return (long)(unsigned)mr0;          /* prior flag word */
+}
+
+int ConnectFlags(pid_t pid, int coid, unsigned mask, unsigned bits)
+{
+    long r = ConnectFlags_r(pid, coid, mask, bits);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
+    return (int)r;
 }

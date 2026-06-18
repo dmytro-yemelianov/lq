@@ -82,6 +82,7 @@ int InterruptAttachThread(int vector, unsigned flags)
     /* The calling thread becomes the IST for this IRQ.  Subsequent
      * InterruptWait() blocks on the bound notification we just set up. */
     qsoe_curthr()->irq_iid = iid;
+    __qsoe_name_irq_thread(vector);   /* ps(1) -H label: "irq<N>" */
     return iid;
 }
 

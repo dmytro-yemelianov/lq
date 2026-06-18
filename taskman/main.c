@@ -41,14 +41,20 @@
 #include <qsoe/sysinfo.h>
 #include <qsoe/sys_version.h>
 #include <cpio.h>
+#include <limits.h>     /* CHAR_BIT, UCHAR_MAX -- thread-name byte unpack */
 
 /* LQ's variant-private wire opcodes must live in the variant space
  * (>= TM_REQ_VARIANT_BASE) so they can never collide with a shared
  * opcode -- see the rule in <qsoe/tm_msgs.h>. */
 _Static_assert(TM_REQ_DUP_CAP            >= TM_REQ_VARIANT_BASE &&
                TM_REQ_DETACH_CAP         >= TM_REQ_VARIANT_BASE &&
-               TM_REQ_CHANNEL_BIND_THREAD >= TM_REQ_VARIANT_BASE,
+               TM_REQ_CHANNEL_BIND_THREAD >= TM_REQ_VARIANT_BASE &&
+               TM_REQ_THREAD_SETNAME      >= TM_REQ_VARIANT_BASE,
                "LQ variant opcode defined below TM_REQ_VARIANT_BASE");
+
+/* TM_REQ_THREAD_SETNAME packs the whole thread name into MR1..MR2. */
+_Static_assert(TM_THREAD_NAME_LEN == 2 * sizeof(seL4_Word),
+               "thread name no longer packs into exactly MR1..MR2");
 
 #ifdef TM_USE_INITRD_LOADER
 /* Vestigial FDT-driven initrd loader.  See sys/initrd.c top-of-file
@@ -305,7 +311,8 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
                                   ? QSOE_TSTATE_DETACHED
                                   : QSOE_TSTATE_RUNNING;
                 si_emit_thread(dst, recsz, want, skip, &idx, &got,
-                               /*tid=*/1, (int)p->pid, pstate, p->name);
+                               /*tid=*/1, (int)p->pid, pstate,
+                               p->main_name[0] ? p->main_name : p->name);
                 /* Then this process's ThreadCreate'd threads. */
                 for (int j = 0; j < TM_MAX_THREADS; ++j) {
                     if (!threads[j].in_use || threads[j].pid != p->pid)
@@ -445,6 +452,40 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         }
         break;
     }
+    case TM_REQ_THREAD_SETNAME: {
+        /* Label a thread for ps(1) -H.  The caller's pid is the badge;
+         * MR0 selects the thread; MR1..MR2 carry the name packed
+         * little-endian.  Only threads taskman tracks live in
+         * g_threads -- a process's main thread is named after its binary
+         * and isn't here, so naming it is a benign no-op (ESRCH), which
+         * libc's best-effort ThreadCtl ignores. */
+        int       tid      = (int)mr0;
+        seL4_Word words[2] = { mr1, mr2 };
+        char nm[TM_THREAD_NAME_LEN];
+        for (unsigned i = 0; i < TM_THREAD_NAME_LEN; ++i) {
+            unsigned wi = i / sizeof(seL4_Word);   /* which MR holds byte i */
+            unsigned bi = i % sizeof(seL4_Word);   /* byte offset within it */
+            nm[i] = (char)((words[wi] >> (bi * CHAR_BIT)) & UCHAR_MAX);
+        }
+        nm[TM_THREAD_NAME_LEN - 1] = '\0';
+        tm_thread_t *t = tm_thread_find(caller, tid);
+        if (t) {
+            for (unsigned i = 0; i < TM_THREAD_NAME_LEN; ++i) t->name[i] = nm[i];
+            break;
+        }
+        /* The main thread (tid 1) lives in the process record, not in
+         * g_threads, so tag it there; ps(1) -H reads it for the main row. */
+        if (tid == 1) {
+            tm_process_t *p = tm_process_lookup(caller);
+            if (p) {
+                for (unsigned i = 0; i < TM_THREAD_NAME_LEN; ++i)
+                    p->main_name[i] = nm[i];
+                break;
+            }
+        }
+        err = (seL4_Word)ESRCH;
+        break;
+    }
     case TM_REQ_PROCESS_CREATE: {
         /* MR0=argc, MR1=envc, MR2=path_len, MR3=total_strs_bytes;
          * strings live at ipcbuf->msg[4..]. */
@@ -575,10 +616,14 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         unsigned len = 0;
         int rc = tm_getcwd(caller, &len);
         if (rc) { err = (seL4_Word)(-rc); break; }
+        /* Pure-payload reply: length @ word0, cwd bytes @ word1.. (tm_getcwd
+         * wrote them to msg[1..]).  Lift words 1..3 into MR1..3 so the client
+         * sees [len, bytes] contiguous from word0; any tail is in msg[4..]. */
         *out_mr0 = (seL4_Word)len;
-        /* Bytes ride in msg[4..]; framing covers the MR0..3 quad
-         * plus enough words for the path payload. */
-        reply_len = 4 + (len + 7) / 8;
+        *out_mr1 = qsoe_ipcbuf->msg[1];
+        *out_mr2 = qsoe_ipcbuf->msg[2];
+        *out_mr3 = qsoe_ipcbuf->msg[3];
+        reply_len = 1 + (len + 7) / 8;
         break;
     }
     case TM_REQ_DUP_CAP: {

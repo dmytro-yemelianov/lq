@@ -144,20 +144,31 @@ int SyncTypeCreate(unsigned type, sync_t *s,
     return 0;
 }
 
-int SyncDestroy(sync_t *s)
+/* Reentrant core: 0 on success, NEGATIVE errno on failure -- never touch
+ * qsoe_errno.  pthread_mutex_destroy / pthread_cond_destroy (shared libc)
+ * call this; SyncDestroy() below is the errno-setting wrapper.  Matches
+ * NQ's SyncDestroy_r so one pthread layer serves both kernels. */
+long SyncDestroy_r(sync_t *s)
 {
     /* Nothing kernel-side to release in v0.8.  The taskman per-(pid,
      * addr) wait-list entry is allocated on first WAIT and freed
      * when its wait list drains and credit count is zero; not
      * eagerly torn down here.  When a real cross-process Sync*
      * arrives (shm-mapped sync_t), this will free the registration. */
-    if (!s) { qsoe_errno = EINVAL; return -1; }
+    if (!s) return -EINVAL;
     /* Plant the destroyed sentinel so a later operation on this object
      * fails with EINVAL rather than silently succeeding (a destroyed
      * mutex looks "free" if we just zero it).  A fresh SyncTypeCreate at
      * the same address clears it. */
     s->count = 0;
     s->owner = QSOE_SYNC_DESTROYED;
+    return 0;
+}
+
+int SyncDestroy(sync_t *s)
+{
+    long r = SyncDestroy_r(s);
+    if (r < 0) { qsoe_errno = (int)-r; return -1; }
     return 0;
 }
 

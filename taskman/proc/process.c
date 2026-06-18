@@ -722,7 +722,10 @@ int tm_getcwd(pid_t caller_pid, unsigned *out_len)
     unsigned len = 0;
     while (p->cwd[len] != 0 && len < sizeof p->cwd) ++len;
 
-    unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[4];
+    /* Pure-payload reply (shared libc getcwd via MsgSendv, 1-word reply
+     * header): length rides at reply word0, the cwd bytes at word1.. -- so
+     * write them to msg[1..] (the GETCWD case lifts msg[1..3] into MR1..3). */
+    unsigned char *dst = (unsigned char *)&qsoe_ipcbuf->msg[1];
     for (unsigned i = 0; i < len; ++i) dst[i] = (unsigned char)p->cwd[i];
     *out_len = len;
     return 0;
