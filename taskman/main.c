@@ -33,7 +33,6 @@
 #include "sys/rsrcdb.h"
 #include "sys/syscfg.h"
 #include "sys/sysmap.h"
-#include "sys/sync.h"
 
 #include <sys/qsoe.h>
 #include <qsoe/slots.h>
@@ -132,10 +131,6 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
 
     switch (label) {
     /* ---------- system management ---------- */
-    case TM_REQ_DEBUG_SLOT_COUNT:
-        *out_mr0 = (seL4_Word)s_next_slot;
-        reply_len = 1;
-        break;
     case TM_REQ_CLOCK_FREQ: {
         /* RISC-V `time` CSR frequency.  v0.8 reads it from the FDT
          * via syscfg; falls back to the qemu-virt hardcode if the
@@ -202,25 +197,6 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         *out_mr0 = (seL4_Word)written;
         unsigned bytes = written * 32u;  /* sizeof rsrc_alloc_t */
         reply_len = 4 + (bytes + 7) / 8;
-        break;
-    }
-    case TM_REQ_SYNC_WAIT: {
-        /* mr0 = vaddr (key), mr1 = mode, mr2 = expected_gen.  Either
-         * returns immediately (gen mismatch or credit consumed) or
-         * defers the reply by saving the caller — *out_no_reply
-         * tells the dispatch loop not to send a reply. */
-        int parked = 0;
-        int rc = tm_sync_wait(caller, (unsigned long)mr0,
-                               (unsigned)mr1, (long)mr2, &parked);
-        if (rc) { err = (seL4_Word)(-rc); break; }
-        if (parked) *out_no_reply = 1;
-        break;
-    }
-    case TM_REQ_SYNC_WAKE: {
-        /* mr0 = vaddr, mr1 = max_n, mr2 = mode. */
-        int rc = tm_sync_wake(caller, (unsigned long)mr0,
-                               (int)mr1, (unsigned)mr2);
-        if (rc) err = (seL4_Word)(-rc);
         break;
     }
     case TM_REQ_GET_SYSCFG: {
@@ -344,16 +320,6 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         tm_info("shutdown: powering off (requested by pid %d)", (int)caller);
         sel4_debug_halt();   /* never returns */
         err = EIO;           /* unreachable */
-        break;
-    }
-    case TM_REQ_PING_CLIENTINFO: {
-        /* Demo: exercise ConnectClientInfo from inside the dispatch
-         * loop.  The badge IS the scoid of the calling connection. */
-        struct _client_info ci;
-        int rc = ConnectClientInfo((int)badge, &ci, 0);
-        *out_mr0 = mr0 + 1;
-        *out_mr1 = (rc == 0) ? (seL4_Word)ci.pid : (seL4_Word)-1;
-        reply_len = 2;
         break;
     }
 

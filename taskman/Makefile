@@ -211,7 +211,6 @@ TASKMAN_OBJS := \
     $(OBJDIR)/sys/fdt.o \
     $(OBJDIR)/sys/irq.o \
     $(OBJDIR)/sys/rsrcdb.o \
-    $(OBJDIR)/sys/sync.o \
     $(OBJDIR)/sys/syscfg.o \
     $(OBJDIR)/sys/sysmap.o \
     $(OBJDIR)/cpio.o \

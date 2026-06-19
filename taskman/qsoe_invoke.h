@@ -565,4 +565,73 @@ qsoe_riscv_asidpool_assign(seL4_CPtr asid_pool, seL4_CPtr vspace)
  */
 #define TM_REQ_THREAD_SETNAME  (TM_REQ_VARIANT_BASE + 4u)  /* LQ variant op 4 */
 
+/*
+ * LQ-private wire opcodes for per-kernel mechanism that NQ does NOT route
+ * through taskman.  NQ does each of these in-kernel (sys_* syscalls) or via
+ * the sysmap page, so they were never shared opcodes -- they used to sit in
+ * the common <qsoe/tm_msgs.h> sys bucket by historical accident.  Moved here
+ * so the common bucket holds only genuinely cross-kernel system-control
+ * messages.
+ *
+ * TM_REQ_CLOCK_FREQ: RISC-V `time` CSR frequency.  Reply mr0 = ticks per
+ *   second of what `rdtime` returns; libc caches it once at startup so
+ *   ClockTime / nanosleep read rdtime directly.  (NQ: sysmap page.)
+ * TM_REQ_GET_SYSCFG: full syscfg blob (machine model, CPUs, memory, PCI
+ *   windows) built from the FDT.  mr0 = max bytes the caller accepts; reply
+ *   mr0 = bytes copied into msg[4..].  (NQ: sysmap page.)
+ * TM_REQ_IRQ_ATTACH: thread-bound IRQ attach for the Interrupt* API.  mr0 =
+ *   PLIC IRQ, mr1 = trigger (0 level, 1 edge); reply mr0 = handler-cap slot,
+ *   mr1 = notification-cap slot, both minted into the caller's CSpace.
+ * TM_REQ_IRQ_DETACH: symmetric tear-down.  mr0 = handler-cap slot, mr1 =
+ *   ntfn-cap slot; taskman revokes the binding and returns the slots.
+ *   (NQ: sys_intr_attach_thread / sys_intr_detach syscalls.)
+ */
+#define TM_REQ_CLOCK_FREQ      (TM_REQ_VARIANT_BASE + 5u)  /* LQ variant op 5 */
+#define TM_REQ_GET_SYSCFG      (TM_REQ_VARIANT_BASE + 6u)  /* LQ variant op 6 */
+#define TM_REQ_IRQ_ATTACH      (TM_REQ_VARIANT_BASE + 7u)  /* LQ variant op 7 */
+#define TM_REQ_IRQ_DETACH      (TM_REQ_VARIANT_BASE + 8u)  /* LQ variant op 8 */
+
+/*
+ * LQ-private pulse delivery.  A pulse is async delivery to a channel's
+ * bound Notification; LQ routes it through taskman (which holds the
+ * coid->channel->ntfn mapping and signals + queues the code/value
+ * payload), the receiver popping the payload via TM_REQ_PULSE_FETCH.
+ * NQ does pulses natively in Skimmer (sys_msg_send_pulse), so these were
+ * never shared opcodes -- they sat in the common proc bucket by accident.
+ *   TM_REQ_PULSE_SEND:  MR0 = sender's coid slot, MR1 = priority,
+ *     MR2 = code (low byte), MR3 = value.  taskman resolves the target
+ *     channel from the connection registry and signals + queues.
+ *   TM_REQ_PULSE_FETCH: MR0 = the receiving channel's recv slot; reply
+ *     MR0 = code, MR1 = value, MR2 = sender pid, MR3 = scoid.
+ * (A QSOE_CHF_PULSE_DIRECT channel bypasses both: the sender signals the
+ * Notification straight and the receiver synthesizes an empty pulse.)
+ */
+#define TM_REQ_PULSE_SEND      (TM_REQ_VARIANT_BASE + 9u)   /* LQ variant op 9  */
+#define TM_REQ_PULSE_FETCH     (TM_REQ_VARIANT_BASE + 10u)  /* LQ variant op 10 */
+
+/*
+ * LQ-private channel / connection / thread / process-create / scheduling
+ * opcodes.  These are kernel primitives on NQ -- Skimmer provides
+ * SYS_CHANNEL_*, SYS_CONNECT_*, SYS_THREAD_*, SYS_SCHED_* -- so NQ never
+ * sends them as taskman messages.  On LQ, seL4 exposes only endpoints and
+ * caps, so taskman owns channel/connection/thread/SchedContext management
+ * and these are its wire opcodes.  They used to sit in the common proc
+ * bucket by historical accident; moved here so the common bucket holds
+ * only the both-kernel process/signal/POSIX surface.  SCHED_SET/GET are
+ * kept adjacent.
+ */
+#define TM_REQ_CHANNEL_CREATE       (TM_REQ_VARIANT_BASE + 11u)  /* op 11 */
+#define TM_REQ_CHANNEL_DESTROY      (TM_REQ_VARIANT_BASE + 12u)  /* op 12 */
+#define TM_REQ_CONNECT_ATTACH       (TM_REQ_VARIANT_BASE + 13u)  /* op 13 */
+#define TM_REQ_CONNECT_DETACH       (TM_REQ_VARIANT_BASE + 14u)  /* op 14 */
+#define TM_REQ_CONNECT_SERVER_INFO  (TM_REQ_VARIANT_BASE + 15u)  /* op 15 */
+#define TM_REQ_CONNECT_CLIENT_INFO  (TM_REQ_VARIANT_BASE + 16u)  /* op 16 */
+#define TM_REQ_CONNECT_FLAGS        (TM_REQ_VARIANT_BASE + 17u)  /* op 17 */
+#define TM_REQ_THREAD_ALLOC         (TM_REQ_VARIANT_BASE + 18u)  /* op 18 */
+#define TM_REQ_THREAD_DESTROY       (TM_REQ_VARIANT_BASE + 19u)  /* op 19 */
+#define TM_REQ_PROCESS_CREATE       (TM_REQ_VARIANT_BASE + 20u)  /* op 20 */
+#define TM_REQ_PROCESS_TERMINATE    (TM_REQ_VARIANT_BASE + 21u)  /* op 21 */
+#define TM_REQ_SCHED_SET            (TM_REQ_VARIANT_BASE + 22u)  /* op 22 */
+#define TM_REQ_SCHED_GET            (TM_REQ_VARIANT_BASE + 23u)  /* op 23 */
+
 #endif /* QSOE_INVOKE_H */
