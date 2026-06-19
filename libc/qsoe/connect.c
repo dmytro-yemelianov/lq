@@ -13,6 +13,51 @@
 #include "sel4_types.h"
 #include "qsoe_invoke.h"
 
+/* ---- direct-pulse registry (QSOE_CHF_PULSE_DIRECT) ------------------
+ *
+ * Few connections ever use this -- only a driver's MSI-pulse link to the
+ * pci-server -- so a tiny linear table keyed by coid is plenty.  Each
+ * entry maps a coid to the Notification Send-cap taskman copied into our
+ * CSpace at ConnectAttach; MsgSendPulse signals it directly. */
+#define QSOE_MAX_DIRECT_PULSE 8
+
+static struct { int coid; unsigned long ntfn; } g_direct_pulse[QSOE_MAX_DIRECT_PULSE];
+
+void qsoe_direct_pulse_register(int coid, unsigned long ntfn_slot)
+{
+    if (!ntfn_slot) return;
+    for (int i = 0; i < QSOE_MAX_DIRECT_PULSE; ++i) {
+        if (g_direct_pulse[i].ntfn == 0) {
+            g_direct_pulse[i].coid = coid;
+            g_direct_pulse[i].ntfn = ntfn_slot;
+            return;
+        }
+    }
+    /* Table full: fall back to the taskman-routed pulse for this coid
+     * (correct, just not deadlock-free).  Announce -- a silent drop here
+     * would re-introduce the very deadlock this path exists to avoid. */
+    qsoe_dbgprintf("direct-pulse registry full; coid %d uses TM_REQ_PULSE_SEND\n",
+                   coid);
+}
+
+unsigned long qsoe_direct_pulse_lookup(int coid)
+{
+    for (int i = 0; i < QSOE_MAX_DIRECT_PULSE; ++i)
+        if (g_direct_pulse[i].ntfn && g_direct_pulse[i].coid == coid)
+            return g_direct_pulse[i].ntfn;
+    return 0;
+}
+
+void qsoe_direct_pulse_clear(int coid)
+{
+    for (int i = 0; i < QSOE_MAX_DIRECT_PULSE; ++i)
+        if (g_direct_pulse[i].ntfn && g_direct_pulse[i].coid == coid) {
+            g_direct_pulse[i].coid = 0;
+            g_direct_pulse[i].ntfn = 0;
+            return;
+        }
+}
+
 
 int ConnectAttach(uint32_t nd, pid_t pid, int chid, unsigned index, int flags)
 {
@@ -22,7 +67,9 @@ int ConnectAttach(uint32_t nd, pid_t pid, int chid, unsigned index, int flags)
     int coid = qsoe_state_alloc_coid((unsigned)flags);
     if (coid < 0) { qsoe_errno = ENOMEM; return -1; }
 
-    /* Wire: MR0 = pid, MR1 = chid, MR2 = flags. Reply: label=errno, MR0=send slot. */
+    /* Wire: MR0 = pid, MR1 = chid, MR2 = flags. Reply: label=errno,
+     * MR0 = send slot, MR1 = direct-pulse ntfn slot (0 unless the target
+     * is a QSOE_CHF_PULSE_DIRECT channel). */
     seL4_Word mr0 = (seL4_Word)pid;
     seL4_Word mr1 = (seL4_Word)chid;
     seL4_Word mr2 = (seL4_Word)flags;
@@ -37,6 +84,7 @@ int ConnectAttach(uint32_t nd, pid_t pid, int chid, unsigned index, int flags)
         return -1;
     }
     qsoe_state_bind_coid(coid, mr0);
+    qsoe_direct_pulse_register(coid, (unsigned long)mr1);
     return coid;
 }
 
@@ -53,6 +101,7 @@ int ConnectDetach(int coid)
     seL4_Word err = seL4_MessageInfo_get_label(reply);
     if (err != 0) { qsoe_errno = (int)err; return -1; }
     qsoe_state_bind_coid(coid, 0);
+    qsoe_direct_pulse_clear(coid);
     return 0;
 }
 

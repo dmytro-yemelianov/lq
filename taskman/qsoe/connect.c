@@ -23,9 +23,10 @@ int ConnectAttach(uint32_t nd, pid_t pid, int chid, unsigned index, int flags)
     int coid = qsoe_state_alloc_coid((unsigned)flags);
     if (coid < 0) { qsoe_errno = ENOMEM; return -1; }
 
-    unsigned long send_slot = 0;
+    unsigned long send_slot = 0, ntfn_unused = 0;
     int err = tm_connect_attach(QSOE_PID_TASKMAN, pid, chid, (unsigned)flags,
-                                (unsigned long *)&send_slot);
+                                (seL4_CPtr *)&send_slot,
+                                (seL4_CPtr *)&ntfn_unused);
     if (err != 0) {
         qsoe_state_bind_coid(coid, 0);
         qsoe_errno = -err;

@@ -80,6 +80,7 @@ int tm_connection_register_existing(pid_t client_pid, seL4_CPtr client_slot,
         g_connections[i].badge       = badge;
         g_connections[i].client_pid  = client_pid;
         g_connections[i].client_slot = client_slot;
+        g_connections[i].ntfn_slot   = 0;
         g_connections[i].flags       = flags;
         g_connections[i].ctx[0]      = 0;
         g_connections[i].ctx[1]      = 0;
@@ -100,6 +101,7 @@ int tm_connection_clone_for_dup(pid_t client_pid, seL4_CPtr src_slot,
     g_connections[idx].badge       = src->badge;
     g_connections[idx].client_pid  = client_pid;
     g_connections[idx].client_slot = dest_slot;
+    g_connections[idx].ntfn_slot   = 0;   /* dup falls back to the pulse path */
     g_connections[idx].flags       = src->flags;
     g_connections[idx].ctx[0]      = src->ctx[0];
     g_connections[idx].ctx[1]      = src->ctx[1];
@@ -157,8 +159,10 @@ int tm_channel_by_badge(seL4_Word badge, pid_t *out_pid, int *out_chid)
 }
 
 int tm_connect_attach(pid_t client_pid, pid_t target_pid, int target_chid,
-                      unsigned flags, seL4_CPtr *out_send_slot)
+                      unsigned flags, seL4_CPtr *out_send_slot,
+                      seL4_CPtr *out_ntfn_slot)
 {
+    *out_ntfn_slot = 0;
     tm_process_t *client = tm_process_lookup(client_pid);
     if (!client) return -ESRCH;
     int target_idx = tm_channel_index(target_pid, target_chid);
@@ -179,14 +183,33 @@ int tm_connect_attach(pid_t client_pid, pid_t target_pid, int target_chid,
         return -ENOMEM;
     }
 
+    /* QSOE_CHF_PULSE_DIRECT: also hand the client a copy of the channel's
+     * pulse Notification Send-cap, so its MsgSendPulse signals the receiver
+     * straight through the kernel instead of routing TM_REQ_PULSE_SEND back
+     * here.  Lets a device wake its owner while taskman is blocked (e.g. in
+     * a spawn-image read off that same device).  Best-effort: if the copy
+     * fails we leave ntfn_slot 0 and the client falls back to the pulse
+     * path -- correctness is unaffected, only the deadlock-freedom is. */
+    seL4_CPtr ntfn_slot = 0;
+    if ((c->flags & QSOE_CHF_PULSE_DIRECT) && c->ntfn_sig) {
+        ntfn_slot = tm_process_alloc_slot(client_pid);
+        if (qsoe_cnode_copy(client->cnode, ntfn_slot, dest_depth,
+                            s_cnode_root, c->ntfn_sig, TM_DEPTH_TASKMAN,
+                            QSOE_RIGHTS_SEND) != 0) {
+            ntfn_slot = 0;   /* slot stays claimed; reclaimed at process exit */
+        }
+    }
+
     g_connections[cidx].in_use      = 1;
     g_connections[cidx].channel_idx = target_idx;
     g_connections[cidx].badge       = badge;
     g_connections[cidx].client_pid  = client_pid;
     g_connections[cidx].client_slot = send_slot;
+    g_connections[cidx].ntfn_slot   = ntfn_slot;
     g_connections[cidx].flags       = flags & ~QSOE_SIDE_CHANNEL;
 
     *out_send_slot = send_slot;
+    *out_ntfn_slot = ntfn_slot;
     return 0;
 }
 
@@ -200,6 +223,13 @@ int tm_connect_detach(pid_t client_pid, seL4_CPtr send_slot)
     if (qsoe_cnode_delete(client->cnode, send_slot,
                           cnode_depth_for(client_pid)) != 0) {
         return -EBADF;
+    }
+    /* Drop the direct-pulse Notification copy too, if this was a
+     * QSOE_CHF_PULSE_DIRECT connection. */
+    if (cn->ntfn_slot) {
+        (void)qsoe_cnode_delete(client->cnode, cn->ntfn_slot,
+                                cnode_depth_for(client_pid));
+        cn->ntfn_slot = 0;
     }
     cn->in_use = 0;
     return 0;

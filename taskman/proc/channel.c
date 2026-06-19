@@ -131,7 +131,12 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
 
     /* Per-channel Notification for pulse wake.  ntfn_master is
      * unbadged (used for Bind/Unbind/Revoke); ntfn_sig is a Send-cap
-     * minted with badge=QSOE_NTFN_BADGE_BIT. */
+     * minted with badge=QSOE_NTFN_BADGE_BIT.  A QSOE_CHF_PULSE_DIRECT
+     * channel ORs in QSOE_NTFN_DIRECT_BIT: a connector handed this
+     * Send-cap (in tm_connect) signals it straight, and the receiver's
+     * MsgReceive treats the wake as a payload-free pulse (no fetch). */
+    seL4_Word sig_badge = QSOE_NTFN_BADGE_BIT;
+    if (flags & QSOE_CHF_PULSE_DIRECT) sig_badge |= QSOE_NTFN_DIRECT_BIT;
     seL4_CPtr ntfn_master = taskman_alloc_and_retype(seL4_NotificationObject,
                                                       seL4_NotificationBits);
     seL4_CPtr ntfn_sig    = 0;
@@ -140,7 +145,7 @@ int tm_channel_create(pid_t owner_pid, int chid, unsigned flags,
         seL4_CapRights_t sig_rights = seL4_CapRights_new(0, 0, 0, 1);
         if (qsoe_cnode_mint(s_cnode_root, ntfn_sig, TM_DEPTH_TASKMAN,
                             s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN,
-                            sig_rights, QSOE_NTFN_BADGE_BIT) != 0) {
+                            sig_rights, sig_badge) != 0) {
             qsoe_cnode_delete(s_cnode_root, ntfn_master, TM_DEPTH_TASKMAN);
             taskman_free_slot(ntfn_master);
             taskman_free_slot(ntfn_sig);

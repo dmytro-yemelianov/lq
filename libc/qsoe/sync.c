@@ -3,27 +3,56 @@
  *
  * Userspace fast path: __atomic_compare_exchange_n on the sync_t's
  * `owner` (mutex) / `count` (sem) field.  Uncontended operations
- * never enter taskman.
+ * never enter the kernel and never message taskman.
  *
- * Slow path: TM_REQ_SYNC_WAIT / TM_REQ_SYNC_WAKE — the two-mode
- * address-keyed primitive lives in taskman/sys/sync.c.  See
- * qsoe/wire.h for the mr0..mr2 layout.
+ * Slow path (PoC): an in-process, address-keyed wait/wake table that
+ * blocks and wakes threads through *kernel Notifications* — never
+ * through taskman.  This is the same data model as taskman/sys/sync.c
+ * (credit-absorb + gen-check, a small linear table), moved into the
+ * process and re-plumbed onto seL4 primitives:
+ *
+ *   taskman model            ->  in-process model (here)
+ *   ----------------------       --------------------------------------
+ *   keyed by (pid, addr)         keyed by addr (one address space)
+ *   park = stash reply object    park = push this thread's Notification
+ *   wake = reply on the object   wake = qsoe_sys_signal(Notification)
+ *   table is single-threaded     table guarded by a Notification-as-mutex
+ *   in the taskman dispatcher
+ *
+ * Why this matters: routing the slow path through taskman deadlocks
+ * when taskman is itself a blocked client of a server whose own
+ * threads need to wake each other (e.g. devb-nvme's IST signalling its
+ * I/O worker while taskman waits on a spawn-image read from fs-qrv).
+ * Going straight through the kernel makes the wake independent of
+ * taskman's state — exactly like NQ, where Skimmer mediates Sync.
+ *
+ * Per-thread block Notification: worker threads already own one
+ * (taskman mints `join_ntfn` at THREAD_ALLOC); the main thread gets
+ * one minted at qsoe_sync_init().  seL4_Wait is sticky (a Signal
+ * delivered before the matching Wait sets a pending bit the Wait then
+ * consumes), so it serves as a futex-style park with no lost-wakeup in
+ * the unlock→park window.  Reuse of join_ntfn is safe: a thread parked
+ * in a Sync wait is never simultaneously exiting to signal a joiner.
+ *
+ * Table lock: a Notification used as a *blocking* binary-semaphore
+ * mutex, NOT a CAS spinlock.  A spinlock livelocks here — the prio-21
+ * IST can preempt a prio-10 lock holder and busy-wait forever, since
+ * the holder never regains the CPU under strict priority.  A blocking
+ * mutex makes the IST yield instead; the holder runs, releases, and the
+ * IST proceeds (bounded priority inversion).
  *
  * Mode choice per primitive:
- *   Mutex / Sem use WAIT mode 0 (credit-absorb): the unlock side
- *     calls WAKE absorb=1 even when it doesn't know whether anyone
- *     is parked, so any wake delivered before its matching wait
- *     is held as a single-shot credit instead of being lost.
- *   Cond uses WAIT mode 1 (gen-check): the user's last-observed
- *     cond->count is passed as expected_gen; taskman's tracked gen
- *     for the cond's address advances on every Signal/WAKE; if a
- *     Signal raced ahead, gen mismatches and WAIT returns
- *     immediately without parking.  Cond uses WAKE mode 1
- *     (discard) since POSIX permits losing a Signal that has no
- *     blocked waiter at the time.
+ *   Mutex / Sem use WAIT credit-absorb: the unlock side WAKEs absorb
+ *     even without knowing whether anyone is parked, so a wake
+ *     delivered before its matching wait is held as a single-shot
+ *     credit instead of being lost.
+ *   Cond uses WAIT gen-check: the user's last-observed cond->count is
+ *     passed as expected; the tracked gen for the address advances on
+ *     every Signal/WAKE; if a Signal raced ahead, gen mismatches and
+ *     WAIT returns immediately without parking.  Cond uses WAKE discard
+ *     since POSIX permits losing a Signal that has no blocked waiter.
  *
- * No priority inheritance in v0.8 — see [[project_sync_design]];
- * lands together with the seL4/MCS switch.
+ * No priority inheritance yet — see [[project_sync_design]].
  *
  * Copyright (c) 2026 Yuri Zaporozhets <yuriz@qrv-systems.net>
  * SPDX-License-Identifier: Apache-2.0
@@ -34,52 +63,247 @@
 #include <qsoe/tm_msgs.h>
 #include <qsoe/tls.h>
 
+#include "state.h"          /* qsoe_state_alloc_empty_slot, qsoe_sync_init */
 #include "sel4_types.h"
 #include "qsoe_invoke.h"
 
-/* ---- slow-path wrappers -------------------------------------------- */
+/* ---- in-process wait/wake table ------------------------------------ */
+
+/* Mirrors taskman/sys/sync.h, the model this replaces.  CREDIT =
+ * mutex/sem (absorb a pending wake); GEN = cond (park iff gen matches). */
+enum { SYNC_WAIT_CREDIT = 0, SYNC_WAIT_GEN = 1 };
+/* ABSORB = deposit a credit if no waiter; DISCARD = drop it. */
+enum { SYNC_WAKE_ABSORB = 0, SYNC_WAKE_DISCARD = 1 };
+
+#define SYNC_MAX_ENTRIES   16   /* distinct addresses in flight at once  */
+#define SYNC_MAX_WAITERS    4   /* parked threads per address            */
+
+typedef struct {
+    unsigned long addr;                     /* sync_t field address (key) */
+    int           in_use;
+    int           credit;                   /* absorbing-WAKE deposits    */
+    long          gen;                       /* advances on every WAKE     */
+    int           nwaiters;
+    seL4_CPtr     waiters[SYNC_MAX_WAITERS]; /* parked threads' Notifs     */
+} sync_entry_t;
+
+static sync_entry_t g_sync[SYNC_MAX_ENTRIES];
+
+/* Notification used as a blocking mutex over g_sync[].  0 until
+ * qsoe_sync_init() mints + arms it; see the file banner for why this is
+ * a blocking primitive and not a spinlock. */
+static seL4_CPtr g_table_lock;
+
+/* ---- kernel-object minting (taskman-free) -------------------------- */
+
+/* Retype one seL4 Notification out of our own untyped budget into a
+ * fresh CSpace slot.  Invokes the Untyped cap directly on the kernel —
+ * no taskman round-trip — so it is safe even while taskman is blocked.
+ * Returns the slot (a usable Notification cap) or 0 on exhaustion. */
+static seL4_CPtr mint_notification(void)
+{
+    unsigned long slot = qsoe_state_alloc_empty_slot();
+    if (!slot) return 0;
+    seL4_Word err = qsoe_untyped_retype(QSOE_CAP_OWN_UNTYPED,
+                                        seL4_NotificationObject, 0,
+                                        QSOE_CAP_CNODE_SELF, 0, 0,
+                                        slot, 1);
+    if (err) { qsoe_state_free_empty_slot(slot); return 0; }
+    return (seL4_CPtr)slot;
+}
+
+/* This thread's block Notification.  Workers carry join_ntfn from
+ * taskman; the main thread (and any thread that lacks one) mints its
+ * own lazily — only the owning thread writes its join_ntfn, so no race. */
+static seL4_CPtr block_ntfn_self(void)
+{
+    qsoe_tcb_t *t = qsoe_curthr();
+    if (t->join_ntfn) return (seL4_CPtr)t->join_ntfn;
+    seL4_CPtr n = mint_notification();
+    if (n) t->join_ntfn = (unsigned long)n;
+    return n;
+}
+
+/* One-time per-process setup: mint + arm the table-lock Notification and
+ * give the main thread its block Notification.  Called from
+ * qsoe_libc_init() while still single-threaded, so the guard never
+ * races; the slow path below also calls it defensively. */
+void qsoe_sync_init(void)
+{
+    if (g_table_lock) return;
+    seL4_CPtr lock = mint_notification();
+    if (!lock) return;          /* slow path announces on first use */
+    qsoe_sys_signal(lock);      /* one token: the mutex starts available */
+    g_table_lock = lock;
+    (void)block_ntfn_self();    /* main thread's park Notification */
+}
+
+static void table_lock(void)
+{
+    if (!g_table_lock) qsoe_sync_init();
+    if (g_table_lock) qsoe_sys_wait(g_table_lock);
+}
+
+static void table_unlock(void)
+{
+    if (g_table_lock) qsoe_sys_signal(g_table_lock);
+}
+
+/* ---- table helpers (addr-keyed; mirror taskman/sys/sync.c) --------- */
+
+static sync_entry_t *find_entry(unsigned long addr)
+{
+    for (int i = 0; i < SYNC_MAX_ENTRIES; ++i)
+        if (g_sync[i].in_use && g_sync[i].addr == addr) return &g_sync[i];
+    return 0;
+}
+
+static sync_entry_t *alloc_entry(unsigned long addr)
+{
+    for (int i = 0; i < SYNC_MAX_ENTRIES; ++i) {
+        if (g_sync[i].in_use) continue;
+        sync_entry_t *e = &g_sync[i];
+        e->addr = addr; e->in_use = 1;
+        e->credit = 0;  e->gen = 0; e->nwaiters = 0;
+        return e;
+    }
+    return 0;
+}
+
+/* Drop an entry with no waiters and no pending credit. */
+static void retire_if_idle(sync_entry_t *e)
+{
+    if (e && e->in_use && e->nwaiters == 0 && e->credit == 0)
+        e->in_use = 0;
+}
+
+static int push_waiter(sync_entry_t *e, seL4_CPtr n)
+{
+    if (e->nwaiters >= SYNC_MAX_WAITERS) return -1;
+    e->waiters[e->nwaiters++] = n;
+    return 0;
+}
+
+static seL4_CPtr pop_waiter(sync_entry_t *e)
+{
+    if (e->nwaiters == 0) return 0;
+    seL4_CPtr n = e->waiters[0];
+    for (int i = 1; i < e->nwaiters; ++i) e->waiters[i - 1] = e->waiters[i];
+    --e->nwaiters;
+    return n;
+}
+
+/* Remove a specific Notification from the FIFO (post-wait cleanup for a
+ * spurious return; a no-op if the waker already popped us). */
+static void remove_waiter(sync_entry_t *e, seL4_CPtr n)
+{
+    for (int i = 0; i < e->nwaiters; ++i) {
+        if (e->waiters[i] != n) continue;
+        for (int j = i + 1; j < e->nwaiters; ++j) e->waiters[j - 1] = e->waiters[j];
+        --e->nwaiters;
+        return;
+    }
+}
+
+/* ---- slow-path wait/wake (kernel Notifications, no taskman) -------- */
+
+static int sync_wait_impl(volatile void *vaddr, unsigned mode, long expected)
+{
+    unsigned long addr = (unsigned long)vaddr;
+    if (!addr) { qsoe_errno = EINVAL; return -1; }
+
+    /* Mint our park Notification BEFORE taking the table lock, so the
+     * (possible) retype syscall doesn't lengthen the critical section. */
+    seL4_CPtr myn = block_ntfn_self();
+    if (!myn) { qsoe_errno = ENOMEM; return -1; }
+
+    table_lock();
+    sync_entry_t *e = find_entry(addr);
+
+    if (mode == SYNC_WAIT_GEN) {
+        /* Cond: a Signal since the caller sampled `expected` advanced the
+         * gen — don't park.  No entry + non-zero expected means signals
+         * ran before any wait; treat as "wake already arrived". */
+        if (e && e->gen != expected) { retire_if_idle(e); table_unlock(); return 0; }
+        if (!e && expected != 0)     { table_unlock(); return 0; }
+    } else {
+        /* Mutex/sem: consume a deposited credit instead of parking. */
+        if (e && e->credit > 0) { --e->credit; retire_if_idle(e); table_unlock(); return 0; }
+    }
+
+    if (!e) {
+        e = alloc_entry(addr);
+        if (!e) { table_unlock(); qsoe_errno = ENOMEM; return -1; }
+    }
+    if (push_waiter(e, myn) != 0) {
+        retire_if_idle(e); table_unlock(); qsoe_errno = ENOMEM; return -1;
+    }
+    table_unlock();
+
+    /* Block outside the lock.  A wake racing between unlock and here sets
+     * myn's pending bit; the Wait then returns at once (Notifications are
+     * sticky) — no lost wakeup. */
+    qsoe_sys_wait(myn);
+
+    table_lock();
+    e = find_entry(addr);           /* re-find: may have been retired/reused */
+    if (e) { remove_waiter(e, myn); retire_if_idle(e); }
+    table_unlock();
+    return 0;
+}
+
+static int sync_wake_impl(volatile void *vaddr, int max_n, unsigned mode)
+{
+    unsigned long addr = (unsigned long)vaddr;
+    if (!addr) { qsoe_errno = EINVAL; return -1; }
+
+    table_lock();
+    sync_entry_t *e = find_entry(addr);
+    if (e) e->gen += 1;                       /* cond waiters compare this */
+
+    if (max_n == 0) max_n = SYNC_MAX_WAITERS;  /* 0 = wake all */
+    int woken = 0;
+    if (e) {
+        while (woken < max_n) {
+            seL4_CPtr n = pop_waiter(e);
+            if (!n) break;
+            qsoe_sys_signal(n);
+            ++woken;
+        }
+    }
+
+    if (woken < max_n && mode == SYNC_WAKE_ABSORB) {
+        /* Nobody to wake; deposit one single-shot credit so the next
+         * credit-mode WAIT consumes it instead of parking. */
+        if (!e) {
+            e = alloc_entry(addr);
+            if (!e) { table_unlock(); qsoe_errno = ENOMEM; return -1; }
+            e->gen = 1;                        /* this WAKE counts too */
+        }
+        if (e->credit < 1) e->credit = 1;
+    }
+
+    retire_if_idle(e);
+    table_unlock();
+    return 0;
+}
+
+/* ---- slow-path wrappers (same shape the public API below calls) ---- */
 
 static int sync_wait_credit(volatile void *addr)
 {
-    seL4_Word mr0 = (seL4_Word)addr;
-    seL4_Word mr1 = 0;          /* mode 0: credit-absorb */
-    seL4_Word mr2 = 0;
-    seL4_Word mr3 = 0;
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_SYNC_WAIT, 0, 0, 3);
-    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
-                                              &mr0, &mr1, &mr2, &mr3);
-    seL4_Word err = seL4_MessageInfo_get_label(reply);
-    if (err) { qsoe_errno = (int)err; return -1; }
-    return 0;
+    return sync_wait_impl(addr, SYNC_WAIT_CREDIT, 0);
 }
 
 static int sync_wait_gen(volatile void *addr, long expected)
 {
-    seL4_Word mr0 = (seL4_Word)addr;
-    seL4_Word mr1 = 1;          /* mode 1: gen-check */
-    seL4_Word mr2 = (seL4_Word)expected;
-    seL4_Word mr3 = 0;
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_SYNC_WAIT, 0, 0, 3);
-    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
-                                              &mr0, &mr1, &mr2, &mr3);
-    seL4_Word err = seL4_MessageInfo_get_label(reply);
-    if (err) { qsoe_errno = (int)err; return -1; }
-    return 0;
+    return sync_wait_impl(addr, SYNC_WAIT_GEN, expected);
 }
 
 /* WAKE; mode 0 deposits credit, mode 1 discards on no-waiter. */
 static int sync_wake(volatile void *addr, int max_n, int mode)
 {
-    seL4_Word mr0 = (seL4_Word)addr;
-    seL4_Word mr1 = (seL4_Word)max_n;
-    seL4_Word mr2 = (seL4_Word)mode;
-    seL4_Word mr3 = 0;
-    seL4_MessageInfo_t tag = seL4_MessageInfo_new(TM_REQ_SYNC_WAKE, 0, 0, 3);
-    seL4_MessageInfo_t reply = qsoe_sys_call(QSOE_CAP_TASKMAN_EP, tag,
-                                              &mr0, &mr1, &mr2, &mr3);
-    seL4_Word err = seL4_MessageInfo_get_label(reply);
-    if (err) { qsoe_errno = (int)err; return -1; }
-    return 0;
+    return sync_wake_impl(addr, max_n, (unsigned)mode);
 }
 
 /* ---- public API ---------------------------------------------------- */

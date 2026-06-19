@@ -366,6 +366,8 @@ typedef struct {
     seL4_Word     badge;
     pid_t         client_pid;
     seL4_CPtr     client_slot;
+    seL4_CPtr     ntfn_slot;    /* direct-pulse Send-cap in the client's
+                                 * CSpace (QSOE_CHF_PULSE_DIRECT), else 0 */
     unsigned      flags;
     unsigned long ctx[2];
 } tm_connection_t;
@@ -622,7 +624,8 @@ tm_thread_t  *tm_threads_array(void);    /* returns &g_threads[0] */
 /* ----------- connections ----------- */
 
 int tm_connect_attach(pid_t client_pid, pid_t target_pid, int target_chid,
-                      unsigned flags, seL4_CPtr *out_send_slot);
+                      unsigned flags, seL4_CPtr *out_send_slot,
+                      seL4_CPtr *out_ntfn_slot);
 int tm_connect_detach(pid_t client_pid, seL4_CPtr send_slot);
 int tm_connect_server_info(pid_t caller_pid, seL4_CPtr client_slot,
                             pid_t *out_server_pid, int *out_server_chid,

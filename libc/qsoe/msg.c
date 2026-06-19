@@ -105,6 +105,12 @@ void qsoe_libc_init(void *ipcbuf, pid_t self_pid)
         extern unsigned long qsoe_time_freq_hz;
         (void)qsoe_query_clock_freq(&qsoe_time_freq_hz);
 
+        /* Sync* slow path: mint the Notification-backed wait/wake
+         * machinery (and the main thread's park Notification) while still
+         * single-threaded, before any worker — including the system
+         * thread spawned just below — can hit a contended Sync. */
+        qsoe_sync_init();
+
         /* Signals-as-pulses: bring up the per-process system thread +
          * signal channel before main runs (same shape as NQ).  Failure
          * is announced inside and non-fatal -- the process just cannot
@@ -423,6 +429,38 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
      * than treating MRs as a regular message. The high bit can't
      * collide with EP-message badges, which encode pids (≤ 255). */
     if (badge & QSOE_NTFN_BADGE_BIT) {
+        /* QSOE_CHF_PULSE_DIRECT wake: the sender signaled this Notification
+         * straight (no taskman, no queued payload).  Synthesize an empty
+         * pulse and skip TM_REQ_PULSE_FETCH -- fetching would re-enter
+         * taskman and reintroduce the deadlock this path avoids.  The
+         * receiver re-checks its device on any wake, so a zero code/value
+         * is exactly right. */
+        if (badge & QSOE_NTFN_DIRECT_BIT) {
+            if (msg && bytes >= (int)sizeof(struct _pulse)) {
+                struct _pulse *p = (struct _pulse *)msg;
+                p->type    = _PULSE_TYPE;
+                p->subtype = 0;
+                p->code    = 0;
+                p->reserved[0] = p->reserved[1] = p->reserved[2] = 0;
+                p->value.sival_int = 0;
+                p->scoid   = 0;
+            }
+            if (info) {
+                info->nd        = ND_LOCAL_NODE;
+                info->pid       = 0;
+                info->chid      = chid;
+                info->scoid     = 0;
+                info->coid      = 0;
+                info->msglen    = (int)sizeof(struct _pulse);
+                info->srcmsglen = (int)sizeof(struct _pulse);
+                info->dstmsglen = bytes;
+                info->priority  = 0;
+                info->flags     = QSOE_MI_PULSE;
+                info->label     = 0;
+            }
+            return 0;
+        }
+
         seL4_Word p_mr0 = (seL4_Word)recv;
         seL4_Word p_mr1 = 0, p_mr2 = 0, p_mr3 = 0;
         seL4_MessageInfo_t p_tag = seL4_MessageInfo_new(TM_REQ_PULSE_FETCH,
@@ -648,6 +686,19 @@ int MsgSendPulse(int coid, int priority, int code, int value)
     qsoe_cancel_point();
     seL4_CPtr send = qsoe_state_coid_to_slot(coid);
     if (!send) { qsoe_errno = EBADF; return -1; }
+
+    /* QSOE_CHF_PULSE_DIRECT fast path: taskman handed us a Send-cap to the
+     * target channel's bound Notification at ConnectAttach.  Signal it
+     * straight through the kernel -- no TM_REQ_PULSE_SEND, so the wake lands
+     * even while taskman is blocked.  The payload (code/value) is dropped:
+     * a direct channel's receiver re-checks its device on any wake (the
+     * channel opted in via the flag precisely because it doesn't need it). */
+    seL4_CPtr direct = (seL4_CPtr)qsoe_direct_pulse_lookup(coid);
+    if (direct) {
+        (void)priority; (void)code; (void)value;
+        qsoe_sys_signal(direct);
+        return 0;
+    }
 
     /* MR0 = sender's coid slot, MR1 = priority, MR2 = code (8-bit
      * signed in low byte), MR3 = value. Taskman finds the target

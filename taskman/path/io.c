@@ -62,9 +62,12 @@ int tm_io_open(pid_t caller, unsigned path_len, seL4_CPtr *out_slot,
     int rc = tm_pathmgr_resolve(eff, &obj, &consumed);
     if (rc) return rc;
 
-    /* ConnectAttach mints a badged Send cap on (server_pid, server_chid). */
-    seL4_CPtr slot = 0;
-    rc = tm_connect_attach(caller, obj.server_pid, obj.server_chid, 0, &slot);
+    /* ConnectAttach mints a badged Send cap on (server_pid, server_chid).
+     * taskman never sends device pulses over this link, so the direct-pulse
+     * ntfn slot is unused here. */
+    seL4_CPtr slot = 0, ntfn_unused = 0;
+    rc = tm_connect_attach(caller, obj.server_pid, obj.server_chid, 0,
+                           &slot, &ntfn_unused);
     if (rc) return rc;
 
     /* An external resmgr (a libressrv server, not one of taskman's own

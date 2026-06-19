@@ -383,11 +383,13 @@ tm_dispatch(seL4_MessageInfo_t info, seL4_Word badge,
         break;
     }
     case TM_REQ_CONNECT_ATTACH: {
-        unsigned long send_slot = 0;
+        unsigned long send_slot = 0, ntfn_slot = 0;
         int rc = tm_connect_attach(caller, (pid_t)mr0, (int)mr1,
-                                    (unsigned)mr2, &send_slot);
+                                    (unsigned)mr2, &send_slot, &ntfn_slot);
         if (rc) { err = (seL4_Word)(-rc); }
-        else    { *out_mr0 = send_slot; reply_len = 1; }
+        else    { *out_mr0 = send_slot;       /* MR0 = send cap slot */
+                  *out_mr1 = ntfn_slot;       /* MR1 = direct-pulse ntfn slot (0 if none) */
+                  reply_len = 2; }
         break;
     }
     case TM_REQ_CONNECT_DETACH: {

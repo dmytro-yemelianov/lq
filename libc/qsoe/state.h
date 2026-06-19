@@ -67,4 +67,17 @@ extern qsoe_tcb_t qsoe_worker_tcbs[31];
 unsigned long qsoe_state_alloc_empty_slot(void);
 void          qsoe_state_free_empty_slot(unsigned long slot);
 
+/* One-time per-process setup for the Sync* slow path: mints the
+ * Notification-backed wait/wake machinery (see qsoe/sync.c).  Called
+ * from qsoe_libc_init() while still single-threaded. */
+void          qsoe_sync_init(void);
+
+/* Direct-pulse registry (QSOE_CHF_PULSE_DIRECT connections).  ConnectAttach
+ * records the Notification Send-cap taskman handed us for such a coid;
+ * MsgSendPulse signals it straight through the kernel instead of routing
+ * TM_REQ_PULSE_SEND.  lookup() returns 0 (the fallback) for a normal coid. */
+void          qsoe_direct_pulse_register(int coid, unsigned long ntfn_slot);
+unsigned long qsoe_direct_pulse_lookup(int coid);
+void          qsoe_direct_pulse_clear(int coid);
+
 #endif /* QSOE_LIBQSOE_STATE_H */
