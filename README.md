@@ -59,32 +59,34 @@ over a seL4 endpoint.
   (`TM_REQ_MMAP` / `TM_REQ_MUNMAP`).
 - **Spawn, not fork.** Process creation only via `posix_spawn(3)`.
 
-## Current state — v0.13
+## Current state — v0.14
 
-**Writable storage on real silicon, and the first mounted filesystem.**
-Building on the v0.12 PCIe-on-silicon line, real `Sched*` lets `devb-nvme`
-come up over MSI-X on the SiFive Unmatched (the Samsung NVMe enumerates and
-`/dev/nvme0n1p*` appears); under QEMU a polled virtio-mmio driver stands in
-(seL4 has no AIA, so no NVMe there). On either backend the qrvfs server
-**mounts a real filesystem at `/usr`**, taskman **spawns binaries and
-`#!`-scripts straight off it**, and `/sbin/init` hands the system to an
-on-disk `/usr/sbin/sysinit/level1.sh`. Everything also runs under QEMU
-`virt`.
+**First login from real NVMe storage on the SiFive Unmatched.** v0.13
+mounted a filesystem but wedged the instant taskman tried to spawn the
+first program off it: the spawn-image read blocked taskman, while the NVMe
+completion that would unblock it routed its wake *back through* taskman.
+v0.14 takes taskman out of the wake path entirely — `Sync*` and device
+pulses now go straight through the kernel — so QSOE/L boots NVMe → `getty`
+→ `login` → an interactive `qsh` as a real user on the board. Everything
+also runs under QEMU `virt` (polled virtio-mmio standing in for NVMe).
 
 ```
-QSOE/L Operating System version v0.13
-[init] starting devb-virtio...
-devb-virtio: /dev/vblk0 ready (16 MiB)
-[init] mounting /dev/vblk0 at /usr...
-fs-qrv: mounted qrvfs at /usr (dev=/dev/vblk0)
+QSOE/L 0.14 on sifive,hifive-unmatched-a00
+[init] mounting /dev/nvme0n1p8 at /usr...
+fs-qrv: mounted qrvfs at /usr (dev=/dev/nvme0n1p8)
 Sysinit: level1 running (on-disk init from /usr).
-[/]# ls /usr/bin
-test_syncspace  test_msgpass  suite  time
-[/]# /usr/bin/time ls /usr
-bin  sbin
 
-real  0.163371s
-[/]#
+login: user
+Password:
+Welcome to QSOE, user.
+[/home/user]$ ls /usr/bin
+test_syncspace  test_msgpass  suite  time
+[/home/user]$ ls -la /
+lrwxrwxrwx  1  0  0  9 home -> /usr/home
+dr-xr-xr-x  2  0  0  0 bin
+drwxr-xr-x  6  0  0  1536 usr
+...
+[/home/user]$
 ```
 
 What's working:
@@ -114,8 +116,8 @@ What's working:
   `slogf(opcode, severity, fmt, ...)` from libc drops records; `sloginfo`
   drains them.
 - **`Sync*` primitives.** QNX-shape mutex / condvar / semaphore — fast
-  path CAS in user-space, slow path through an address-keyed wait queue
-  in taskman.
+  path CAS in user-space, slow path through an in-process address-keyed
+  wait/wake table backed by kernel Notifications (no taskman round-trip).
 - **Pulse-based signals** with per-process system thread; no
   `TM_REQ_SIGACTION` opcode (libc-local dispositions).
 - **Resource Manager Database.** `rsrcdbmgr_create` / `_attach` /
@@ -126,6 +128,32 @@ What's working:
 - **FDT-driven syscfg.** Taskman parses the device tree at boot into a
   tagged blob (`_MEMORY`, `_CPUS`, `_PLIC`, `_PCI_ECAM`, …); user-space
   queries via `<qsoe/hwinfo.h>`.
+
+New in v0.14:
+
+- **Kernel-direct `Sync*`** — the slow path moved out of taskman into an
+  in-process address-keyed wait/wake table backed by per-thread seL4
+  Notifications (a Notification-as-mutex guards the table, safe under
+  strict priority). Same credit-absorb / gen-check semantics; mutex /
+  condvar / semaphore wakes never message taskman.
+- **Kernel-direct device pulses** (`QSOE_CHF_PULSE_DIRECT`) — a device
+  driver's MSI-pulse channel hands the connector a copy of its bound
+  Notification at `ConnectAttach`; `MsgSendPulse` signals it straight and
+  `MsgReceive` synthesizes an empty pulse. The NVMe completion wakes the
+  driver with taskman uninvolved. Together with kernel-direct `Sync*`,
+  this is what lets the spawn-image read off NVMe complete while taskman
+  is blocked on it — the v0.13 wedge is gone.
+- **First login from disk** — `getty` + `login` (crypt/shadow) chain off
+  `/usr`; boots NVMe → login → `qsh` as a uid-1000 user on the FU740.
+- **TM_REQ opcode honesty pass** — the shared "common" opcode buckets now
+  hold only messages both kernels send; every LQ-only kernel primitive
+  (sync, pulse, IRQ attach, syscfg / clock-freq, channels, connections,
+  threads, process-create, `Sched*`) lives in LQ's variant-private space.
+- **Shared-libc promotion + fd seam** — the OS-independent POSIX bodies
+  live once in the shared libc tree; `ps -H` shows per-thread names
+  (main / sigthread / irqN) via a `ThreadCtl(TCTL_NAME)` bridge.
+- **Hard-float ABI**, unified credential setters with a `setuid(0)` gate,
+  cpio cross-fs symlinks, and `MsgSendv`.
 
 New in v0.13:
 
@@ -183,11 +211,11 @@ New since v0.9 (the v0.10 MCS line and v0.11):
 
 What's deliberately not implemented: `fork()`, `select()`, `brk()`.
 
-Still ahead (v0.14+): the shared `quser/test/suite/` fully green on LQ;
-the `setuid`/`setgid` privilege check; a writable filesystem (qrvfs is
-read-only today); wall-clock `CLOCK_REALTIME`; MCS-native timers; shell
-pipelines. The umbrella roadmap (`ROADMAP.md` in the top-level `os` repo)
-sketches the path to the unified 1.0.
+Still ahead (v0.15+): the shared `quser/test/suite/` fully green on LQ; a
+writable filesystem (qrvfs is read-only today); wall-clock
+`CLOCK_REALTIME`; MCS-native timers; shell pipelines. The umbrella roadmap
+(`ROADMAP.md` in the top-level `os` repo) sketches the path to the
+unified 1.0.
 
 ## Build and run
 

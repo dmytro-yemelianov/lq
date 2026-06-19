@@ -5,6 +5,65 @@ All notable changes to QSOE. Format inspired by
 `vMAJOR.MINOR[.PATCH]` until v1.0, which is reserved for the first
 release with full QNX libc compatibility.
 
+## [v0.14] — 2026-06-19
+
+**Milestone: first login from real NVMe storage on the SiFive Unmatched.**
+v0.13 mounted a filesystem but wedged the instant taskman tried to spawn
+the first program off it — the spawn-image read blocked taskman, while the
+NVMe completion that would unblock it routed its wake back through taskman
+(a circular wait that QEMU and NQ escape but the FU740 DesignWare-MSI path
+does not). v0.14 takes taskman out of the wake path entirely, on two
+layers, so QSOE/L boots NVMe → `getty` → `login` → an interactive `qsh` as
+a real user on the board.
+
+### Taskman out of the wake path (the headline)
+- **Kernel-direct `Sync*`** — the slow path no longer messages taskman.
+  It is an in-process, address-keyed wait/wake table (the same
+  credit-absorb / gen-check model as the old `taskman/sys/sync.c`) that
+  blocks and wakes threads through per-thread seL4 Notifications. The
+  table is guarded by a Notification used as a *blocking* mutex, not a
+  spinlock — a spinlock would livelock when a high-priority IST preempts a
+  low-priority lock holder under strict priority. The orphaned
+  `TM_REQ_SYNC_WAIT/WAKE` server is removed.
+- **Kernel-direct device pulses** (`QSOE_CHF_PULSE_DIRECT`) — a
+  payload-free device-interrupt channel hands the connector a copy of its
+  bound Notification Send-cap at `ConnectAttach`; `MsgSendPulse` signals it
+  straight and `MsgReceive` synthesizes an empty pulse, skipping the
+  payload fetch. Both taskman touchpoints (`PULSE_SEND` / `PULSE_FETCH`)
+  drop out for such channels. General pulses (signals, app pulses) keep the
+  payload-carrying path. `devb-nvme` opts in, so the NVMe completion wakes
+  its IST with taskman uninvolved.
+- Net: nothing in the NVMe interrupt path re-enters taskman, so the
+  spawn-image read off the disk completes while taskman is blocked on it.
+
+### TM_REQ opcode honesty pass
+- The shared `<qsoe/tm_msgs.h>` "common" buckets had accumulated opcodes
+  only LQ ever sends — Skimmer does sync, pulses, IRQ attach, channels,
+  connections, threads, and scheduling below the syscall line. They are
+  moved into LQ's variant-private space (`>= TM_REQ_VARIANT_BASE`):
+  `CLOCK_FREQ`, `GET_SYSCFG`, `IRQ_ATTACH/DETACH`, `PULSE_SEND/FETCH`,
+  `CHANNEL_CREATE/DESTROY`, `CONNECT_*`, `THREAD_ALLOC/DESTROY`,
+  `PROCESS_CREATE/TERMINATE`, `SCHED_SET/GET`.
+- The common sys bucket is reordered to lead with system control
+  (`REBOOT`, `SHUTDOWN`, `CLOCK_SETTIME`, `SYSINFO`) then the
+  resource-manager database; the proc bucket compactifies to the
+  both-kernel process / signal / POSIX surface. Two debug/demo opcodes are
+  retired. `RSRC_*` stays common (a future resource db would be a taskman
+  service on either kernel).
+
+### Userspace and ABI
+- **First login from disk** — `getty` + `login` (crypt + `/etc/shadow`)
+  off the mounted `/usr`; boots to `qsh` as a uid-1000 user.
+- **Shared-libc promotion + fd seam** — the OS-independent POSIX bodies
+  (access, close, dup2, fcntl, fstat, getcwd, lseek, munmap, readdir,
+  umask, unlink) live once in the shared libc tree; `$HOME` propagates
+  through `crt0` to `qsh`. `ps -H` shows per-thread names (main /
+  sigthread / irqN) via a `ThreadCtl(TCTL_NAME)` bridge into taskman's
+  thread table; `pthread_setname_np` / `getname_np`.
+- **Hard-float ABI** (rv64gc, lp64d) with libc internal locks unified on
+  `sync_t`; unified credential setters with the `euid == 0` gate armed for
+  `setuid(0)`; cpio cross-fs symlinks; `MsgSendv`.
+
 ## [v0.13] — 2026-06-17
 
 **Milestone: writable storage on real silicon, and QSOE/L's first mounted
