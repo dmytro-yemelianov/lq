@@ -426,9 +426,23 @@ ifeq ($(BOARD),)
 # into each selected board to build its kernel + elfloader + ELF.
 # ============================================================================
 
+# Goals that must run with NO board selected -- the Kconfig front-ends (they
+# are how you GET a selection) and the clean targets.  $(error) is evaluated at
+# parse time, so without this it would fire for `make qemu_defconfig` itself.
+CONFIG_GOALS := menuconfig defconfig qemu_defconfig sifive_defconfig \
+                both_defconfig clean distclean
+
+# Fire only for a genuine misconfiguration: a .config that EXISTS but selects no
+# board.  A fresh tree with no .config is not an error -- the $(TOP)/.config rule
+# below bootstraps the qemu default and make re-reads.  And never block the
+# config/clean goals above.
 ifeq ($(strip $(BOARDS)),)
+ifeq ($(filter $(CONFIG_GOALS),$(MAKECMDGOALS)),)
+ifneq ($(wildcard $(TOP)/.config),)
 $(error No target board selected — run `make menuconfig` and enable at least \
 one board, or use `make qemu_defconfig` / `sifive_defconfig` / `both_defconfig`)
+endif
+endif
 endif
 
 .PHONY: all shared prepare clean distclean libc rtld libtaskman taskman modpkg \
