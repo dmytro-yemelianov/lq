@@ -495,7 +495,11 @@ $(TOP)/.config:
 # ---- shared userspace -------------------------------------------------------
 AR := $(CROSS)ar
 
-libc:
+# libc's seam (taskman/sel4_types.h) pulls in seL4's generated ABI headers
+# (arch/api/invocation.h & co.), which the qemu kernel build emits into its
+# gen_headers/.  Order-only-depend on that kernel.elf so a parallel (-j) fresh
+# build cannot compile libc before those headers exist -- mirrors taskman.
+libc: | $(TM_SEL4BUILD)/kernel.elf
 	+$(MAKE) -C $(LIBC_DIR) all
 $(LIBC_A) $(LIBC_SO) $(LIBC_CRT0): | libc
 	@true
