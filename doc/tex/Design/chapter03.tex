@@ -40,7 +40,7 @@ After sel4runtime hands control to \texttt{main()}, taskman:
 \label{sec:process-lifecycle}
 
 QSOE's process model is QNX-style: no \texttt{fork()}, only
-\texttt{posix\_spawn()} (per CLAUDE.md's architectural decisions).
+\texttt{posix\_spawn()}.
 \texttt{taskman} owns the pid namespace and the master capabilities
 for every kernel object backing a process.
 
