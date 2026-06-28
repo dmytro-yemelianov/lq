@@ -40,6 +40,7 @@ BUILD      := $(TOP)/build
 
 CROSS      ?= riscv64-linux-gnu-
 CC         := $(CROSS)gcc
+QSOE_RUST_TM_PROCFS ?= 0
 
 TASKMAN_DIR := $(TOP)/taskman
 # Public QSOE/libc headers (sys/qsoe.h, qsoe/tm_msgs.h, ...) live in
@@ -79,6 +80,14 @@ ARCH_CFLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 \
 # builds fall back to defaults.
 LIBTASKMAN_INC ?= $(abspath $(TOP)/..)/libtaskman/include
 LIBTASKMAN_A   ?= $(BUILD)/libtaskman/libtaskman.a
+REPO_ROOT := $(abspath $(TOP)/..)
+RUST_TM_PROCFS_A := $(REPO_ROOT)/build/rust/tm-procfs/libqsoe_tm_procfs.a
+
+ifeq ($(QSOE_RUST_TM_PROCFS),1)
+TASKMAN_RUST_LIBS := $(RUST_TM_PROCFS_A)
+else
+TASKMAN_RUST_LIBS :=
+endif
 
 TM_CFLAGS := $(ARCH_CFLAGS) \
     -std=c11 -ffreestanding -nostdlib -nostdinc \
@@ -230,12 +239,17 @@ TASKMAN_OBJS := \
 # symbols are referenced get pulled in, so LQ-side overrides (e.g.
 # sys/syscfg.o, kept while the API still differs) suppress libtaskman's
 # matching module cleanly.
-$(TASKMAN_ELF): $(TASKMAN_OBJS) $(LIBTASKMAN_A)
+FORCE:
+
+$(RUST_TM_PROCFS_A): FORCE
+	@$(REPO_ROOT)/scripts/build-rust-tm-procfs-provider.sh $@
+
+$(TASKMAN_ELF): $(TASKMAN_OBJS) $(LIBTASKMAN_A) $(TASKMAN_RUST_LIBS)
 	@mkdir -p $(@D)
 	$(CC) $(TM_CFLAGS) -static -nostdlib \
 	    -Wl,--build-id=none \
 	    -Wl,-Ttext-segment=0x10000 \
-	    -o $@ $(TASKMAN_OBJS) $(LIBTASKMAN_A)
+	    -o $@ $(TASKMAN_OBJS) $(LIBTASKMAN_A) $(TASKMAN_RUST_LIBS)
 
 clean:
 	rm -rf $(OBJDIR) $(TASKMAN_ELF)

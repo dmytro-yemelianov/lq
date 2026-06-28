@@ -793,41 +793,53 @@ long tm_bulk_copy(tm_process_t *src_proc, unsigned long src_va,
     while (done < len) {
         unsigned long sva = src_va + done;
         unsigned long dva = dst_va + done;
-        seL4_CPtr fs = tm_process_find_frame(src_proc, sva);
-        seL4_CPtr fd = tm_process_find_frame(dst_proc, dva);
-        if (!fs || !fd) {
+        seL4_CPtr src_cnode, src_slot;
+        seL4_Uint8 src_depth;
+        int src_is_mega;
+        seL4_CPtr dst_cnode, dst_slot;
+        seL4_Uint8 dst_depth;
+        int dst_is_mega;
+
+        if (tm_process_resolve_frame(src_proc, sva, &src_cnode, &src_slot, &src_depth, &src_is_mega) != 0 ||
+            tm_process_resolve_frame(dst_proc, dva, &dst_cnode, &dst_slot, &dst_depth, &dst_is_mega) != 0) {
             tm_err("tm_bulk_copy: unmapped VA (src pid %ld va=%08lx -> %lu, "
                    "dst pid %ld va=%08lx -> %lu)",
-                   (long)src_proc->pid, sva, (unsigned long)fs,
-                   (long)dst_proc->pid, dva, (unsigned long)fd);
+                   (long)src_proc->pid, sva, 0UL,
+                   (long)dst_proc->pid, dva, 0UL);
             return -EFAULT;
         }
-        /* Chunk = bytes left in whichever megaframe (src or dst) ends
-         * first -- the two buffers may carry independent in-page offsets. */
-        unsigned long so   = sva & (QSOE_MEGA_PAGE - 1);
-        unsigned long dof  = dva & (QSOE_MEGA_PAGE - 1);
+
+        unsigned long src_page_size = src_is_mega ? QSOE_MEGA_PAGE : QSOE_PAGE_4K;
+        unsigned long dst_page_size = dst_is_mega ? QSOE_MEGA_PAGE : QSOE_PAGE_4K;
+
+        unsigned long so  = sva & (src_page_size - 1);
+        unsigned long dof = dva & (dst_page_size - 1);
+
         unsigned long chunk = len - done;
-        if (chunk > QSOE_MEGA_PAGE - so)  chunk = QSOE_MEGA_PAGE - so;
-        if (chunk > QSOE_MEGA_PAGE - dof) chunk = QSOE_MEGA_PAGE - dof;
+        if (chunk > src_page_size - so)  chunk = src_page_size - so;
+        if (chunk > dst_page_size - dof) chunk = dst_page_size - dof;
 
         seL4_Word err = qsoe_cnode_copy(s_cnode_root, s_bulk_slot_src,
-                                         TM_BULK_CNODE_DEPTH, s_cnode_root, fs,
-                                         TM_BULK_CNODE_DEPTH, QSOE_RIGHTS_ALL);
+                                         TM_BULK_CNODE_DEPTH, src_cnode, src_slot,
+                                         src_depth, QSOE_RIGHTS_ALL);
         if (err) return -ENOMEM;
         err = qsoe_cnode_copy(s_cnode_root, s_bulk_slot_dst,
-                              TM_BULK_CNODE_DEPTH, s_cnode_root, fd,
-                              TM_BULK_CNODE_DEPTH, QSOE_RIGHTS_ALL);
+                              TM_BULK_CNODE_DEPTH, dst_cnode, dst_slot,
+                              dst_depth, QSOE_RIGHTS_ALL);
         if (err) {
             qsoe_cnode_delete(s_cnode_root, s_bulk_slot_src, TM_BULK_CNODE_DEPTH);
             return -ENOMEM;
         }
 
+        unsigned long src_scratch_va = src_is_mega ? TM_SCRATCH_MEGA_VADDR : TM_SCRATCH_VADDR;
+        unsigned long dst_scratch_va = dst_is_mega ? TM_SCRATCH_MEGA_VADDR_B : (TM_SCRATCH_VADDR + 0x1000UL);
+
         err = qsoe_riscv_page_map(s_bulk_slot_src, seL4_CapInitThreadVSpace,
-                                  TM_SCRATCH_MEGA_VADDR, QSOE_RIGHTS_ALL,
+                                  src_scratch_va, QSOE_RIGHTS_ALL,
                                   QSOE_VM_ATTR_DEFAULT);
         if (!err)
             err = qsoe_riscv_page_map(s_bulk_slot_dst, seL4_CapInitThreadVSpace,
-                                      TM_SCRATCH_MEGA_VADDR_B, QSOE_RIGHTS_ALL,
+                                      dst_scratch_va, QSOE_RIGHTS_ALL,
                                       QSOE_VM_ATTR_DEFAULT);
         if (err) {
             qsoe_riscv_page_unmap(s_bulk_slot_src);
@@ -836,8 +848,8 @@ long tm_bulk_copy(tm_process_t *src_proc, unsigned long src_va,
             return -ENOMEM;
         }
 
-        qmemcpy((void *)(TM_SCRATCH_MEGA_VADDR_B + dof),
-                (const void *)(TM_SCRATCH_MEGA_VADDR + so), chunk);
+        qmemcpy((void *)(dst_scratch_va + dof),
+                (const void *)(src_scratch_va + so), chunk);
         __asm__ volatile ("fence rw, rw" ::: "memory");
 
         qsoe_riscv_page_unmap(s_bulk_slot_src);
@@ -1731,6 +1743,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                            (unsigned long)merr);
                     return -ENOMEM;
                 }
+                op->objcnode_va[op->objcnode_next] = s_frames[i].va_page;
                 op->objcnode_next++;
                 taskman_free_slot(src);
             }
@@ -1749,6 +1762,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                            (unsigned long)merr);
                     return -ENOMEM;
                 }
+                op->objcnode_va[op->objcnode_next] = 0;
                 op->objcnode_next++;
                 taskman_free_slot(src);
             }

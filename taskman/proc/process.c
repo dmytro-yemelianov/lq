@@ -15,6 +15,7 @@
 #include "../qsoe_invoke.h"
 #include "../path/cpiofs.h"  /* tm_cpio_lookup */
 #include <tm_log.h>
+#include <tm_pathmgr.h>
 #include <tm_cred.h>          /* tm_cred_change_permitted */
 #include <qsoe/slots.h>
 #include <cpio.h>
@@ -250,6 +251,9 @@ void tm_init(seL4_CPtr ut, seL4_CPtr cnode_root, seL4_CPtr first_free)
     g_processes[0].pput_count = 0;
     g_processes[0].objcnode = 0;
     g_processes[0].objcnode_next = 0;
+    for (int j = 0; j < (1 << TM_OBJCNODE_RADIX); ++j) {
+        g_processes[0].objcnode_va[j] = 0;
+    }
     g_processes[0].fault_ep = 0;
 }
 
@@ -305,6 +309,9 @@ int tm_process_register(pid_t pid, seL4_CPtr cnode,
         g_processes[i].pput_count = 0;
         g_processes[i].objcnode = 0;
         g_processes[i].objcnode_next = 0;
+        for (int j = 0; j < (1 << TM_OBJCNODE_RADIX); ++j) {
+            g_processes[i].objcnode_va[j] = 0;
+        }
         g_processes[i].fault_ep = 0;
         return 0;
     }
@@ -337,6 +344,63 @@ seL4_CPtr tm_process_find_frame(const tm_process_t *proc, unsigned long va)
         if (proc->mmap[i].va_page == key) return proc->mmap[i].frame;
     }
     return 0;
+}
+
+int tm_process_resolve_frame(const tm_process_t *proc, unsigned long va,
+                             seL4_CPtr *out_cnode, seL4_CPtr *out_slot,
+                             seL4_Uint8 *out_depth, int *out_is_mega)
+{
+    if (!proc) return -EINVAL;
+
+    /* 1. Check anonymous mmap region (Mega_Pages) */
+    unsigned long key_mega = va & ~(QSOE_MEGA_PAGE - 1);
+    for (int i = 0; i < proc->mmap_count; ++i) {
+        if (proc->mmap[i].va_page == key_mega) {
+            *out_cnode = s_cnode_root;
+            *out_slot  = proc->mmap[i].frame;
+            *out_depth = TM_DEPTH_TASKMAN;
+            *out_is_mega = 1;
+            return 0;
+        }
+    }
+
+    /* 2. Check RELRO region (4 KiB pages) */
+    unsigned long key_4k = va & ~0xFFFUL;
+    for (int i = 0; i < proc->mprot_count; ++i) {
+        if (proc->mprot[i].va_page == key_4k) {
+            *out_cnode = s_cnode_root;
+            *out_slot  = proc->mprot[i].frame;
+            *out_depth = TM_DEPTH_TASKMAN;
+            *out_is_mega = 0;
+            return 0;
+        }
+    }
+
+    /* 3. Check object CNode (image/stack 4 KiB pages) */
+    if (proc->objcnode) {
+        for (int i = 0; i < proc->objcnode_next; ++i) {
+            if (proc->objcnode_va[i] == key_4k) {
+                *out_cnode = proc->objcnode;
+                *out_slot  = (seL4_CPtr)i;
+                *out_depth = TM_OBJCNODE_RADIX;
+                *out_is_mega = 0;
+                return 0;
+            }
+        }
+    }
+
+    /* 4. Check device frames (MAP_PHYS) */
+    for (int i = 0; i < proc->devframe_count; ++i) {
+        if (proc->devframe_va[i] == key_4k) {
+            *out_cnode = s_cnode_root;
+            *out_slot  = proc->devframes[i];
+            *out_depth = TM_DEPTH_TASKMAN;
+            *out_is_mega = 0;
+            return 0;
+        }
+    }
+
+    return -EFAULT;
 }
 
 seL4_CPtr tm_process_alloc_slot(pid_t pid)
@@ -870,6 +934,8 @@ int tm_process_terminate(pid_t target, int status)
      * never run the teardown again -- just succeed. */
     if (p->exit_state != 0) return 0;
 
+    tm_pathmgr_unregister_pid(target);
+
     p->exit_state  = TM_EXIT_ZOMBIE;
     p->exit_status = status;
     int delivered = 0;
@@ -965,6 +1031,21 @@ int tm_process_terminate(pid_t target, int status)
     qsoe_cnode_revoke(s_cnode_root, p->vspace, TM_DEPTH_TASKMAN);
     qsoe_cnode_delete(s_cnode_root, p->vspace, TM_DEPTH_TASKMAN);
     taskman_free_slot(p->vspace);
+
+    /* Clear all capabilities inside the child's CSpace to avoid leaks and unblock clients.
+     * Running this after the TCB is destroyed (Step 4) guarantees that the kernel has already
+     * cancelled and unblocked any reply-blocked client threads before we delete the
+     * Reply Object capability in slot 10. */
+    if (p->cnode) {
+        seL4_Uint8 ddepth = cnode_depth_for(target);
+        for (seL4_CPtr slot = 1; slot < (seL4_CPtr)p->next_slot; ++slot) {
+            /* Skip slot 9 (QSOE_CAP_CNODE_SELF) and slot 1 (QSOE_CAP_TASKMAN_EP)
+             * to avoid self-revocation problems while we are clearing the CSpace. */
+            if (slot == 1 || slot == 9) continue;
+            (void) qsoe_cnode_revoke(p->cnode, slot, ddepth);
+            (void) qsoe_cnode_delete(p->cnode, slot, ddepth);
+        }
+    }
 
     /* 6. CNode. */
     qsoe_cnode_revoke(s_cnode_root, p->cnode, TM_DEPTH_TASKMAN);
