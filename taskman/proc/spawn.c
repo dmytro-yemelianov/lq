@@ -1561,9 +1561,15 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         auxv[auxc++] = (struct aux_pair){ AT_KPRELOAD_, DL_LIBC_LOAD_VA };
     }
 
+    int argpack_rc = tm_spawn_argpack_prepare(&argpack, argc, argv, envc, envp,
+                                              auxv, auxc);
+    if (argpack_rc != 0) {
+        tm_err("spawn: tm_spawn_argpack_prepare failed rc=%d", argpack_rc);
+        return argpack_rc;
+    }
+
     unsigned long initial_sp =
-        build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1],
-                            argc, argv, envc, envp, auxv, auxc);
+        build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1], &argpack);
     if (!initial_sp) {
         tm_err("spawn: build_initial_stack failed");
         return -E2BIG;
