@@ -1267,6 +1267,363 @@ static int tm_spawn_build_runtime_pages(tm_spawn_build_t *build,
     return 0;
 }
 
+static int tm_spawn_commit_cspace(const tm_spawn_build_t *build,
+                                  pid_t pid,
+                                  seL4_CPtr primary_ep,
+                                  seL4_CPtr *child_untyped_out)
+{
+    seL4_CPtr cnode = build->cnode;
+    seL4_Word err;
+
+    /* 5. Populate the child's CSpace. Slot 1 = Send cap to taskman's
+     *    primary endpoint, badged with the child's pid. The child's
+     *    CNode is freshly retyped — depth = its radix (12), no guard.
+     *    The TCB_Configure step below sets a guard that gives the child
+     *    a 64-bit effective CSpace at runtime. */
+    err = qsoe_cnode_mint(cnode, QSOE_CAP_TASKMAN_EP, 12,
+                          s_cnode_root, primary_ep, 64,
+                          QSOE_RIGHTS_SEND, (seL4_Word)pid);
+    if (err) { tm_err("spawn: mint TASKMAN_EP failed"); return -ENOMEM; }
+
+    /* 5b. Untyped budget. Retype 256 KiB (2^18) of untyped out of
+     *     taskman's pool; copy the resulting Untyped cap into the
+     *     child's slot QSOE_CAP_OWN_UNTYPED. v0.4.1 just *establishes*
+     *     the budget — libqsoe still goes through taskman for
+     *     ChannelCreate. v0.5 will let the child retype from this
+     *     directly. */
+    seL4_CPtr child_untyped = alloc_object(seL4_UntypedObject, 18);
+    if (!child_untyped) {
+        tm_err("spawn: child untyped retype failed");
+        return -ENOMEM;
+    }
+    err = qsoe_cnode_copy(cnode, QSOE_CAP_OWN_UNTYPED, 12,
+                          s_cnode_root, child_untyped, 64,
+                          QSOE_RIGHTS_ALL);
+    if (err) { tm_err("spawn: copy OWN_UNTYPED failed"); return -ENOMEM; }
+
+    /* 5b'. Copy the child's own CNode cap into its slot
+     *      QSOE_CAP_CNODE_SELF so the child can move a reply object
+     *      within its own CSpace from inside — required for resmgr
+     *      park-the-caller patterns (devc-ser8250 RX). */
+    err = qsoe_cnode_copy(cnode, QSOE_CAP_CNODE_SELF, 12,
+                          s_cnode_root, cnode, 64,
+                          QSOE_RIGHTS_ALL);
+    if (err) { tm_err("spawn: copy CNODE_SELF failed"); return -ENOMEM; }
+
+    /* 4c. v0.6.4: no pre-allocated heap.  Memory comes on demand via
+     * TM_REQ_MMAP after the child runs.  See tm_mmap_serve below. */
+
+    /* 5c. v0.5.0/v0.6.1: stdio inheritance. Resolve the CURRENT
+     *     /dev/console binding via the path manager — early in boot
+     *     this is (taskman, TM_CONSOLE_CHID, in-taskman handler);
+     *     after init runs pathmgr_repath it points at the real UART
+     *     driver's channel. Mint three badged Send-caps on whatever
+     *     channel master is currently registered, then record each
+     *     connection in taskman's table. */
+    tm_pathmgr_obj_t console_obj;
+    unsigned cons_consumed = 0;
+    if (tm_pathmgr_resolve("/dev/console", &console_obj, &cons_consumed) != 0) {
+        tm_err("spawn: /dev/console not in pathmgr");
+        return -EINVAL;
+    }
+    int console_idx = tm_channel_index(console_obj.server_pid,
+                                        console_obj.server_chid);
+    if (console_idx < 0) {
+        tm_err("spawn: /dev/console channel not registered");
+        return -EINVAL;
+    }
+    seL4_CPtr console_master = tm_channel_master(console_idx);
+    if (!console_master) {
+        tm_err("spawn: /dev/console master cap missing");
+        return -EINVAL;
+    }
+    static const seL4_CPtr stdio_slots[3] = {
+        QSOE_CAP_STDIN_CONNECT,
+        QSOE_CAP_STDOUT_CONNECT,
+        QSOE_CAP_STDERR_CONNECT,
+    };
+    for (int i = 0; i < 3; ++i) {
+        seL4_Word scoid = tm_alloc_scoid();
+        err = qsoe_cnode_mint(cnode, stdio_slots[i], 12,
+                              s_cnode_root, console_master, 64,
+                              QSOE_RIGHTS_SEND, scoid);
+        if (err) {
+            tm_err("spawn: mint stdio cap failed");
+            return -ENOMEM;
+        }
+        if (tm_connection_register_existing(pid, stdio_slots[i],
+                                             console_idx, scoid, 0) != 0) {
+            tm_err("spawn: register stdio connection failed");
+            return -ENOMEM;
+        }
+    }
+
+    /* (No spawn-time UART cap granting.)  devc-ser8250 maps the 16550
+     * itself via mmap(MAP_PHYS, UART_PHYS) and claims PLIC line 10 at
+     * runtime via InterruptAttachThread.  The old v0.6.1 ELF-name-gated
+     * block that pre-mapped the UART MMIO + pre-minted the IRQHandler
+     * was removed (v0.10): besides being dead, its retype of a 4 KiB
+     * frame from the UART device-untyped advanced that untyped's
+     * watermark, so devc's own mmap_phys then landed one frame past the
+     * UART (phys 0x10001000, the virtio window) -- the driver mapped the
+     * wrong device and uart_tx spun forever on a bogus LSR. */
+
+    *child_untyped_out = child_untyped;
+    return 0;
+}
+
+static int tm_spawn_commit_tcb(const tm_spawn_build_t *build,
+                               pid_t pid,
+                               seL4_CPtr primary_ep,
+                               unsigned long entry_pc,
+                               seL4_CPtr *sc_out,
+                               seL4_CPtr *fault_ep_out)
+{
+    seL4_CPtr cnode = build->cnode;
+    seL4_CPtr vspace = build->vspace;
+    seL4_CPtr tcb = build->tcb;
+    seL4_Word err;
+
+    /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
+     *    12) and guard value 0; the CNode is 2^12 slots so addresses
+     *    fit in 12 bits. seL4_CNode_CapData layout: bits[0..5] =
+     *    guardSize, bits[6..63] = guard value. */
+    seL4_Word cnode_data = 52UL;  /* guardSize=52, guard=0 */
+    err = qsoe_tcb_configure(tcb,
+                              cnode, cnode_data,
+                              vspace, 0 /*vspace_data*/,
+                              CHILD_IPC_BUFFER, build->ipc_frame);
+    if (err) { tm_err("spawn: TCB_Configure failed"); return -ENOMEM; }
+
+    /* MCS: a TCB cannot run until a scheduling context is bound.  Give
+     * the main thread a round-robin SC on core 0 and bind it (along with
+     * priority) via SetSchedParams.  Spawned processes run in the QNX
+     * default user band (TM_PRIO_USER_DEFAULT), well below taskman; taskman
+     * blocks on Recv when idle, so user threads always get the CPU. */
+    seL4_CPtr sc = tm_sched_context_create(/*core=*/0);
+    if (!sc) { tm_err("spawn: sched-context create failed"); return -ENOMEM; }
+    /* Graceful crash: give the main thread a fault handler -- a badged
+     * Send+GrantReply cap to taskman's primary EP (QSOE_RIGHTS_SEND
+     * already grants reply).  On a fatal U-mode fault seL4 delivers a
+     * fault IPC here (badge = pid | TM_FAULT_BADGE_FLAG) instead of
+     * wedging the thread; the dispatcher then terminates the process.
+     * The TCB derives its own copy of the cap, so our temp slot is
+     * reclaimed right after. */
+    seL4_CPtr fault_ep = taskman_alloc_empty_slot();
+    err = qsoe_cnode_mint(s_cnode_root, fault_ep, TM_DEPTH_TASKMAN,
+                          s_cnode_root, primary_ep, TM_DEPTH_TASKMAN,
+                          QSOE_RIGHTS_SEND,
+                          TM_FAULT_BADGE_FLAG | (seL4_Word)pid);
+    if (err) { tm_err("spawn: fault-ep mint failed"); return -ENOMEM; }
+    err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
+                                    /*mcp=*/TM_PRIO_USER_DEFAULT,
+                                    /*prio=*/TM_PRIO_USER_DEFAULT,
+                                    sc, fault_ep);
+    if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return -ENOMEM; }
+    /* The minted fault cap must stay in our CSpace -- the TCB references
+     * it (deleting it strips the handler).  Stashed in the record below
+     * and freed in teardown once the TCB is gone. */
+
+    /* MCS: provision the child's reply object at the well-known slot its
+     * libc MsgReceive/MsgReply ride (register a6 / Send target).  Retype
+     * straight into the child's CNode (node_depth 0 => cnode is the dest
+     * CNode itself), mirroring the IRQ-notification retype above. */
+    err = qsoe_untyped_retype(s_untyped, seL4_ReplyObject, 0,
+                              cnode, 0, 0, QSOE_CAP_REPLY, 1);
+    if (err) { tm_err("spawn: child reply object retype failed"); return -ENOMEM; }
+
+    /* 7. WriteRegisters: pc=entry, a0=pid, sp=initial_sp (pointing
+     *    at argc in the SysV image we just wrote into the top stack
+     *    page). gp=0 because the binary's start.S sets it itself.
+     *
+     *    For static binaries entry_pc == eh->e_entry.  For dynamic
+     *    binaries it's rtld's .rtld_start; rtld parses the auxv,
+     *    relocates qsh + libc.so, then jumps to qsh.e_entry. */
+    qsoe_user_ctx_t ctx;
+    qmemset(&ctx, 0, sizeof ctx);
+    ctx.pc = entry_pc;
+    ctx.sp = build->initial_sp;
+    ctx.gp = 0;
+    ctx.tp = CHILD_TCB_BASE;     /* points at the zeroed TCB page above */
+    ctx.a0 = (seL4_Word)pid;
+    err = qsoe_tcb_write_registers(tcb, 0, &ctx);
+    if (err) { tm_err("spawn: TCB_WriteRegisters failed"); return -ENOMEM; }
+
+    *sc_out = sc;
+    *fault_ep_out = fault_ep;
+    return 0;
+}
+
+static int tm_spawn_commit_process(const tm_spawn_build_t *build,
+                                   pid_t pid,
+                                   seL4_CPtr child_untyped,
+                                   seL4_CPtr fault_ep,
+                                   seL4_CPtr sc,
+                                   seL4_CPtr workers_l1_cap,
+                                   const char *elf_name)
+{
+    seL4_CPtr cnode = build->cnode;
+    seL4_CPtr vspace = build->vspace;
+    seL4_CPtr tcb = build->tcb;
+
+    /* 8. Register the new process in taskman's process table so the
+     *    lifecycle handlers can find its CSpace + slot allocator. */
+    int reg_err = tm_process_register(pid, cnode, tcb, vspace,
+                                       QSOE_CAP_WELL_KNOWN_END);
+    if (reg_err) {
+        tm_err("spawn: tm_process_register failed");
+        return reg_err;
+    }
+    /* Record the child's untyped budget master for cleanup on terminate,
+     * and capture the ELF basename as the process name for /proc. */
+    tm_process_t *prec = tm_process_lookup(pid);
+    if (prec) {
+        prec->untyped_budget = child_untyped;
+        prec->fault_ep       = fault_ep;
+        /* Seed the main thread's tracked scheduling state to match the
+         * priority/policy it was just configured with (SetSchedParams
+         * above), so SchedGet reports the truth before any SchedSet. */
+        prec->sched_prio     = TM_PRIO_USER_DEFAULT;
+        prec->sched_policy   = TM_SCHED_RR;
+        const char *base = elf_name ? elf_name : "?";
+        for (const char *s = base; *s; ++s)
+            if (*s == '/') base = s + 1;
+        unsigned ni = 0;
+        while (base[ni] != '\0' && ni < sizeof prec->name - 1) {
+            prec->name[ni] = base[ni];
+            ++ni;
+        }
+        prec->name[ni] = '\0';
+        /* Main-thread ps(1) label starts empty (the main thread tags
+         * itself "main" via ThreadCtl at startup); clear it here so a
+         * reused process slot never shows a stale label. */
+        prec->main_name[0] = '\0';
+    }
+    /* Hand the dyn-link L1 PT to the worker-region allocator (same
+     * L2[1] slot covers libc.so/rtld AND the worker region at 0x40000000). */
+    if (prec && workers_l1_cap) prec->workers_l1_pt = workers_l1_cap;
+
+    /* 8b. Register the connection record for the SYSMGR_COID cap we
+     *     minted in step 5. The badge we used was `pid` itself, so the
+     *     server-side ConnectClientInfo(scoid==pid) will resolve to
+     *     this connection. Without this record, ConnectServerInfo /
+     *     ConnectFlags on SYSMGR_COID would EBADF in the child. */
+    /* The primary channel was registered in main.c with raw chid=1.
+     * tm_channel_index matches owner_chid as stored, so we use the
+     * raw index here -- NOT the encoded TASKMAN_CHID = (gen<<16)|idx
+     * the user-facing ABI exposes (see <sys/qsoe.h>).               */
+    int primary_idx = tm_channel_index(QSOE_PID_TASKMAN, /*raw chid*/1);
+    tm_dbg("spawn: probe channel pid=%lu chid=1 -> idx=%ld",
+            (unsigned long)QSOE_PID_TASKMAN, (long)primary_idx);
+    if (primary_idx < 0) {
+        tm_err("spawn: primary channel not registered yet");
+        return -EINVAL;
+    }
+    int cnreg = tm_connection_register_existing(pid, QSOE_CAP_TASKMAN_EP,
+                                                primary_idx,
+                                                (seL4_Word)pid, 0);
+    if (cnreg) {
+        tm_err("spawn: tm_connection_register_existing failed");
+        return cnreg;
+    }
+
+    /* Slot reclamation: move the image-frame caps (the bulk of this
+     * process's cap count) out of the flat root CNode into its own
+     * object CNode.  Their root slots return to the free list right
+     * away; on exit the objcnode -- a pp_ut child -- is destroyed by
+     * Revoke(pput), freeing all of them together.  The page mapping
+     * lives in the frame cap, so it survives the move; safe now that the
+     * loads and the relocation pass have finished touching the frames. */
+    tm_process_t *op = tm_process_lookup(pid);
+    if (op) {
+        op->sc = sc;   /* main-thread SC slot, freed in teardown */
+        seL4_CPtr objc = alloc_object(seL4_CapTableObject, TM_OBJCNODE_RADIX);
+        if (!objc) { tm_err("spawn: objcnode alloc failed"); return -ENOMEM; }
+        op->objcnode      = objc;
+        op->objcnode_next = 0;
+        for (int i = 0; i < s_frame_count; ++i) {
+            seL4_CPtr src  = s_frames[i].frame;
+            /* RELRO pages keep their cap INVOKEABLE (left in the root
+             * slot, recorded in op->mprot[]) so TM_REQ_MPROTECT can
+             * re-map them; everything else moves to the objcnode. */
+            if (va_in_relro(s_frames[i].va_page)) {
+                if (op->mprot_count >= TM_MAX_MPROT) {
+                    tm_err("spawn: pid %ld RELRO tracker full (cap=%d)",
+                           (long)pid, TM_MAX_MPROT);
+                    return -ENOMEM;
+                }
+                op->mprot[op->mprot_count].va_page = s_frames[i].va_page;
+                op->mprot[op->mprot_count].frame   = src;
+                op->mprot_count++;
+                continue;
+            }
+            seL4_Word merr = qsoe_cnode_move(objc,
+                                             (seL4_Word)op->objcnode_next,
+                                             TM_OBJCNODE_RADIX,
+                                             s_cnode_root, src,
+                                             TM_DEPTH_TASKMAN);
+            if (merr) {
+                tm_err("spawn: objcnode move failed err=%lu",
+                       (unsigned long)merr);
+                return -ENOMEM;
+            }
+            op->objcnode_next++;
+            taskman_free_slot(src);
+        }
+        /* Same for the per-spawn page-table caps: relocate into the
+         * objcnode (the mapping lives in the parent PT, not the cap,
+         * so the move is transparent) and reclaim their root slots. */
+        for (int i = 0; i < s_pt_count; ++i) {
+            seL4_CPtr src  = s_pt_slots[i];
+            seL4_Word merr = qsoe_cnode_move(objc,
+                                             (seL4_Word)op->objcnode_next,
+                                             TM_OBJCNODE_RADIX,
+                                             s_cnode_root, src,
+                                             TM_DEPTH_TASKMAN);
+            if (merr) {
+                tm_err("spawn: objcnode PT move failed err=%lu",
+                       (unsigned long)merr);
+                return -ENOMEM;
+            }
+            op->objcnode_next++;
+            taskman_free_slot(src);
+        }
+    }
+
+    return 0;
+}
+
+static int tm_spawn_commit(const tm_spawn_build_t *build,
+                           pid_t pid,
+                           seL4_CPtr primary_ep,
+                           unsigned long entry_pc,
+                           seL4_CPtr workers_l1_cap,
+                           const char *elf_name)
+{
+    /* COMMIT phase: publish caps/process records and resume only after
+     * the address space, stack, and loader state have been built. */
+    seL4_CPtr child_untyped = 0;
+    seL4_CPtr sc = 0;
+    seL4_CPtr fault_ep = 0;
+
+    int rc = tm_spawn_commit_cspace(build, pid, primary_ep, &child_untyped);
+    if (rc != 0) return rc;
+
+    rc = tm_spawn_commit_tcb(build, pid, primary_ep, entry_pc,
+                             &sc, &fault_ep);
+    if (rc != 0) return rc;
+
+    rc = tm_spawn_commit_process(build, pid, child_untyped, fault_ep, sc,
+                                 workers_l1_cap, elf_name);
+    if (rc != 0) return rc;
+
+    /* 9. Liftoff. */
+    seL4_Word err = qsoe_tcb_resume(build->tcb);
+    if (err) { tm_err("spawn: TCB_Resume failed"); return -ENOMEM; }
+
+    return 0;
+}
+
 int tm_spawn(const void *elf_blob, unsigned long elf_len,
              pid_t pid, seL4_CPtr primary_ep,
              int argc, const char *const *argv,
@@ -1371,9 +1728,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     int build_rc = tm_spawn_build_base_objects(&build, &plan);
     if (build_rc != 0) return build_rc;
 
-    seL4_CPtr cnode = build.cnode;
     seL4_CPtr vspace = build.vspace;
-    seL4_CPtr tcb = build.tcb;
     seL4_Word err = 0;
     int load_rc = 0;
 
@@ -1574,299 +1929,6 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                             argc, argv, envc, envp);
     if (build_rc != 0) return build_rc;
 
-    seL4_CPtr ipc_frame = build.ipc_frame;
-    unsigned long initial_sp = build.initial_sp;
-
-    /* COMMIT phase: publish caps/process records and resume only after
-     * the address space, stack, and loader state have been built. */
-
-    /* 5. Populate the child's CSpace. Slot 1 = Send cap to taskman's
-     *    primary endpoint, badged with the child's pid. The child's
-     *    CNode is freshly retyped — depth = its radix (12), no guard.
-     *    The TCB_Configure step below sets a guard that gives the child
-     *    a 64-bit effective CSpace at runtime. */
-    err = qsoe_cnode_mint(cnode, QSOE_CAP_TASKMAN_EP, 12,
-                          s_cnode_root, primary_ep, 64,
-                          QSOE_RIGHTS_SEND, (seL4_Word)pid);
-    if (err) { tm_err("spawn: mint TASKMAN_EP failed"); return -ENOMEM; }
-
-    /* 5b. Untyped budget. Retype 256 KiB (2^18) of untyped out of
-     *     taskman's pool; copy the resulting Untyped cap into the
-     *     child's slot QSOE_CAP_OWN_UNTYPED. v0.4.1 just *establishes*
-     *     the budget — libqsoe still goes through taskman for
-     *     ChannelCreate. v0.5 will let the child retype from this
-     *     directly. */
-    seL4_CPtr child_untyped = alloc_object(seL4_UntypedObject, 18);
-    if (!child_untyped) {
-        tm_err("spawn: child untyped retype failed");
-        return -ENOMEM;
-    }
-    err = qsoe_cnode_copy(cnode, QSOE_CAP_OWN_UNTYPED, 12,
-                          s_cnode_root, child_untyped, 64,
-                          QSOE_RIGHTS_ALL);
-    if (err) { tm_err("spawn: copy OWN_UNTYPED failed"); return -ENOMEM; }
-
-    /* 5b'. Copy the child's own CNode cap into its slot
-     *      QSOE_CAP_CNODE_SELF so the child can move a reply object
-     *      within its own CSpace from inside — required for resmgr
-     *      park-the-caller patterns (devc-ser8250 RX). */
-    err = qsoe_cnode_copy(cnode, QSOE_CAP_CNODE_SELF, 12,
-                          s_cnode_root, cnode, 64,
-                          QSOE_RIGHTS_ALL);
-    if (err) { tm_err("spawn: copy CNODE_SELF failed"); return -ENOMEM; }
-
-    /* 4c. v0.6.4: no pre-allocated heap.  Memory comes on demand via
-     * TM_REQ_MMAP after the child runs.  See tm_mmap_serve below. */
-
-    /* 5c. v0.5.0/v0.6.1: stdio inheritance. Resolve the CURRENT
-     *     /dev/console binding via the path manager — early in boot
-     *     this is (taskman, TM_CONSOLE_CHID, in-taskman handler);
-     *     after init runs pathmgr_repath it points at the real UART
-     *     driver's channel. Mint three badged Send-caps on whatever
-     *     channel master is currently registered, then record each
-     *     connection in taskman's table. */
-    tm_pathmgr_obj_t console_obj;
-    unsigned cons_consumed = 0;
-    if (tm_pathmgr_resolve("/dev/console", &console_obj, &cons_consumed) != 0) {
-        tm_err("spawn: /dev/console not in pathmgr");
-        return -EINVAL;
-    }
-    int console_idx = tm_channel_index(console_obj.server_pid,
-                                        console_obj.server_chid);
-    if (console_idx < 0) {
-        tm_err("spawn: /dev/console channel not registered");
-        return -EINVAL;
-    }
-    seL4_CPtr console_master = tm_channel_master(console_idx);
-    if (!console_master) {
-        tm_err("spawn: /dev/console master cap missing");
-        return -EINVAL;
-    }
-    static const seL4_CPtr stdio_slots[3] = {
-        QSOE_CAP_STDIN_CONNECT,
-        QSOE_CAP_STDOUT_CONNECT,
-        QSOE_CAP_STDERR_CONNECT,
-    };
-    for (int i = 0; i < 3; ++i) {
-        seL4_Word scoid = tm_alloc_scoid();
-        err = qsoe_cnode_mint(cnode, stdio_slots[i], 12,
-                              s_cnode_root, console_master, 64,
-                              QSOE_RIGHTS_SEND, scoid);
-        if (err) {
-            tm_err("spawn: mint stdio cap failed");
-            return -ENOMEM;
-        }
-        if (tm_connection_register_existing(pid, stdio_slots[i],
-                                             console_idx, scoid, 0) != 0) {
-            tm_err("spawn: register stdio connection failed");
-            return -ENOMEM;
-        }
-    }
-
-    /* (No spawn-time UART cap granting.)  devc-ser8250 maps the 16550
-     * itself via mmap(MAP_PHYS, UART_PHYS) and claims PLIC line 10 at
-     * runtime via InterruptAttachThread.  The old v0.6.1 ELF-name-gated
-     * block that pre-mapped the UART MMIO + pre-minted the IRQHandler
-     * was removed (v0.10): besides being dead, its retype of a 4 KiB
-     * frame from the UART device-untyped advanced that untyped's
-     * watermark, so devc's own mmap_phys then landed one frame past the
-     * UART (phys 0x10001000, the virtio window) -- the driver mapped the
-     * wrong device and uart_tx spun forever on a bogus LSR. */
-
-    /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
-     *    12) and guard value 0; the CNode is 2^12 slots so addresses
-     *    fit in 12 bits. seL4_CNode_CapData layout: bits[0..5] =
-     *    guardSize, bits[6..63] = guard value. */
-    seL4_Word cnode_data = 52UL;  /* guardSize=52, guard=0 */
-    err = qsoe_tcb_configure(tcb,
-                              cnode, cnode_data,
-                              vspace, 0 /*vspace_data*/,
-                              CHILD_IPC_BUFFER, ipc_frame);
-    if (err) { tm_err("spawn: TCB_Configure failed"); return -ENOMEM; }
-
-    /* MCS: a TCB cannot run until a scheduling context is bound.  Give
-     * the main thread a round-robin SC on core 0 and bind it (along with
-     * priority) via SetSchedParams.  Spawned processes run in the QNX
-     * default user band (TM_PRIO_USER_DEFAULT), well below taskman; taskman
-     * blocks on Recv when idle, so user threads always get the CPU. */
-    seL4_CPtr sc = tm_sched_context_create(/*core=*/0);
-    if (!sc) { tm_err("spawn: sched-context create failed"); return -ENOMEM; }
-    /* Graceful crash: give the main thread a fault handler -- a badged
-     * Send+GrantReply cap to taskman's primary EP (QSOE_RIGHTS_SEND
-     * already grants reply).  On a fatal U-mode fault seL4 delivers a
-     * fault IPC here (badge = pid | TM_FAULT_BADGE_FLAG) instead of
-     * wedging the thread; the dispatcher then terminates the process.
-     * The TCB derives its own copy of the cap, so our temp slot is
-     * reclaimed right after. */
-    seL4_CPtr fault_ep = taskman_alloc_empty_slot();
-    err = qsoe_cnode_mint(s_cnode_root, fault_ep, TM_DEPTH_TASKMAN,
-                          s_cnode_root, primary_ep, TM_DEPTH_TASKMAN,
-                          QSOE_RIGHTS_SEND,
-                          TM_FAULT_BADGE_FLAG | (seL4_Word)pid);
-    if (err) { tm_err("spawn: fault-ep mint failed"); return -ENOMEM; }
-    err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
-                                    /*mcp=*/TM_PRIO_USER_DEFAULT,
-                                    /*prio=*/TM_PRIO_USER_DEFAULT,
-                                    sc, fault_ep);
-    if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return -ENOMEM; }
-    /* The minted fault cap must stay in our CSpace -- the TCB references
-     * it (deleting it strips the handler).  Stashed in the record below
-     * and freed in teardown once the TCB is gone. */
-
-    /* MCS: provision the child's reply object at the well-known slot its
-     * libc MsgReceive/MsgReply ride (register a6 / Send target).  Retype
-     * straight into the child's CNode (node_depth 0 => cnode is the dest
-     * CNode itself), mirroring the IRQ-notification retype above. */
-    err = qsoe_untyped_retype(s_untyped, seL4_ReplyObject, 0,
-                              cnode, 0, 0, QSOE_CAP_REPLY, 1);
-    if (err) { tm_err("spawn: child reply object retype failed"); return -ENOMEM; }
-
-    /* 7. WriteRegisters: pc=entry, a0=pid, sp=initial_sp (pointing
-     *    at argc in the SysV image we just wrote into the top stack
-     *    page). gp=0 because the binary's start.S sets it itself.
-     *
-     *    For static binaries entry_pc == eh->e_entry.  For dynamic
-     *    binaries it's rtld's .rtld_start; rtld parses the auxv,
-     *    relocates qsh + libc.so, then jumps to qsh.e_entry. */
-    qsoe_user_ctx_t ctx;
-    qmemset(&ctx, 0, sizeof ctx);
-    ctx.pc = entry_pc;
-    ctx.sp = initial_sp;
-    ctx.gp = 0;
-    ctx.tp = CHILD_TCB_BASE;     /* points at the zeroed TCB page above */
-    ctx.a0 = (seL4_Word)pid;
-    err = qsoe_tcb_write_registers(tcb, 0, &ctx);
-    if (err) { tm_err("spawn: TCB_WriteRegisters failed"); return -ENOMEM; }
-
-    /* 8. Register the new process in taskman's process table so the
-     *    lifecycle handlers can find its CSpace + slot allocator. */
-    int reg_err = tm_process_register(pid, cnode, tcb, vspace,
-                                       QSOE_CAP_WELL_KNOWN_END);
-    if (reg_err) {
-        tm_err("spawn: tm_process_register failed");
-        return reg_err;
-    }
-    /* Record the child's untyped budget master for cleanup on terminate,
-     * and capture the ELF basename as the process name for /proc. */
-    tm_process_t *prec = tm_process_lookup(pid);
-    if (prec) {
-        prec->untyped_budget = child_untyped;
-        prec->fault_ep       = fault_ep;
-        /* Seed the main thread's tracked scheduling state to match the
-         * priority/policy it was just configured with (SetSchedParams
-         * above), so SchedGet reports the truth before any SchedSet. */
-        prec->sched_prio     = TM_PRIO_USER_DEFAULT;
-        prec->sched_policy   = TM_SCHED_RR;
-        const char *base = elf_name ? elf_name : "?";
-        for (const char *s = base; *s; ++s)
-            if (*s == '/') base = s + 1;
-        unsigned ni = 0;
-        while (base[ni] != '\0' && ni < sizeof prec->name - 1) {
-            prec->name[ni] = base[ni];
-            ++ni;
-        }
-        prec->name[ni] = '\0';
-        /* Main-thread ps(1) label starts empty (the main thread tags
-         * itself "main" via ThreadCtl at startup); clear it here so a
-         * reused process slot never shows a stale label. */
-        prec->main_name[0] = '\0';
-    }
-    /* Hand the dyn-link L1 PT to the worker-region allocator (same
-     * L2[1] slot covers libc.so/rtld AND the worker region at 0x40000000). */
-    if (prec && workers_l1_cap) prec->workers_l1_pt = workers_l1_cap;
-
-    /* 8b. Register the connection record for the SYSMGR_COID cap we
-     *     minted in step 5. The badge we used was `pid` itself, so the
-     *     server-side ConnectClientInfo(scoid==pid) will resolve to
-     *     this connection. Without this record, ConnectServerInfo /
-     *     ConnectFlags on SYSMGR_COID would EBADF in the child. */
-    /* The primary channel was registered in main.c with raw chid=1.
-     * tm_channel_index matches owner_chid as stored, so we use the
-     * raw index here -- NOT the encoded TASKMAN_CHID = (gen<<16)|idx
-     * the user-facing ABI exposes (see <sys/qsoe.h>).               */
-    int primary_idx = tm_channel_index(QSOE_PID_TASKMAN, /*raw chid*/1);
-    tm_dbg("spawn: probe channel pid=%lu chid=1 -> idx=%ld",
-            (unsigned long)QSOE_PID_TASKMAN, (long)primary_idx);
-    if (primary_idx < 0) {
-        tm_err("spawn: primary channel not registered yet");
-        return -EINVAL;
-    }
-    int cnreg = tm_connection_register_existing(pid, QSOE_CAP_TASKMAN_EP,
-                                                primary_idx,
-                                                (seL4_Word)pid, 0);
-    if (cnreg) {
-        tm_err("spawn: tm_connection_register_existing failed");
-        return cnreg;
-    }
-
-    /* Slot reclamation: move the image-frame caps (the bulk of this
-     * process's cap count) out of the flat root CNode into its own
-     * object CNode.  Their root slots return to the free list right
-     * away; on exit the objcnode -- a pp_ut child -- is destroyed by
-     * Revoke(pput), freeing all of them together.  The page mapping
-     * lives in the frame cap, so it survives the move; safe now that the
-     * loads and the relocation pass have finished touching the frames. */
-    {
-        tm_process_t *op = tm_process_lookup(pid);
-        if (op) {
-            op->sc = sc;   /* main-thread SC slot, freed in teardown */
-            seL4_CPtr objc = alloc_object(seL4_CapTableObject, TM_OBJCNODE_RADIX);
-            if (!objc) { tm_err("spawn: objcnode alloc failed"); return -ENOMEM; }
-            op->objcnode      = objc;
-            op->objcnode_next = 0;
-            for (int i = 0; i < s_frame_count; ++i) {
-                seL4_CPtr src  = s_frames[i].frame;
-                /* RELRO pages keep their cap INVOKEABLE (left in the root
-                 * slot, recorded in op->mprot[]) so TM_REQ_MPROTECT can
-                 * re-map them; everything else moves to the objcnode. */
-                if (va_in_relro(s_frames[i].va_page)) {
-                    if (op->mprot_count >= TM_MAX_MPROT) {
-                        tm_err("spawn: pid %ld RELRO tracker full (cap=%d)",
-                               (long)pid, TM_MAX_MPROT);
-                        return -ENOMEM;
-                    }
-                    op->mprot[op->mprot_count].va_page = s_frames[i].va_page;
-                    op->mprot[op->mprot_count].frame   = src;
-                    op->mprot_count++;
-                    continue;
-                }
-                seL4_Word merr = qsoe_cnode_move(objc,
-                                                 (seL4_Word)op->objcnode_next,
-                                                 TM_OBJCNODE_RADIX,
-                                                 s_cnode_root, src,
-                                                 TM_DEPTH_TASKMAN);
-                if (merr) {
-                    tm_err("spawn: objcnode move failed err=%lu",
-                           (unsigned long)merr);
-                    return -ENOMEM;
-                }
-                op->objcnode_next++;
-                taskman_free_slot(src);
-            }
-            /* Same for the per-spawn page-table caps: relocate into the
-             * objcnode (the mapping lives in the parent PT, not the cap,
-             * so the move is transparent) and reclaim their root slots. */
-            for (int i = 0; i < s_pt_count; ++i) {
-                seL4_CPtr src  = s_pt_slots[i];
-                seL4_Word merr = qsoe_cnode_move(objc,
-                                                 (seL4_Word)op->objcnode_next,
-                                                 TM_OBJCNODE_RADIX,
-                                                 s_cnode_root, src,
-                                                 TM_DEPTH_TASKMAN);
-                if (merr) {
-                    tm_err("spawn: objcnode PT move failed err=%lu",
-                           (unsigned long)merr);
-                    return -ENOMEM;
-                }
-                op->objcnode_next++;
-                taskman_free_slot(src);
-            }
-        }
-    }
-
-    /* 9. Liftoff. */
-    err = qsoe_tcb_resume(tcb);
-    if (err) { tm_err("spawn: TCB_Resume failed"); return -ENOMEM; }
-
-    return 0;
+    return tm_spawn_commit(&build, pid, primary_ep, entry_pc,
+                           workers_l1_cap, elf_name);
 }
