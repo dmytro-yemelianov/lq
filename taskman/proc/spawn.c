@@ -411,6 +411,77 @@ static unsigned long qstrlen(const char *s)
 /* One auxv entry, packed as two 8-byte words for the SysV ABI image. */
 struct aux_pair { unsigned long type; unsigned long val; };
 
+#define TM_SPAWN_ARGPACK_MAX_VEC 16
+#define TM_SPAWN_ARGPACK_MAX_AUXV 8
+#define TM_SPAWN_ARGPACK_STACK_LIMIT 0x1000UL
+
+typedef struct tm_spawn_argpack {
+    int argc;
+    const char *const *argv;
+    int envc;
+    const char *const *envp;
+    const struct aux_pair *auxv;
+    int auxc;
+    unsigned long strings_bytes;
+    unsigned long pointer_bytes;
+    unsigned long total_aligned;
+    unsigned long strings_alloc;
+} tm_spawn_argpack_t;
+
+static int tm_spawn_argpack_prepare(tm_spawn_argpack_t *pack,
+                                    int argc, const char *const *argv,
+                                    int envc, const char *const *envp,
+                                    const struct aux_pair *auxv,
+                                    int auxc)
+{
+    unsigned long strings_bytes = 0;
+    unsigned long pointer_bytes;
+    unsigned long total;
+    unsigned long total_aligned;
+
+    if (!pack || argc < 0 || envc < 0 || auxc < 0)
+        return -EINVAL;
+    if (argc > TM_SPAWN_ARGPACK_MAX_VEC ||
+        envc > TM_SPAWN_ARGPACK_MAX_VEC ||
+        auxc > TM_SPAWN_ARGPACK_MAX_AUXV)
+        return -E2BIG;
+    if ((argc > 0 && !argv) || (envc > 0 && !envp) ||
+        (auxc > 0 && !auxv))
+        return -EINVAL;
+
+    for (int i = 0; i < argc; ++i) {
+        if (!argv[i])
+            return -EINVAL;
+        strings_bytes += qstrlen(argv[i]) + 1;
+    }
+    for (int i = 0; i < envc; ++i) {
+        if (!envp[i])
+            return -EINVAL;
+        strings_bytes += qstrlen(envp[i]) + 1;
+    }
+
+    pointer_bytes = 8 /*argc*/
+                  + 8UL * (unsigned long)(argc + 1) /*argv + NULL*/
+                  + 8UL * (unsigned long)(envc + 1) /*envp + NULL*/
+                  + 16UL * (unsigned long)(auxc + 1); /*auxv + AT_NULL*/
+    total = strings_bytes + pointer_bytes;
+    total_aligned = (total + 15UL) & ~15UL;
+    if (total_aligned > TM_SPAWN_ARGPACK_STACK_LIMIT)
+        return -E2BIG;
+
+    pack->argc = argc;
+    pack->argv = argv;
+    pack->envc = envc;
+    pack->envp = envp;
+    pack->auxv = auxv;
+    pack->auxc = auxc;
+    pack->strings_bytes = strings_bytes;
+    pack->pointer_bytes = pointer_bytes;
+    pack->total_aligned = total_aligned;
+    pack->strings_alloc = total_aligned - pointer_bytes;
+    return 0;
+}
+
 /* Build the SysV ABI initial-stack image into the top page of the
  * child's stack region.
  *
@@ -437,28 +508,9 @@ struct aux_pair { unsigned long type; unsigned long val; };
  * Returns the child-vspace address of argc (= initial sp). 0 if the
  * combined size exceeds one stack page (caller may grow then). */
 static unsigned long build_initial_stack(seL4_CPtr top_frame,
-                                          int argc, const char *const *argv,
-                                          int envc, const char *const *envp,
-                                          const struct aux_pair *auxv,
-                                          int auxc)
+                                          const tm_spawn_argpack_t *argpack)
 {
-    /* Compute total bytes needed for the string area. */
-    unsigned long strs_bytes = 0;
-    for (int i = 0; i < argc; ++i) strs_bytes += qstrlen(argv[i]) + 1;
-    for (int i = 0; i < envc; ++i) strs_bytes += qstrlen(envp[i]) + 1;
-
-    /* Pointer + terminator area below the strings. */
-    unsigned long below = 8 /*argc*/
-                        + 8UL * (unsigned long)(argc + 1) /*argv + NULL*/
-                        + 8UL * (unsigned long)(envc + 1) /*envp + NULL*/
-                        + 16UL * (unsigned long)(auxc + 1); /*auxv + AT_NULL*/
-
-    /* Pad the string area so total is 16-aligned (initial sp 16-aligned). */
-    unsigned long total = strs_bytes + below;
-    unsigned long total_aligned = (total + 15UL) & ~15UL;
-    unsigned long strs_alloc = total_aligned - below;
-
-    if (total_aligned > 0x1000UL) return 0;  /* doesn't fit in one page */
+    if (!argpack) return 0;
 
     /* Map the frame into taskman's vspace, then write top-down. */
     if (scratch_map(top_frame) != 0) return 0;
@@ -470,28 +522,25 @@ static unsigned long build_initial_stack(seL4_CPtr top_frame,
     unsigned long  child_top   = CHILD_STACK_TOP;
 
     /* String area sits at the very top, occupying strs_alloc bytes. */
-    unsigned char *strs_scratch  = scratch_top - strs_alloc;
-    unsigned long  strs_in_child = child_top   - strs_alloc;
+    unsigned char *strs_scratch  = scratch_top - argpack->strings_alloc;
+    unsigned long  strs_in_child = child_top   - argpack->strings_alloc;
 
     /* Per-string pointers we'll write into the argv/envp arrays. */
-    unsigned long child_argv[16];
-    unsigned long child_envp[16];
-    /* (16 is enough for v0.4.4 demos; static array keeps stack frame
-     * small. Larger arg lists would overflow the IPC-buffer payload
-     * anyway.) */
+    unsigned long child_argv[TM_SPAWN_ARGPACK_MAX_VEC];
+    unsigned long child_envp[TM_SPAWN_ARGPACK_MAX_VEC];
 
     unsigned char *cur = strs_scratch;
     unsigned long  cur_child = strs_in_child;
-    for (int i = 0; i < argc; ++i) {
-        unsigned long len = qstrlen(argv[i]) + 1;
-        qmemcpy(cur, argv[i], len);
+    for (int i = 0; i < argpack->argc; ++i) {
+        unsigned long len = qstrlen(argpack->argv[i]) + 1;
+        qmemcpy(cur, argpack->argv[i], len);
         child_argv[i] = cur_child;
         cur += len;
         cur_child += len;
     }
-    for (int i = 0; i < envc; ++i) {
-        unsigned long len = qstrlen(envp[i]) + 1;
-        qmemcpy(cur, envp[i], len);
+    for (int i = 0; i < argpack->envc; ++i) {
+        unsigned long len = qstrlen(argpack->envp[i]) + 1;
+        qmemcpy(cur, argpack->envp[i], len);
         child_envp[i] = cur_child;
         cur += len;
         cur_child += len;
@@ -504,18 +553,18 @@ static unsigned long build_initial_stack(seL4_CPtr top_frame,
     *--p = 0;                                 /* auxv terminator a_un */
     *--p = AT_NULL_;                          /* auxv terminator a_type */
     /* User-supplied entries in reverse so they land in caller order. */
-    for (int i = auxc - 1; i >= 0; --i) {
-        *--p = auxv[i].val;
-        *--p = auxv[i].type;
+    for (int i = argpack->auxc - 1; i >= 0; --i) {
+        *--p = argpack->auxv[i].val;
+        *--p = argpack->auxv[i].type;
     }
     *--p = 0;                                 /* envp NULL */
-    for (int i = envc - 1; i >= 0; --i) *--p = child_envp[i];
+    for (int i = argpack->envc - 1; i >= 0; --i) *--p = child_envp[i];
     *--p = 0;                                 /* argv NULL */
-    for (int i = argc - 1; i >= 0; --i) *--p = child_argv[i];
-    *--p = (unsigned long)argc;               /* argc — sp points here */
+    for (int i = argpack->argc - 1; i >= 0; --i) *--p = child_argv[i];
+    *--p = (unsigned long)argpack->argc;      /* argc — sp points here */
 
     /* Final sp in child = child_top - total_aligned. */
-    unsigned long sp_in_child = child_top - total_aligned;
+    unsigned long sp_in_child = child_top - argpack->total_aligned;
 
     /* fence then unmap. */
     __asm__ volatile ("fence rw, rw" ::: "memory");
@@ -1499,8 +1548,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * AT_PHENT / AT_PHNUM / AT_BASE / AT_ENTRY / AT_PAGESZ plus
      * AT_KPRELOAD = DL_LIBC_LOAD_VA so load_kpreload() picks up
      * libc.so under its DT_SONAME = "libc.so" alias. */
-    struct aux_pair auxv[8];
+    struct aux_pair auxv[TM_SPAWN_ARGPACK_MAX_AUXV];
     int auxc = 0;
+    tm_spawn_argpack_t argpack;
     if (dyn_link) {
         auxv[auxc++] = (struct aux_pair){ AT_PHDR_,     main_phdr_va };
         auxv[auxc++] = (struct aux_pair){ AT_PHENT_,    sizeof(struct elf64_phdr) };
