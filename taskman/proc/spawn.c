@@ -411,6 +411,77 @@ static unsigned long qstrlen(const char *s)
 /* One auxv entry, packed as two 8-byte words for the SysV ABI image. */
 struct aux_pair { unsigned long type; unsigned long val; };
 
+#define TM_SPAWN_ARGPACK_MAX_VEC 16
+#define TM_SPAWN_ARGPACK_MAX_AUXV 8
+#define TM_SPAWN_ARGPACK_STACK_LIMIT 0x1000UL
+
+typedef struct tm_spawn_argpack {
+    int argc;
+    const char *const *argv;
+    int envc;
+    const char *const *envp;
+    const struct aux_pair *auxv;
+    int auxc;
+    unsigned long strings_bytes;
+    unsigned long pointer_bytes;
+    unsigned long total_aligned;
+    unsigned long strings_alloc;
+} tm_spawn_argpack_t;
+
+static int tm_spawn_argpack_prepare(tm_spawn_argpack_t *pack,
+                                    int argc, const char *const *argv,
+                                    int envc, const char *const *envp,
+                                    const struct aux_pair *auxv,
+                                    int auxc)
+{
+    unsigned long strings_bytes = 0;
+    unsigned long pointer_bytes;
+    unsigned long total;
+    unsigned long total_aligned;
+
+    if (!pack || argc < 0 || envc < 0 || auxc < 0)
+        return -EINVAL;
+    if (argc > TM_SPAWN_ARGPACK_MAX_VEC ||
+        envc > TM_SPAWN_ARGPACK_MAX_VEC ||
+        auxc > TM_SPAWN_ARGPACK_MAX_AUXV)
+        return -E2BIG;
+    if ((argc > 0 && !argv) || (envc > 0 && !envp) ||
+        (auxc > 0 && !auxv))
+        return -EINVAL;
+
+    for (int i = 0; i < argc; ++i) {
+        if (!argv[i])
+            return -EINVAL;
+        strings_bytes += qstrlen(argv[i]) + 1;
+    }
+    for (int i = 0; i < envc; ++i) {
+        if (!envp[i])
+            return -EINVAL;
+        strings_bytes += qstrlen(envp[i]) + 1;
+    }
+
+    pointer_bytes = 8 /*argc*/
+                  + 8UL * (unsigned long)(argc + 1) /*argv + NULL*/
+                  + 8UL * (unsigned long)(envc + 1) /*envp + NULL*/
+                  + 16UL * (unsigned long)(auxc + 1); /*auxv + AT_NULL*/
+    total = strings_bytes + pointer_bytes;
+    total_aligned = (total + 15UL) & ~15UL;
+    if (total_aligned > TM_SPAWN_ARGPACK_STACK_LIMIT)
+        return -E2BIG;
+
+    pack->argc = argc;
+    pack->argv = argv;
+    pack->envc = envc;
+    pack->envp = envp;
+    pack->auxv = auxv;
+    pack->auxc = auxc;
+    pack->strings_bytes = strings_bytes;
+    pack->pointer_bytes = pointer_bytes;
+    pack->total_aligned = total_aligned;
+    pack->strings_alloc = total_aligned - pointer_bytes;
+    return 0;
+}
+
 /* Build the SysV ABI initial-stack image into the top page of the
  * child's stack region.
  *
@@ -437,28 +508,9 @@ struct aux_pair { unsigned long type; unsigned long val; };
  * Returns the child-vspace address of argc (= initial sp). 0 if the
  * combined size exceeds one stack page (caller may grow then). */
 static unsigned long build_initial_stack(seL4_CPtr top_frame,
-                                          int argc, const char *const *argv,
-                                          int envc, const char *const *envp,
-                                          const struct aux_pair *auxv,
-                                          int auxc)
+                                          const tm_spawn_argpack_t *argpack)
 {
-    /* Compute total bytes needed for the string area. */
-    unsigned long strs_bytes = 0;
-    for (int i = 0; i < argc; ++i) strs_bytes += qstrlen(argv[i]) + 1;
-    for (int i = 0; i < envc; ++i) strs_bytes += qstrlen(envp[i]) + 1;
-
-    /* Pointer + terminator area below the strings. */
-    unsigned long below = 8 /*argc*/
-                        + 8UL * (unsigned long)(argc + 1) /*argv + NULL*/
-                        + 8UL * (unsigned long)(envc + 1) /*envp + NULL*/
-                        + 16UL * (unsigned long)(auxc + 1); /*auxv + AT_NULL*/
-
-    /* Pad the string area so total is 16-aligned (initial sp 16-aligned). */
-    unsigned long total = strs_bytes + below;
-    unsigned long total_aligned = (total + 15UL) & ~15UL;
-    unsigned long strs_alloc = total_aligned - below;
-
-    if (total_aligned > 0x1000UL) return 0;  /* doesn't fit in one page */
+    if (!argpack) return 0;
 
     /* Map the frame into taskman's vspace, then write top-down. */
     if (scratch_map(top_frame) != 0) return 0;
@@ -470,28 +522,25 @@ static unsigned long build_initial_stack(seL4_CPtr top_frame,
     unsigned long  child_top   = CHILD_STACK_TOP;
 
     /* String area sits at the very top, occupying strs_alloc bytes. */
-    unsigned char *strs_scratch  = scratch_top - strs_alloc;
-    unsigned long  strs_in_child = child_top   - strs_alloc;
+    unsigned char *strs_scratch  = scratch_top - argpack->strings_alloc;
+    unsigned long  strs_in_child = child_top   - argpack->strings_alloc;
 
     /* Per-string pointers we'll write into the argv/envp arrays. */
-    unsigned long child_argv[16];
-    unsigned long child_envp[16];
-    /* (16 is enough for v0.4.4 demos; static array keeps stack frame
-     * small. Larger arg lists would overflow the IPC-buffer payload
-     * anyway.) */
+    unsigned long child_argv[TM_SPAWN_ARGPACK_MAX_VEC];
+    unsigned long child_envp[TM_SPAWN_ARGPACK_MAX_VEC];
 
     unsigned char *cur = strs_scratch;
     unsigned long  cur_child = strs_in_child;
-    for (int i = 0; i < argc; ++i) {
-        unsigned long len = qstrlen(argv[i]) + 1;
-        qmemcpy(cur, argv[i], len);
+    for (int i = 0; i < argpack->argc; ++i) {
+        unsigned long len = qstrlen(argpack->argv[i]) + 1;
+        qmemcpy(cur, argpack->argv[i], len);
         child_argv[i] = cur_child;
         cur += len;
         cur_child += len;
     }
-    for (int i = 0; i < envc; ++i) {
-        unsigned long len = qstrlen(envp[i]) + 1;
-        qmemcpy(cur, envp[i], len);
+    for (int i = 0; i < argpack->envc; ++i) {
+        unsigned long len = qstrlen(argpack->envp[i]) + 1;
+        qmemcpy(cur, argpack->envp[i], len);
         child_envp[i] = cur_child;
         cur += len;
         cur_child += len;
@@ -504,18 +553,18 @@ static unsigned long build_initial_stack(seL4_CPtr top_frame,
     *--p = 0;                                 /* auxv terminator a_un */
     *--p = AT_NULL_;                          /* auxv terminator a_type */
     /* User-supplied entries in reverse so they land in caller order. */
-    for (int i = auxc - 1; i >= 0; --i) {
-        *--p = auxv[i].val;
-        *--p = auxv[i].type;
+    for (int i = argpack->auxc - 1; i >= 0; --i) {
+        *--p = argpack->auxv[i].val;
+        *--p = argpack->auxv[i].type;
     }
     *--p = 0;                                 /* envp NULL */
-    for (int i = envc - 1; i >= 0; --i) *--p = child_envp[i];
+    for (int i = argpack->envc - 1; i >= 0; --i) *--p = child_envp[i];
     *--p = 0;                                 /* argv NULL */
-    for (int i = argc - 1; i >= 0; --i) *--p = child_argv[i];
-    *--p = (unsigned long)argc;               /* argc — sp points here */
+    for (int i = argpack->argc - 1; i >= 0; --i) *--p = child_argv[i];
+    *--p = (unsigned long)argpack->argc;      /* argc — sp points here */
 
     /* Final sp in child = child_top - total_aligned. */
-    unsigned long sp_in_child = child_top - total_aligned;
+    unsigned long sp_in_child = child_top - argpack->total_aligned;
 
     /* fence then unmap. */
     __asm__ volatile ("fence rw, rw" ::: "memory");
@@ -793,41 +842,53 @@ long tm_bulk_copy(tm_process_t *src_proc, unsigned long src_va,
     while (done < len) {
         unsigned long sva = src_va + done;
         unsigned long dva = dst_va + done;
-        seL4_CPtr fs = tm_process_find_frame(src_proc, sva);
-        seL4_CPtr fd = tm_process_find_frame(dst_proc, dva);
-        if (!fs || !fd) {
+        seL4_CPtr src_cnode, src_slot;
+        seL4_Uint8 src_depth;
+        int src_is_mega;
+        seL4_CPtr dst_cnode, dst_slot;
+        seL4_Uint8 dst_depth;
+        int dst_is_mega;
+
+        if (tm_process_resolve_frame(src_proc, sva, &src_cnode, &src_slot, &src_depth, &src_is_mega) != 0 ||
+            tm_process_resolve_frame(dst_proc, dva, &dst_cnode, &dst_slot, &dst_depth, &dst_is_mega) != 0) {
             tm_err("tm_bulk_copy: unmapped VA (src pid %ld va=%08lx -> %lu, "
                    "dst pid %ld va=%08lx -> %lu)",
-                   (long)src_proc->pid, sva, (unsigned long)fs,
-                   (long)dst_proc->pid, dva, (unsigned long)fd);
+                   (long)src_proc->pid, sva, 0UL,
+                   (long)dst_proc->pid, dva, 0UL);
             return -EFAULT;
         }
-        /* Chunk = bytes left in whichever megaframe (src or dst) ends
-         * first -- the two buffers may carry independent in-page offsets. */
-        unsigned long so   = sva & (QSOE_MEGA_PAGE - 1);
-        unsigned long dof  = dva & (QSOE_MEGA_PAGE - 1);
+
+        unsigned long src_page_size = src_is_mega ? QSOE_MEGA_PAGE : QSOE_PAGE_4K;
+        unsigned long dst_page_size = dst_is_mega ? QSOE_MEGA_PAGE : QSOE_PAGE_4K;
+
+        unsigned long so  = sva & (src_page_size - 1);
+        unsigned long dof = dva & (dst_page_size - 1);
+
         unsigned long chunk = len - done;
-        if (chunk > QSOE_MEGA_PAGE - so)  chunk = QSOE_MEGA_PAGE - so;
-        if (chunk > QSOE_MEGA_PAGE - dof) chunk = QSOE_MEGA_PAGE - dof;
+        if (chunk > src_page_size - so)  chunk = src_page_size - so;
+        if (chunk > dst_page_size - dof) chunk = dst_page_size - dof;
 
         seL4_Word err = qsoe_cnode_copy(s_cnode_root, s_bulk_slot_src,
-                                         TM_BULK_CNODE_DEPTH, s_cnode_root, fs,
-                                         TM_BULK_CNODE_DEPTH, QSOE_RIGHTS_ALL);
+                                         TM_BULK_CNODE_DEPTH, src_cnode, src_slot,
+                                         src_depth, QSOE_RIGHTS_ALL);
         if (err) return -ENOMEM;
         err = qsoe_cnode_copy(s_cnode_root, s_bulk_slot_dst,
-                              TM_BULK_CNODE_DEPTH, s_cnode_root, fd,
-                              TM_BULK_CNODE_DEPTH, QSOE_RIGHTS_ALL);
+                              TM_BULK_CNODE_DEPTH, dst_cnode, dst_slot,
+                              dst_depth, QSOE_RIGHTS_ALL);
         if (err) {
             qsoe_cnode_delete(s_cnode_root, s_bulk_slot_src, TM_BULK_CNODE_DEPTH);
             return -ENOMEM;
         }
 
+        unsigned long src_scratch_va = src_is_mega ? TM_SCRATCH_MEGA_VADDR : TM_SCRATCH_VADDR;
+        unsigned long dst_scratch_va = dst_is_mega ? TM_SCRATCH_MEGA_VADDR_B : (TM_SCRATCH_VADDR + 0x1000UL);
+
         err = qsoe_riscv_page_map(s_bulk_slot_src, seL4_CapInitThreadVSpace,
-                                  TM_SCRATCH_MEGA_VADDR, QSOE_RIGHTS_ALL,
+                                  src_scratch_va, QSOE_RIGHTS_ALL,
                                   QSOE_VM_ATTR_DEFAULT);
         if (!err)
             err = qsoe_riscv_page_map(s_bulk_slot_dst, seL4_CapInitThreadVSpace,
-                                      TM_SCRATCH_MEGA_VADDR_B, QSOE_RIGHTS_ALL,
+                                      dst_scratch_va, QSOE_RIGHTS_ALL,
                                       QSOE_VM_ATTR_DEFAULT);
         if (err) {
             qsoe_riscv_page_unmap(s_bulk_slot_src);
@@ -836,8 +897,8 @@ long tm_bulk_copy(tm_process_t *src_proc, unsigned long src_va,
             return -ENOMEM;
         }
 
-        qmemcpy((void *)(TM_SCRATCH_MEGA_VADDR_B + dof),
-                (const void *)(TM_SCRATCH_MEGA_VADDR + so), chunk);
+        qmemcpy((void *)(dst_scratch_va + dof),
+                (const void *)(src_scratch_va + so), chunk);
         __asm__ volatile ("fence rw, rw" ::: "memory");
 
         qsoe_riscv_page_unmap(s_bulk_slot_src);
@@ -1003,17 +1064,77 @@ static int load_elf_segments(seL4_CPtr vspace, const void *elf_blob,
     return 0;
 }
 
-int tm_spawn(const void *elf_blob, unsigned long elf_len,
-             pid_t pid, seL4_CPtr primary_ep,
-             int argc, const char *const *argv,
-             int envc, const char *const *envp,
-             const char *elf_name)
+typedef struct tm_spawn_plan {
+    const void *elf_blob;
+    unsigned long elf_len;
+    const char *elf_name;
+    const struct elf64_hdr *eh;
+    const struct elf64_phdr *ph;
+    const struct elf64_phdr *interp_ph;
+    int dyn_link;
+    unsigned long entry_pc;
+    unsigned long main_phdr_va;
+    unsigned long rtld_load_base;
+} tm_spawn_plan_t;
+
+static void tm_spawn_state_reset(void)
 {
     /* Reset per-spawn state.  Frame table is rebuilt as PT_LOAD pages
      * are mapped; the reloc walker consults it to find write targets. */
     s_frame_count = 0;
     s_pt_count    = 0;
     s_relro_count = 0;
+}
+
+static int tm_spawn_plan_prepare(tm_spawn_plan_t *plan,
+                                 const void *elf_blob,
+                                 unsigned long elf_len,
+                                 const char *elf_name)
+{
+    (void)elf_len;
+    qmemset(plan, 0, sizeof *plan);
+    plan->elf_blob = elf_blob;
+    plan->elf_len = elf_len;
+    plan->elf_name = elf_name;
+
+    const struct elf64_hdr *eh = elf_blob;
+
+    /* Sanity-check the ELF header. */
+    if (eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') {
+        tm_err("spawn: not an ELF");
+        return -EINVAL;
+    }
+    if (eh->e_ident[4] != 2 /* ELFCLASS64 */) {
+        tm_err("spawn: not ELF64");
+        return -EINVAL;
+    }
+
+    plan->eh = eh;
+    plan->ph = (const struct elf64_phdr *)
+               ((const u8 *)elf_blob + eh->e_phoff);
+    for (u16 i = 0; i < eh->e_phnum; ++i) {
+        if (plan->ph[i].p_type == PT_INTERP) {
+            plan->interp_ph = &plan->ph[i];
+            break;
+        }
+    }
+
+    plan->entry_pc = eh->e_entry;
+
+    tm_dbg("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
+            eh->e_type, eh->e_phnum, plan->interp_ph ? "yes" : "no");
+
+    return 0;
+}
+
+int tm_spawn(const void *elf_blob, unsigned long elf_len,
+             pid_t pid, seL4_CPtr primary_ep,
+             int argc, const char *const *argv,
+             int envc, const char *const *envp,
+             const char *elf_name)
+{
+    tm_spawn_state_reset();
 
     /* The L1 PT covering [0x40000000, 0x80000000).  In dyn-linked
      * spawns we install it below as `dl_l1` (so libc.so + rtld + the
@@ -1093,19 +1214,20 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
     }
 
-    (void)elf_len;
-    const struct elf64_hdr *eh = elf_blob;
+    tm_spawn_plan_t plan;
+    int plan_rc = tm_spawn_plan_prepare(&plan, elf_blob, elf_len, elf_name);
+    if (plan_rc != 0) return plan_rc;
 
-    /* Sanity-check the ELF header. */
-    if (eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' ||
-        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') {
-        tm_err("spawn: not an ELF");
-        return -EINVAL;
-    }
-    if (eh->e_ident[4] != 2 /* ELFCLASS64 */) {
-        tm_err("spawn: not ELF64");
-        return -EINVAL;
-    }
+    const struct elf64_hdr *eh = plan.eh;
+    const struct elf64_phdr *ph = plan.ph;
+    const struct elf64_phdr *interp_ph = plan.interp_ph;
+    int dyn_link = plan.dyn_link;
+    unsigned long entry_pc = plan.entry_pc;
+    unsigned long main_phdr_va = plan.main_phdr_va;
+    unsigned long rtld_load_base = plan.rtld_load_base;
+
+    /* BUILD phase: allocate child objects, map image/address-space state,
+     * and prepare the initial user stack without publishing process state. */
 
     /* 1. Allocate the child's kernel objects.
      *
@@ -1147,8 +1269,6 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    For ET_EXEC like our current binaries, p_vaddr is the final
      *    address; for ET_DYN PIE we'd pass a non-zero load_offset.
      *    We only spawn ET_EXEC main images, so 0 is correct. */
-    const struct elf64_phdr *ph = (const struct elf64_phdr *)
-                                  ((const u8 *)elf_blob + eh->e_phoff);
     int load_rc = load_elf_segments(vspace, elf_blob, /*load_offset=*/0);
     if (load_rc != 0) return load_rc;
 
@@ -1172,18 +1292,6 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     resolves to it without a duplicate filesystem load), then
      *     applies relocations to qsh and libc.so, then jumps to qsh's
      *     entry (AT_ENTRY) with the original sp.                    */
-    const struct elf64_phdr *interp_ph = 0;
-    for (u16 i = 0; i < eh->e_phnum; ++i) {
-        if (ph[i].p_type == PT_INTERP) { interp_ph = &ph[i]; break; }
-    }
-    tm_dbg("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
-            eh->e_type, eh->e_phnum, interp_ph ? "yes" : "no");
-
-    int          dyn_link        = 0;
-    unsigned long entry_pc        = eh->e_entry;
-    unsigned long main_phdr_va    = 0;
-    unsigned long rtld_load_base  = 0;
-
     if (interp_ph) {
         /* PT_INTERP body is an ASCIIZ path like "/lib/ld-qsoe.so.1".
          * Strip the leading '/' for the cpio (flat) namespace. */
@@ -1440,8 +1548,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * AT_PHENT / AT_PHNUM / AT_BASE / AT_ENTRY / AT_PAGESZ plus
      * AT_KPRELOAD = DL_LIBC_LOAD_VA so load_kpreload() picks up
      * libc.so under its DT_SONAME = "libc.so" alias. */
-    struct aux_pair auxv[8];
+    struct aux_pair auxv[TM_SPAWN_ARGPACK_MAX_AUXV];
     int auxc = 0;
+    tm_spawn_argpack_t argpack;
     if (dyn_link) {
         auxv[auxc++] = (struct aux_pair){ AT_PHDR_,     main_phdr_va };
         auxv[auxc++] = (struct aux_pair){ AT_PHENT_,    sizeof(struct elf64_phdr) };
@@ -1452,9 +1561,15 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         auxv[auxc++] = (struct aux_pair){ AT_KPRELOAD_, DL_LIBC_LOAD_VA };
     }
 
+    int argpack_rc = tm_spawn_argpack_prepare(&argpack, argc, argv, envc, envp,
+                                              auxv, auxc);
+    if (argpack_rc != 0) {
+        tm_err("spawn: tm_spawn_argpack_prepare failed rc=%d", argpack_rc);
+        return argpack_rc;
+    }
+
     unsigned long initial_sp =
-        build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1],
-                            argc, argv, envc, envp, auxv, auxc);
+        build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1], &argpack);
     if (!initial_sp) {
         tm_err("spawn: build_initial_stack failed");
         return -E2BIG;
@@ -1470,6 +1585,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
         if (spawn_record_frame(va, stack_frames[i]) != 0) return -ENOMEM;
     }
+
+    /* COMMIT phase: publish caps/process records and resume only after
+     * the address space, stack, and loader state have been built. */
 
     /* 5. Populate the child's CSpace. Slot 1 = Send cap to taskman's
      *    primary endpoint, badged with the child's pid. The child's
@@ -1731,6 +1849,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                            (unsigned long)merr);
                     return -ENOMEM;
                 }
+                op->objcnode_va[op->objcnode_next] = s_frames[i].va_page;
                 op->objcnode_next++;
                 taskman_free_slot(src);
             }
@@ -1749,6 +1868,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                            (unsigned long)merr);
                     return -ENOMEM;
                 }
+                op->objcnode_va[op->objcnode_next] = 0;
                 op->objcnode_next++;
                 taskman_free_slot(src);
             }
