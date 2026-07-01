@@ -453,6 +453,10 @@ int SyncMutexUnlock(sync_t *s)
     unsigned long my_tid = (unsigned long)qsoe_curthr()->tid;
     unsigned long val = __atomic_load_n(&s->owner, __ATOMIC_RELAXED);
 
+    if ((val & QSOE_SYNC_TID_MASK) == 0) {
+        return 0;
+    }
+
     if ((val & QSOE_SYNC_TID_MASK) != my_tid) {
         qsoe_errno = EPERM;
         return -1;

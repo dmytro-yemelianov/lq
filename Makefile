@@ -39,6 +39,7 @@
 
 CROSS   := riscv64-linux-gnu-
 CC      := $(CROSS)gcc
+QSOE_RUST_TM_PROCFS ?= 0
 
 QEMU    := qemu-system-riscv64
 
@@ -515,13 +516,14 @@ $(RTLD_SO):
 	    all
 
 libtaskman: $(LIBTASKMAN_A)
-$(LIBTASKMAN_A):
+$(LIBTASKMAN_A): FORCE
 	@mkdir -p $(LIBTASKMAN_BUILD)
 	+$(MAKE) -C $(LIBTASKMAN_DIR) \
 	    O=$(LIBTASKMAN_BUILD) \
 	    LIBC_INC=$(LIBC_INCLUDE) \
 	    PICFLAG=-fno-pic \
 	    ARCHFLAGS="$(ARCH_CFLAGS)" \
+	    QSOE_RUST_TM_PROCFS=$(QSOE_RUST_TM_PROCFS) \
 	    all
 
 # taskman is board-independent.  Its seL4 ABI headers come from the qemu
@@ -531,9 +533,13 @@ $(LIBTASKMAN_A):
 taskman: $(MODPKG_CPIO) $(LIBTASKMAN_A) $(GEN)/qsoe/sys_version.h \
          $(TM_SEL4BUILD)/kernel.elf
 	+$(MAKE) -C $(TOP)/taskman all \
-	    LIBTASKMAN_A=$(LIBTASKMAN_A) LIBTASKMAN_INC=$(LIBTASKMAN_DIR)/include
+	    LIBTASKMAN_A=$(LIBTASKMAN_A) \
+	    LIBTASKMAN_INC=$(LIBTASKMAN_DIR)/include \
+	    QSOE_RUST_TM_PROCFS=$(QSOE_RUST_TM_PROCFS)
 $(TASKMAN_ELF): | taskman
 	@true
+
+FORCE:
 
 # Version header. Regenerates whenever .git/HEAD or .git/index changes.
 $(GEN)/qsoe/sys_version.h: $(wildcard .git/HEAD .git/index)
