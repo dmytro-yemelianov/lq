@@ -482,6 +482,182 @@ static int tm_spawn_argpack_prepare(tm_spawn_argpack_t *pack,
     return 0;
 }
 
+#define TM_CAP_PLAN_MAX_OPS 6
+#define TM_CAP_PLAN_STDIO_COUNT 3
+
+typedef enum tm_cap_op_kind {
+    TM_CAP_OP_MINT,
+    TM_CAP_OP_COPY,
+} tm_cap_op_kind_t;
+
+typedef struct tm_cap_op {
+    tm_cap_op_kind_t kind;
+    seL4_CPtr dst_cnode;
+    seL4_CPtr dst_slot;
+    seL4_Word dst_depth;
+    seL4_CPtr src_cnode;
+    seL4_CPtr src_slot;
+    seL4_Word src_depth;
+    seL4_CapRights_t rights;
+    seL4_Word badge;
+    int stdio_index;
+    const char *label;
+} tm_cap_op_t;
+
+typedef struct tm_cap_plan {
+    pid_t pid;
+    unsigned op_count;
+    int console_idx;
+    seL4_Word stdio_scoids[TM_CAP_PLAN_STDIO_COUNT];
+    tm_cap_op_t ops[TM_CAP_PLAN_MAX_OPS];
+} tm_cap_plan_t;
+
+static int tm_cap_plan_add(tm_cap_plan_t *plan,
+                           tm_cap_op_kind_t kind,
+                           seL4_CPtr dst_cnode, seL4_CPtr dst_slot,
+                           seL4_Word dst_depth,
+                           seL4_CPtr src_cnode, seL4_CPtr src_slot,
+                           seL4_Word src_depth,
+                           seL4_CapRights_t rights,
+                           seL4_Word badge,
+                           int stdio_index,
+                           const char *label)
+{
+    if (!plan || plan->op_count >= TM_CAP_PLAN_MAX_OPS)
+        return -E2BIG;
+
+    tm_cap_op_t *op = &plan->ops[plan->op_count++];
+    op->kind = kind;
+    op->dst_cnode = dst_cnode;
+    op->dst_slot = dst_slot;
+    op->dst_depth = dst_depth;
+    op->src_cnode = src_cnode;
+    op->src_slot = src_slot;
+    op->src_depth = src_depth;
+    op->rights = rights;
+    op->badge = badge;
+    op->stdio_index = stdio_index;
+    op->label = label;
+    return 0;
+}
+
+static int tm_cap_plan_prepare(tm_cap_plan_t *plan,
+                               pid_t pid,
+                               seL4_CPtr cnode,
+                               seL4_CPtr root_cnode,
+                               seL4_CPtr primary_ep,
+                               seL4_CPtr child_untyped)
+{
+    tm_pathmgr_obj_t console_obj;
+    unsigned cons_consumed = 0;
+
+    if (!plan || !pid || !cnode || !root_cnode || !primary_ep ||
+        !child_untyped)
+        return -EINVAL;
+
+    qmemset(plan, 0, sizeof *plan);
+    plan->pid = pid;
+    plan->console_idx = -1;
+
+    if (tm_cap_plan_add(plan, TM_CAP_OP_MINT,
+                        cnode, QSOE_CAP_TASKMAN_EP, 12,
+                        root_cnode, primary_ep, 64,
+                        QSOE_RIGHTS_SEND, (seL4_Word)pid,
+                        -1, "mint TASKMAN_EP") != 0)
+        return -E2BIG;
+
+    if (tm_cap_plan_add(plan, TM_CAP_OP_COPY,
+                        cnode, QSOE_CAP_OWN_UNTYPED, 12,
+                        root_cnode, child_untyped, 64,
+                        QSOE_RIGHTS_ALL, 0,
+                        -1, "copy OWN_UNTYPED") != 0)
+        return -E2BIG;
+
+    if (tm_cap_plan_add(plan, TM_CAP_OP_COPY,
+                        cnode, QSOE_CAP_CNODE_SELF, 12,
+                        root_cnode, cnode, 64,
+                        QSOE_RIGHTS_ALL, 0,
+                        -1, "copy CNODE_SELF") != 0)
+        return -E2BIG;
+
+    if (tm_pathmgr_resolve("/dev/console", &console_obj, &cons_consumed) != 0) {
+        tm_err("spawn: /dev/console not in pathmgr");
+        return -EINVAL;
+    }
+    plan->console_idx = tm_channel_index(console_obj.server_pid,
+                                         console_obj.server_chid);
+    if (plan->console_idx < 0) {
+        tm_err("spawn: /dev/console channel not registered");
+        return -EINVAL;
+    }
+    seL4_CPtr console_master = tm_channel_master(plan->console_idx);
+    if (!console_master) {
+        tm_err("spawn: /dev/console master cap missing");
+        return -EINVAL;
+    }
+
+    static const seL4_CPtr stdio_slots[TM_CAP_PLAN_STDIO_COUNT] = {
+        QSOE_CAP_STDIN_CONNECT,
+        QSOE_CAP_STDOUT_CONNECT,
+        QSOE_CAP_STDERR_CONNECT,
+    };
+    for (int i = 0; i < TM_CAP_PLAN_STDIO_COUNT; ++i) {
+        plan->stdio_scoids[i] = tm_alloc_scoid();
+        if (tm_cap_plan_add(plan, TM_CAP_OP_MINT,
+                            cnode, stdio_slots[i], 12,
+                            root_cnode, console_master, 64,
+                            QSOE_RIGHTS_SEND, plan->stdio_scoids[i],
+                            i, "mint stdio cap") != 0)
+            return -E2BIG;
+    }
+
+    return 0;
+}
+
+static int tm_cap_plan_commit(const tm_cap_plan_t *plan)
+{
+    if (!plan)
+        return -EINVAL;
+
+    for (unsigned i = 0; i < plan->op_count; ++i) {
+        const tm_cap_op_t *op = &plan->ops[i];
+        seL4_Word err;
+
+        if (op->kind == TM_CAP_OP_MINT) {
+            err = qsoe_cnode_mint(op->dst_cnode, op->dst_slot,
+                                  op->dst_depth,
+                                  op->src_cnode, op->src_slot,
+                                  op->src_depth,
+                                  op->rights, op->badge);
+        } else if (op->kind == TM_CAP_OP_COPY) {
+            err = qsoe_cnode_copy(op->dst_cnode, op->dst_slot,
+                                  op->dst_depth,
+                                  op->src_cnode, op->src_slot,
+                                  op->src_depth,
+                                  op->rights);
+        } else {
+            return -EINVAL;
+        }
+        if (err) {
+            tm_err("spawn: %s failed", op->label);
+            return -ENOMEM;
+        }
+
+        if (op->stdio_index >= 0) {
+            int sidx = op->stdio_index;
+            if (tm_connection_register_existing(plan->pid, op->dst_slot,
+                                                 plan->console_idx,
+                                                 plan->stdio_scoids[sidx],
+                                                 0) != 0) {
+                tm_err("spawn: register stdio connection failed");
+                return -ENOMEM;
+            }
+        }
+    }
+
+    return 0;
+}
+
 /* Build the SysV ABI initial-stack image into the top page of the
  * child's stack region.
  *
@@ -1589,15 +1765,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     /* COMMIT phase: publish caps/process records and resume only after
      * the address space, stack, and loader state have been built. */
 
-    /* 5. Populate the child's CSpace. Slot 1 = Send cap to taskman's
-     *    primary endpoint, badged with the child's pid. The child's
-     *    CNode is freshly retyped — depth = its radix (12), no guard.
-     *    The TCB_Configure step below sets a guard that gives the child
-     *    a 64-bit effective CSpace at runtime. */
-    err = qsoe_cnode_mint(cnode, QSOE_CAP_TASKMAN_EP, 12,
-                          s_cnode_root, primary_ep, 64,
-                          QSOE_RIGHTS_SEND, (seL4_Word)pid);
-    if (err) { tm_err("spawn: mint TASKMAN_EP failed"); return -ENOMEM; }
+    /* 5. Populate the child's CSpace from a prepared C-owned cap plan.
+     *    Slot 1 = Send cap to taskman's primary endpoint, badged with
+     *    the child's pid. The child's CNode is freshly retyped -- depth
+     *    = its radix (12), no guard. The TCB_Configure step below sets a
+     *    guard that gives the child a 64-bit effective CSpace at
+     *    runtime. */
 
     /* 5b. Untyped budget. Retype 256 KiB (2^18) of untyped out of
      *     taskman's pool; copy the resulting Untyped cap into the
@@ -1610,22 +1783,11 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         tm_err("spawn: child untyped retype failed");
         return -ENOMEM;
     }
-    err = qsoe_cnode_copy(cnode, QSOE_CAP_OWN_UNTYPED, 12,
-                          s_cnode_root, child_untyped, 64,
-                          QSOE_RIGHTS_ALL);
-    if (err) { tm_err("spawn: copy OWN_UNTYPED failed"); return -ENOMEM; }
 
     /* 5b'. Copy the child's own CNode cap into its slot
      *      QSOE_CAP_CNODE_SELF so the child can move a reply object
      *      within its own CSpace from inside — required for resmgr
      *      park-the-caller patterns (devc-ser8250 RX). */
-    err = qsoe_cnode_copy(cnode, QSOE_CAP_CNODE_SELF, 12,
-                          s_cnode_root, cnode, 64,
-                          QSOE_RIGHTS_ALL);
-    if (err) { tm_err("spawn: copy CNODE_SELF failed"); return -ENOMEM; }
-
-    /* 4c. v0.6.4: no pre-allocated heap.  Memory comes on demand via
-     * TM_REQ_MMAP after the child runs.  See tm_mmap_serve below. */
 
     /* 5c. v0.5.0/v0.6.1: stdio inheritance. Resolve the CURRENT
      *     /dev/console binding via the path manager — early in boot
@@ -1634,43 +1796,20 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     driver's channel. Mint three badged Send-caps on whatever
      *     channel master is currently registered, then record each
      *     connection in taskman's table. */
-    tm_pathmgr_obj_t console_obj;
-    unsigned cons_consumed = 0;
-    if (tm_pathmgr_resolve("/dev/console", &console_obj, &cons_consumed) != 0) {
-        tm_err("spawn: /dev/console not in pathmgr");
-        return -EINVAL;
+    tm_cap_plan_t cap_plan;
+    int cap_plan_rc = tm_cap_plan_prepare(&cap_plan, pid, cnode,
+                                          s_cnode_root, primary_ep,
+                                          child_untyped);
+    if (cap_plan_rc != 0) {
+        tm_err("spawn: tm_cap_plan_prepare failed rc=%d", cap_plan_rc);
+        return cap_plan_rc;
     }
-    int console_idx = tm_channel_index(console_obj.server_pid,
-                                        console_obj.server_chid);
-    if (console_idx < 0) {
-        tm_err("spawn: /dev/console channel not registered");
-        return -EINVAL;
-    }
-    seL4_CPtr console_master = tm_channel_master(console_idx);
-    if (!console_master) {
-        tm_err("spawn: /dev/console master cap missing");
-        return -EINVAL;
-    }
-    static const seL4_CPtr stdio_slots[3] = {
-        QSOE_CAP_STDIN_CONNECT,
-        QSOE_CAP_STDOUT_CONNECT,
-        QSOE_CAP_STDERR_CONNECT,
-    };
-    for (int i = 0; i < 3; ++i) {
-        seL4_Word scoid = tm_alloc_scoid();
-        err = qsoe_cnode_mint(cnode, stdio_slots[i], 12,
-                              s_cnode_root, console_master, 64,
-                              QSOE_RIGHTS_SEND, scoid);
-        if (err) {
-            tm_err("spawn: mint stdio cap failed");
-            return -ENOMEM;
-        }
-        if (tm_connection_register_existing(pid, stdio_slots[i],
-                                             console_idx, scoid, 0) != 0) {
-            tm_err("spawn: register stdio connection failed");
-            return -ENOMEM;
-        }
-    }
+    cap_plan_rc = tm_cap_plan_commit(&cap_plan);
+    if (cap_plan_rc != 0)
+        return cap_plan_rc;
+
+    /* 4c. v0.6.4: no pre-allocated heap.  Memory comes on demand via
+     * TM_REQ_MMAP after the child runs.  See tm_mmap_serve below. */
 
     /* (No spawn-time UART cap granting.)  devc-ser8250 maps the 16550
      * itself via mmap(MAP_PHYS, UART_PHYS) and claims PLIC line 10 at
