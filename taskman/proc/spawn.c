@@ -1015,17 +1015,77 @@ static int load_elf_segments(seL4_CPtr vspace, const void *elf_blob,
     return 0;
 }
 
-int tm_spawn(const void *elf_blob, unsigned long elf_len,
-             pid_t pid, seL4_CPtr primary_ep,
-             int argc, const char *const *argv,
-             int envc, const char *const *envp,
-             const char *elf_name)
+typedef struct tm_spawn_plan {
+    const void *elf_blob;
+    unsigned long elf_len;
+    const char *elf_name;
+    const struct elf64_hdr *eh;
+    const struct elf64_phdr *ph;
+    const struct elf64_phdr *interp_ph;
+    int dyn_link;
+    unsigned long entry_pc;
+    unsigned long main_phdr_va;
+    unsigned long rtld_load_base;
+} tm_spawn_plan_t;
+
+static void tm_spawn_state_reset(void)
 {
     /* Reset per-spawn state.  Frame table is rebuilt as PT_LOAD pages
      * are mapped; the reloc walker consults it to find write targets. */
     s_frame_count = 0;
     s_pt_count    = 0;
     s_relro_count = 0;
+}
+
+static int tm_spawn_plan_prepare(tm_spawn_plan_t *plan,
+                                 const void *elf_blob,
+                                 unsigned long elf_len,
+                                 const char *elf_name)
+{
+    (void)elf_len;
+    qmemset(plan, 0, sizeof *plan);
+    plan->elf_blob = elf_blob;
+    plan->elf_len = elf_len;
+    plan->elf_name = elf_name;
+
+    const struct elf64_hdr *eh = elf_blob;
+
+    /* Sanity-check the ELF header. */
+    if (eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') {
+        tm_err("spawn: not an ELF");
+        return -EINVAL;
+    }
+    if (eh->e_ident[4] != 2 /* ELFCLASS64 */) {
+        tm_err("spawn: not ELF64");
+        return -EINVAL;
+    }
+
+    plan->eh = eh;
+    plan->ph = (const struct elf64_phdr *)
+               ((const u8 *)elf_blob + eh->e_phoff);
+    for (u16 i = 0; i < eh->e_phnum; ++i) {
+        if (plan->ph[i].p_type == PT_INTERP) {
+            plan->interp_ph = &plan->ph[i];
+            break;
+        }
+    }
+
+    plan->entry_pc = eh->e_entry;
+
+    tm_dbg("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
+            eh->e_type, eh->e_phnum, plan->interp_ph ? "yes" : "no");
+
+    return 0;
+}
+
+int tm_spawn(const void *elf_blob, unsigned long elf_len,
+             pid_t pid, seL4_CPtr primary_ep,
+             int argc, const char *const *argv,
+             int envc, const char *const *envp,
+             const char *elf_name)
+{
+    tm_spawn_state_reset();
 
     /* The L1 PT covering [0x40000000, 0x80000000).  In dyn-linked
      * spawns we install it below as `dl_l1` (so libc.so + rtld + the
@@ -1105,19 +1165,20 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
     }
 
-    (void)elf_len;
-    const struct elf64_hdr *eh = elf_blob;
+    tm_spawn_plan_t plan;
+    int plan_rc = tm_spawn_plan_prepare(&plan, elf_blob, elf_len, elf_name);
+    if (plan_rc != 0) return plan_rc;
 
-    /* Sanity-check the ELF header. */
-    if (eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' ||
-        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') {
-        tm_err("spawn: not an ELF");
-        return -EINVAL;
-    }
-    if (eh->e_ident[4] != 2 /* ELFCLASS64 */) {
-        tm_err("spawn: not ELF64");
-        return -EINVAL;
-    }
+    const struct elf64_hdr *eh = plan.eh;
+    const struct elf64_phdr *ph = plan.ph;
+    const struct elf64_phdr *interp_ph = plan.interp_ph;
+    int dyn_link = plan.dyn_link;
+    unsigned long entry_pc = plan.entry_pc;
+    unsigned long main_phdr_va = plan.main_phdr_va;
+    unsigned long rtld_load_base = plan.rtld_load_base;
+
+    /* BUILD phase: allocate child objects, map image/address-space state,
+     * and prepare the initial user stack without publishing process state. */
 
     /* 1. Allocate the child's kernel objects.
      *
@@ -1159,8 +1220,6 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    For ET_EXEC like our current binaries, p_vaddr is the final
      *    address; for ET_DYN PIE we'd pass a non-zero load_offset.
      *    We only spawn ET_EXEC main images, so 0 is correct. */
-    const struct elf64_phdr *ph = (const struct elf64_phdr *)
-                                  ((const u8 *)elf_blob + eh->e_phoff);
     int load_rc = load_elf_segments(vspace, elf_blob, /*load_offset=*/0);
     if (load_rc != 0) return load_rc;
 
@@ -1184,18 +1243,6 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     resolves to it without a duplicate filesystem load), then
      *     applies relocations to qsh and libc.so, then jumps to qsh's
      *     entry (AT_ENTRY) with the original sp.                    */
-    const struct elf64_phdr *interp_ph = 0;
-    for (u16 i = 0; i < eh->e_phnum; ++i) {
-        if (ph[i].p_type == PT_INTERP) { interp_ph = &ph[i]; break; }
-    }
-    tm_dbg("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
-            eh->e_type, eh->e_phnum, interp_ph ? "yes" : "no");
-
-    int          dyn_link        = 0;
-    unsigned long entry_pc        = eh->e_entry;
-    unsigned long main_phdr_va    = 0;
-    unsigned long rtld_load_base  = 0;
-
     if (interp_ph) {
         /* PT_INTERP body is an ASCIIZ path like "/lib/ld-qsoe.so.1".
          * Strip the leading '/' for the cpio (flat) namespace. */
@@ -1482,6 +1529,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
         if (spawn_record_frame(va, stack_frames[i]) != 0) return -ENOMEM;
     }
+
+    /* COMMIT phase: publish caps/process records and resume only after
+     * the address space, stack, and loader state have been built. */
 
     /* 5. Populate the child's CSpace. Slot 1 = Send cap to taskman's
      *    primary endpoint, badged with the child's pid. The child's
