@@ -514,7 +514,7 @@ int MsgReceive(int chid, void *msg, int bytes, struct _msg_info *info)
      * and stash the client's reply buffer for the matching MsgReply.  The
      * descriptor MRs are {client send buf, sbytes, client reply buf,
      * rbytes}; the badge is the client pid. */
-    if (label & QSOE_MSG_BULK_LABEL) {
+    if (label == QSOE_MSG_BULK_LABEL) {
         unsigned long c_sbuf   = (unsigned long)mr0;
         unsigned long c_sbytes = (unsigned long)mr1;
         unsigned long c_rbuf   = (unsigned long)mr2;

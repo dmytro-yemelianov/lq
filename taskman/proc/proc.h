@@ -95,6 +95,7 @@ enum {
  *
  * Radix 2^9 = 512 slots, comfortably above SPAWN_MAX_FRAMES. */
 #define TM_OBJCNODE_RADIX   9
+#define TM_OBJCNODE_NO_VA   (~0UL)
 
 /* Graceful crash (v0.10).  A child's fault handler is a badged
  * Send+GrantReply cap to taskman's primary endpoint; on a fatal U-mode
@@ -305,6 +306,7 @@ typedef struct {
      * root-CNode slot is freed back to the slot free-list. */
     seL4_CPtr objcnode;
     int       objcnode_next;
+    unsigned long objcnode_va[1 << TM_OBJCNODE_RADIX];
 
     /* v0.10 fault handler: the badged Send+GrantReply cap to taskman's
      * primary EP installed as the main thread's fault endpoint.  Stays
@@ -510,6 +512,12 @@ int           tm_process_waitpid(pid_t waiter, pid_t child,
  * args back.  Match is by (va & ~(QSOE_MEGA_PAGE - 1)). */
 seL4_CPtr     tm_process_find_frame(const tm_process_t *proc,
                                      unsigned long va);
+int           tm_process_resolve_frame(const tm_process_t *proc,
+                                       unsigned long va,
+                                       seL4_CPtr *out_cnode,
+                                       seL4_CPtr *out_slot,
+                                       seL4_Uint8 *out_depth,
+                                       int *out_is_mega);
 
 /* Read up to 4 KiB from `args_va` in `proc`'s VSpace into out_buf.
  * Looks up the Mega_Page frame backing args_va via tm_process_find_frame,
