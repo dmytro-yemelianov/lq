@@ -1016,6 +1016,15 @@ typedef struct tm_spawn_plan {
     unsigned long rtld_load_base;
 } tm_spawn_plan_t;
 
+typedef struct tm_spawn_build {
+    seL4_CPtr cnode;
+    seL4_CPtr vspace;
+    seL4_CPtr tcb;
+    seL4_CPtr ipc_frame;
+    seL4_CPtr tcb_frame;
+    unsigned long initial_sp;
+} tm_spawn_build_t;
+
 static void tm_spawn_state_reset(void)
 {
     /* Reset per-spawn state.  Frame table is rebuilt as PT_LOAD pages
@@ -1063,6 +1072,197 @@ static int tm_spawn_plan_prepare(tm_spawn_plan_t *plan,
 
     tm_dbg("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
             eh->e_type, eh->e_phnum, plan->interp_ph ? "yes" : "no");
+
+    return 0;
+}
+
+static int tm_spawn_build_base_objects(tm_spawn_build_t *build,
+                                       const tm_spawn_plan_t *plan)
+{
+    qmemset(build, 0, sizeof *build);
+
+    /* 1. Allocate the child's kernel objects.
+     *
+     *    Order matters for our bump allocator (s_next_slot) — every
+     *    failure path leaks slots until v0.4's PCB-keyed cleanup, but
+     *    on success-path it's tight. */
+    build->cnode = alloc_object(seL4_CapTableObject, 12);
+    if (!build->cnode) return -ENOMEM;
+    build->vspace = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!build->vspace) return -ENOMEM;
+    build->tcb    = alloc_object(seL4_TCBObject, 0);
+    if (!build->tcb) return -ENOMEM;
+
+    /* Assign the new VSpace to taskman's ASID pool — required before
+     * any Page_Map can succeed on it. */
+    seL4_Word err = qsoe_riscv_asidpool_assign(seL4_CapInitThreadASIDPool,
+                                                build->vspace);
+    if (err) {
+        tm_err("spawn: ASIDPool_Assign failed");
+        return -ENOMEM;
+    }
+
+    /* 2. Build the child's page-table tree. We need an L1 PT
+     *    (covering [0, 1 GiB)) and an L0 PT (covering [0, 2 MiB)).
+     *    Sv39 with 4 KiB pages → call PageTable_Map at each
+     *    intermediate level. The kernel decides the level from vaddr. */
+    seL4_CPtr l1_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!l1_pt) return -ENOMEM;
+    if (spawn_record_pt(l1_pt) != 0) return -ENOMEM;
+    err = qsoe_riscv_pagetable_map(l1_pt, build->vspace, 0,
+                                   QSOE_VM_ATTR_DEFAULT);
+    if (err) { tm_err("spawn: L1 PageTable_Map failed"); return -ENOMEM; }
+
+    seL4_CPtr l0_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!l0_pt) return -ENOMEM;
+    if (spawn_record_pt(l0_pt) != 0) return -ENOMEM;
+    err = qsoe_riscv_pagetable_map(l0_pt, build->vspace, 0,
+                                   QSOE_VM_ATTR_DEFAULT);
+    if (err) { tm_err("spawn: L0 PageTable_Map failed"); return -ENOMEM; }
+
+    /* 3. Walk PT_LOAD segments of the main image at link VA.
+     *    For ET_EXEC like our current binaries, p_vaddr is the final
+     *    address; for ET_DYN PIE we'd pass a non-zero load_offset.
+     *    We only spawn ET_EXEC main images, so 0 is correct. */
+    int load_rc = load_elf_segments(build->vspace, plan->elf_blob,
+                                    /*load_offset=*/0);
+    if (load_rc != 0) return load_rc;
+
+    return 0;
+}
+
+static int tm_spawn_build_runtime_pages(tm_spawn_build_t *build,
+                                        const tm_spawn_plan_t *plan,
+                                        int dyn_link,
+                                        unsigned long main_phdr_va,
+                                        unsigned long rtld_load_base,
+                                        int argc,
+                                        const char *const *argv,
+                                        int envc,
+                                        const char *const *envp)
+{
+    const struct elf64_hdr *eh = plan->eh;
+    seL4_Word err;
+
+    /* 4. IPC buffer page — allocate, zero, map into child. */
+    build->ipc_frame = alloc_object(seL4_RISCV_4K_Page, 0);
+    if (!build->ipc_frame) return -ENOMEM;
+    err = scratch_map(build->ipc_frame);
+    if (err) return -ENOMEM;
+    qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
+    err = scratch_unmap(build->ipc_frame);
+    if (err) return -ENOMEM;
+    err = qsoe_riscv_page_map(build->ipc_frame, build->vspace,
+                              CHILD_IPC_BUFFER, QSOE_RIGHTS_ALL,
+                              QSOE_VM_ATTR_DEFAULT);
+    if (err) { tm_err("spawn: ipc_frame Page_Map failed"); return -ENOMEM; }
+    if (spawn_record_frame(CHILD_IPC_BUFFER, build->ipc_frame) != 0)
+        return -ENOMEM;
+
+    /* 4b. TCB page -- one zeroed 4 KiB page at CHILD_TCB_BASE that the
+     *     thread's tp register will point at.  libc.so / rtld use
+     *     `tp + offset` to read/write TLS slots (qsoe_errno at offset
+     *     4, qsoe_self_pid further along, etc.).  Without this, the
+     *     very first `*tp = ...` from libc (e.g. write() setting
+     *     errno) faults on a NULL deref.  Mirrors NQ's TCB-below-stack
+     *     pattern (see nq/taskman/sys/spawn.c).
+     *
+     *     Zero-init is enough for the libc seam: tid=0, qsoe_errno=0,
+     *     and the rest defaulted; libc_init refines on first
+     *     syscall. */
+    build->tcb_frame = alloc_object(seL4_RISCV_4K_Page, 0);
+    if (!build->tcb_frame) return -ENOMEM;
+    err = scratch_map(build->tcb_frame);
+    if (err) return -ENOMEM;
+    qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
+    err = scratch_unmap(build->tcb_frame);
+    if (err) return -ENOMEM;
+    err = qsoe_riscv_page_map(build->tcb_frame, build->vspace,
+                              CHILD_TCB_BASE, QSOE_RIGHTS_ALL,
+                              QSOE_VM_ATTR_DEFAULT);
+    if (err) { tm_err("spawn: tcb_frame Page_Map failed"); return -ENOMEM; }
+    if (spawn_record_frame(CHILD_TCB_BASE, build->tcb_frame) != 0)
+        return -ENOMEM;
+
+    /* 4c. Sysmap page -- one READ-ONLY 'PSYS' page at QSOE_SYSMAP_VA
+     *     carrying the platform catalog (mtime freq, cpu count, PCI
+     *     ECAM + MMIO window).  The shared libc hwi_init() reads it
+     *     with no IPC, exactly as on NQ where the Skimmer kernel maps
+     *     it in the boot PT.  Built once at boot by tm_sysmap_build();
+     *     each child gets its own copy mapped read-only.  Absent only if
+     *     the FDT carried no usable platform info -- then hwi_init falls
+     *     back to its built-in defaults, as before. */
+    {
+        const void *smp = 0;
+        if (tm_sysmap_get(&smp, 0) == 0 && smp) {
+            seL4_CPtr smap_frame = alloc_object(seL4_RISCV_4K_Page, 0);
+            if (!smap_frame) return -ENOMEM;
+            err = scratch_map(smap_frame);
+            if (err) return -ENOMEM;
+            qmemcpy((void *)TM_SCRATCH_VADDR, smp, 0x1000);
+            err = scratch_unmap(smap_frame);
+            if (err) return -ENOMEM;
+            err = qsoe_riscv_page_map(smap_frame, build->vspace,
+                                      CHILD_SYSMAP_BASE, QSOE_RIGHTS_RO,
+                                      QSOE_VM_ATTR_DEFAULT);
+            if (err) { tm_err("spawn: sysmap Page_Map failed"); return -ENOMEM; }
+            if (spawn_record_frame(CHILD_SYSMAP_BASE, smap_frame) != 0)
+                return -ENOMEM;
+        }
+    }
+
+    /* v0.4.4: allocate the stack region below the IPC buffer.
+     * CHILD_STACK_PAGES pages cover [CHILD_STACK_BASE, CHILD_STACK_TOP).
+     * The top page gets populated with the SysV ABI initial-stack
+     * image (argc/argv/envp/auxv/strings) via scratch_map FIRST, then
+     * all pages are mapped into the child. (Mapping into the child
+     * before the scratch-map would fail with "frame does not belong
+     * to passed address space" — a frame may only be mapped in one
+     * VSpace at a time.) */
+    seL4_CPtr stack_frames[CHILD_STACK_PAGES];
+    for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
+        stack_frames[i] = alloc_object(seL4_RISCV_4K_Page, 0);
+        if (!stack_frames[i]) {
+            tm_err("spawn: stack frame alloc failed");
+            return -ENOMEM;
+        }
+    }
+    /* Build the SysV initial-stack image in the top stack page
+     * BEFORE mapping it into the child.  For dynamically-linked
+     * programs hand rtld the auxv entries it asserts on: AT_PHDR /
+     * AT_PHENT / AT_PHNUM / AT_BASE / AT_ENTRY / AT_PAGESZ plus
+     * AT_KPRELOAD = DL_LIBC_LOAD_VA so load_kpreload() picks up
+     * libc.so under its DT_SONAME = "libc.so" alias. */
+    struct aux_pair auxv[8];
+    int auxc = 0;
+    if (dyn_link) {
+        auxv[auxc++] = (struct aux_pair){ AT_PHDR_,     main_phdr_va };
+        auxv[auxc++] = (struct aux_pair){ AT_PHENT_,    sizeof(struct elf64_phdr) };
+        auxv[auxc++] = (struct aux_pair){ AT_PHNUM_,    eh->e_phnum };
+        auxv[auxc++] = (struct aux_pair){ AT_BASE_,     rtld_load_base };
+        auxv[auxc++] = (struct aux_pair){ AT_ENTRY_,    eh->e_entry };
+        auxv[auxc++] = (struct aux_pair){ AT_PAGESZ_,   0x1000 };
+        auxv[auxc++] = (struct aux_pair){ AT_KPRELOAD_, DL_LIBC_LOAD_VA };
+    }
+
+    build->initial_sp =
+        build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1],
+                            argc, argv, envc, envp, auxv, auxc);
+    if (!build->initial_sp) {
+        tm_err("spawn: build_initial_stack failed");
+        return -E2BIG;
+    }
+    /* Now map all stack pages into the child. */
+    for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
+        unsigned long va = CHILD_STACK_BASE + (unsigned long)i * 0x1000UL;
+        err = qsoe_riscv_page_map(stack_frames[i], build->vspace, va,
+                                  QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
+        if (err) {
+            tm_err("spawn: stack Page_Map failed");
+            return -ENOMEM;
+        }
+        if (spawn_record_frame(va, stack_frames[i]) != 0) return -ENOMEM;
+    }
 
     return 0;
 }
@@ -1167,49 +1367,15 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
 
     /* BUILD phase: allocate child objects, map image/address-space state,
      * and prepare the initial user stack without publishing process state. */
+    tm_spawn_build_t build;
+    int build_rc = tm_spawn_build_base_objects(&build, &plan);
+    if (build_rc != 0) return build_rc;
 
-    /* 1. Allocate the child's kernel objects.
-     *
-     *    Order matters for our bump allocator (s_next_slot) — every
-     *    failure path leaks slots until v0.4's PCB-keyed cleanup, but
-     *    on success-path it's tight. */
-    seL4_CPtr cnode = alloc_object(seL4_CapTableObject, 12);
-    if (!cnode) return -ENOMEM;
-    seL4_CPtr vspace = alloc_object(seL4_RISCV_PageTableObject, 0);
-    if (!vspace) return -ENOMEM;
-    seL4_CPtr tcb    = alloc_object(seL4_TCBObject, 0);
-    if (!tcb) return -ENOMEM;
-
-    /* Assign the new VSpace to taskman's ASID pool — required before
-     * any Page_Map can succeed on it. */
-    seL4_Word err = qsoe_riscv_asidpool_assign(seL4_CapInitThreadASIDPool, vspace);
-    if (err) {
-        tm_err("spawn: ASIDPool_Assign failed");
-        return -ENOMEM;
-    }
-
-    /* 2. Build the child's page-table tree. We need an L1 PT
-     *    (covering [0, 1 GiB)) and an L0 PT (covering [0, 2 MiB)).
-     *    Sv39 with 4 KiB pages → call PageTable_Map at each
-     *    intermediate level. The kernel decides the level from vaddr. */
-    seL4_CPtr l1_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
-    if (!l1_pt) return -ENOMEM;
-    if (spawn_record_pt(l1_pt) != 0) return -ENOMEM;
-    err = qsoe_riscv_pagetable_map(l1_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: L1 PageTable_Map failed"); return -ENOMEM; }
-
-    seL4_CPtr l0_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
-    if (!l0_pt) return -ENOMEM;
-    if (spawn_record_pt(l0_pt) != 0) return -ENOMEM;
-    err = qsoe_riscv_pagetable_map(l0_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: L0 PageTable_Map failed"); return -ENOMEM; }
-
-    /* 3. Walk PT_LOAD segments of the main image at link VA.
-     *    For ET_EXEC like our current binaries, p_vaddr is the final
-     *    address; for ET_DYN PIE we'd pass a non-zero load_offset.
-     *    We only spawn ET_EXEC main images, so 0 is correct. */
-    int load_rc = load_elf_segments(vspace, elf_blob, /*load_offset=*/0);
-    if (load_rc != 0) return load_rc;
+    seL4_CPtr cnode = build.cnode;
+    seL4_CPtr vspace = build.vspace;
+    seL4_CPtr tcb = build.tcb;
+    seL4_Word err = 0;
+    int load_rc = 0;
 
     /* 3b. Phase 4: dynamic linking.  If the main image has PT_INTERP,
      *     pre-load rtld + libc.so into the child VSpace and arrange
@@ -1403,120 +1569,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                 (unsigned long)main_phdr_va);
     }
 
-    /* 4. IPC buffer page — allocate, zero, map into child. */
-    seL4_CPtr ipc_frame = alloc_object(seL4_RISCV_4K_Page, 0);
-    if (!ipc_frame) return -ENOMEM;
-    err = scratch_map(ipc_frame);
-    if (err) return -ENOMEM;
-    qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
-    err = scratch_unmap(ipc_frame);
-    if (err) return -ENOMEM;
-    err = qsoe_riscv_page_map(ipc_frame, vspace, CHILD_IPC_BUFFER,
-                              QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: ipc_frame Page_Map failed"); return -ENOMEM; }
-    if (spawn_record_frame(CHILD_IPC_BUFFER, ipc_frame) != 0) return -ENOMEM;
+    build_rc = tm_spawn_build_runtime_pages(&build, &plan, dyn_link,
+                                            main_phdr_va, rtld_load_base,
+                                            argc, argv, envc, envp);
+    if (build_rc != 0) return build_rc;
 
-    /* 4b. TCB page -- one zeroed 4 KiB page at CHILD_TCB_BASE that the
-     *     thread's tp register will point at.  libc.so / rtld use
-     *     `tp + offset` to read/write TLS slots (qsoe_errno at offset
-     *     4, qsoe_self_pid further along, etc.).  Without this, the
-     *     very first `*tp = ...` from libc (e.g. write() setting
-     *     errno) faults on a NULL deref.  Mirrors NQ's TCB-below-stack
-     *     pattern (see nq/taskman/sys/spawn.c).
-     *
-     *     Zero-init is enough for the libc seam: tid=0, qsoe_errno=0,
-     *     and the rest defaulted; libc_init refines on first
-     *     syscall. */
-    seL4_CPtr tcb_frame = alloc_object(seL4_RISCV_4K_Page, 0);
-    if (!tcb_frame) return -ENOMEM;
-    err = scratch_map(tcb_frame);
-    if (err) return -ENOMEM;
-    qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
-    err = scratch_unmap(tcb_frame);
-    if (err) return -ENOMEM;
-    err = qsoe_riscv_page_map(tcb_frame, vspace, CHILD_TCB_BASE,
-                              QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: tcb_frame Page_Map failed"); return -ENOMEM; }
-    if (spawn_record_frame(CHILD_TCB_BASE, tcb_frame) != 0) return -ENOMEM;
-
-    /* 4c. Sysmap page -- one READ-ONLY 'PSYS' page at QSOE_SYSMAP_VA
-     *     carrying the platform catalog (mtime freq, cpu count, PCI
-     *     ECAM + MMIO window).  The shared libc hwi_init() reads it
-     *     with no IPC, exactly as on NQ where the Skimmer kernel maps
-     *     it in the boot PT.  Built once at boot by tm_sysmap_build();
-     *     each child gets its own copy mapped read-only.  Absent only if
-     *     the FDT carried no usable platform info -- then hwi_init falls
-     *     back to its built-in defaults, as before. */
-    {
-        const void *smp = 0;
-        if (tm_sysmap_get(&smp, 0) == 0 && smp) {
-            seL4_CPtr smap_frame = alloc_object(seL4_RISCV_4K_Page, 0);
-            if (!smap_frame) return -ENOMEM;
-            err = scratch_map(smap_frame);
-            if (err) return -ENOMEM;
-            qmemcpy((void *)TM_SCRATCH_VADDR, smp, 0x1000);
-            err = scratch_unmap(smap_frame);
-            if (err) return -ENOMEM;
-            err = qsoe_riscv_page_map(smap_frame, vspace, CHILD_SYSMAP_BASE,
-                                      QSOE_RIGHTS_RO, QSOE_VM_ATTR_DEFAULT);
-            if (err) { tm_err("spawn: sysmap Page_Map failed"); return -ENOMEM; }
-            if (spawn_record_frame(CHILD_SYSMAP_BASE, smap_frame) != 0)
-                return -ENOMEM;
-        }
-    }
-
-    /* v0.4.4: allocate the stack region below the IPC buffer.
-     * CHILD_STACK_PAGES pages cover [CHILD_STACK_BASE, CHILD_STACK_TOP).
-     * The top page gets populated with the SysV ABI initial-stack
-     * image (argc/argv/envp/auxv/strings) via scratch_map FIRST, then
-     * all pages are mapped into the child. (Mapping into the child
-     * before the scratch-map would fail with "frame does not belong
-     * to passed address space" — a frame may only be mapped in one
-     * VSpace at a time.) */
-    seL4_CPtr stack_frames[CHILD_STACK_PAGES];
-    for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
-        stack_frames[i] = alloc_object(seL4_RISCV_4K_Page, 0);
-        if (!stack_frames[i]) {
-            tm_err("spawn: stack frame alloc failed");
-            return -ENOMEM;
-        }
-    }
-    /* Build the SysV initial-stack image in the top stack page
-     * BEFORE mapping it into the child.  For dynamically-linked
-     * programs hand rtld the auxv entries it asserts on: AT_PHDR /
-     * AT_PHENT / AT_PHNUM / AT_BASE / AT_ENTRY / AT_PAGESZ plus
-     * AT_KPRELOAD = DL_LIBC_LOAD_VA so load_kpreload() picks up
-     * libc.so under its DT_SONAME = "libc.so" alias. */
-    struct aux_pair auxv[8];
-    int auxc = 0;
-    if (dyn_link) {
-        auxv[auxc++] = (struct aux_pair){ AT_PHDR_,     main_phdr_va };
-        auxv[auxc++] = (struct aux_pair){ AT_PHENT_,    sizeof(struct elf64_phdr) };
-        auxv[auxc++] = (struct aux_pair){ AT_PHNUM_,    eh->e_phnum };
-        auxv[auxc++] = (struct aux_pair){ AT_BASE_,     rtld_load_base };
-        auxv[auxc++] = (struct aux_pair){ AT_ENTRY_,    eh->e_entry };
-        auxv[auxc++] = (struct aux_pair){ AT_PAGESZ_,   0x1000 };
-        auxv[auxc++] = (struct aux_pair){ AT_KPRELOAD_, DL_LIBC_LOAD_VA };
-    }
-
-    unsigned long initial_sp =
-        build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1],
-                            argc, argv, envc, envp, auxv, auxc);
-    if (!initial_sp) {
-        tm_err("spawn: build_initial_stack failed");
-        return -E2BIG;
-    }
-    /* Now map all stack pages into the child. */
-    for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
-        unsigned long va = CHILD_STACK_BASE + (unsigned long)i * 0x1000UL;
-        err = qsoe_riscv_page_map(stack_frames[i], vspace, va,
-                                  QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-        if (err) {
-            tm_err("spawn: stack Page_Map failed");
-            return -ENOMEM;
-        }
-        if (spawn_record_frame(va, stack_frames[i]) != 0) return -ENOMEM;
-    }
+    seL4_CPtr ipc_frame = build.ipc_frame;
+    unsigned long initial_sp = build.initial_sp;
 
     /* COMMIT phase: publish caps/process records and resume only after
      * the address space, stack, and loader state have been built. */
