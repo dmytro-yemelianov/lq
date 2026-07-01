@@ -1567,6 +1567,7 @@ static int tm_spawn_commit_process(const tm_spawn_build_t *build,
                        (unsigned long)merr);
                 return -ENOMEM;
             }
+            op->objcnode_va[op->objcnode_next] = s_frames[i].va_page;
             op->objcnode_next++;
             taskman_free_slot(src);
         }
@@ -1585,6 +1586,7 @@ static int tm_spawn_commit_process(const tm_spawn_build_t *build,
                        (unsigned long)merr);
                 return -ENOMEM;
             }
+            op->objcnode_va[op->objcnode_next] = TM_OBJCNODE_NO_VA;
             op->objcnode_next++;
             taskman_free_slot(src);
         }
