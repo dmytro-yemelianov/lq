@@ -1289,6 +1289,220 @@ static int tm_spawn_build_runtime_pages(tm_spawn_build_t *build,
     return 0;
 }
 
+
+static int tm_spawn_build_dynamic_loader(tm_spawn_build_t *build,
+                                         const tm_spawn_plan_t *plan,
+                                         seL4_CPtr *workers_l1_cap,
+                                         int *dyn_link,
+                                         unsigned long *entry_pc,
+                                         unsigned long *main_phdr_va,
+                                         unsigned long *rtld_load_base)
+{
+    if (!plan->interp_ph) return 0;
+
+    const void *elf_blob = plan->elf_blob;
+    unsigned long elf_len = plan->elf_len;
+    const struct elf64_hdr *eh = plan->eh;
+    const struct elf64_phdr *ph = plan->ph;
+    const struct elf64_phdr *interp_ph = plan->interp_ph;
+    seL4_CPtr vspace = build->vspace;
+    seL4_Word err = 0;
+    int load_rc = 0;
+
+    /* 3b. Phase 4: dynamic linking.  If the main image has PT_INTERP,
+     *     pre-load rtld + libc.so into the child VSpace and arrange
+     *     for the child to start in rtld instead of the main image's
+     *     entry.
+     *
+     *     Layout in the child VSpace:
+     *       [0x10000 .. 0x46000)   main image (qsh ET_EXEC link VA)
+     *       [0x1F9000 .. 0x1FB000) stack
+     *       [0x1FB000 .. 0x1FC000) TLS/TCB page
+     *       [0x1FC000 .. 0x1FD000) sysmap (read-only PSYS, QSOE_SYSMAP_VA)
+     *       [0x1FE000 .. 0x1FF000) IPC buffer
+     *       [0x60000000 .. +2 MiB) libc.so   -- DL_LIBC_LOAD_VA contract
+     *       [0x70000000 .. +2 MiB) rtld      -- private, told via AT_BASE
+     *
+     *     rtld receives the auxv we build below; its _rtld() walks
+     *     AT_KPRELOAD to register libc.so as an Obj_Entry (matched
+     *     by DT_SONAME = "libc.so" so the main image's DT_NEEDED
+     *     resolves to it without a duplicate filesystem load), then
+     *     applies relocations to qsh and libc.so, then jumps to qsh's
+     *     entry (AT_ENTRY) with the original sp.                    */
+    /* PT_INTERP body is an ASCIIZ path like "/lib/ld-qsoe.so.1".
+     * Strip the leading '/' for the cpio (flat) namespace. */
+    const char *interp_path = (const char *)elf_blob + interp_ph->p_offset;
+    const char *interp_cpio_name = interp_path;
+    if (interp_cpio_name[0] == '/') interp_cpio_name++;
+
+    unsigned long rtld_size = 0;
+    const void   *rtld_blob = tm_cpio_lookup(interp_cpio_name, &rtld_size);
+    if (!rtld_blob) {
+        tm_err("spawn: rtld not in cpio: %s", interp_cpio_name);
+        return -ENOENT;
+    }
+
+    unsigned long libc_size = 0;
+    const void   *libc_blob = tm_cpio_lookup("lib/libc.so", &libc_size);
+    if (!libc_blob) {
+        tm_err("spawn: lib/libc.so not in cpio");
+        return -ENOENT;
+    }
+
+    /* Install the page-table tree covering [0x40000000, 0x80000000).
+     * One L1 PT (for L2[1]), plus one L0 PT for each of the two
+     * 2 MiB regions holding libc.so and rtld.  seL4 picks the
+     * level from vaddr + what's already installed. */
+    seL4_CPtr dl_l1 = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!dl_l1) return -ENOMEM;
+    err = qsoe_riscv_pagetable_map(dl_l1, vspace, DL_LIBC_LOAD_VA,
+                                    QSOE_VM_ATTR_DEFAULT);
+    if (err) { tm_err("spawn: DL L1 PT map failed"); return -ENOMEM; }
+    /* Same PT object also covers the worker region at 0x40000000 —
+     * record it so ensure_workers_pts() doesn't try to install a
+     * second L1 PT into the same already-populated L2[1] slot. */
+    *workers_l1_cap = dl_l1;
+
+    /* dl_l1 above is NOT recorded for objcnode-move: it doubles as
+     * workers_l1_cap -> workers_l1_pt, whose slot teardown step 7
+     * already frees.  The two L0s below have no such alias, so their
+     * slots must be reclaimed here. */
+    seL4_CPtr libc_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!libc_l0) return -ENOMEM;
+    if (spawn_record_pt(libc_l0) != 0) return -ENOMEM;
+    err = qsoe_riscv_pagetable_map(libc_l0, vspace, DL_LIBC_LOAD_VA,
+                                    QSOE_VM_ATTR_DEFAULT);
+    if (err) { tm_err("spawn: libc L0 PT map failed"); return -ENOMEM; }
+
+    seL4_CPtr rtld_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
+    if (!rtld_l0) return -ENOMEM;
+    if (spawn_record_pt(rtld_l0) != 0) return -ENOMEM;
+    err = qsoe_riscv_pagetable_map(rtld_l0, vspace, DL_RTLD_LOAD_VA,
+                                    QSOE_VM_ATTR_DEFAULT);
+    if (err) { tm_err("spawn: rtld L0 PT map failed"); return -ENOMEM; }
+
+    /* PT_LOAD-walk libc.so at the fixed VA, then rtld at its base. */
+    load_rc = load_elf_segments(vspace, libc_blob, DL_LIBC_LOAD_VA);
+    if (load_rc != 0) { tm_err("spawn: libc.so load failed"); return load_rc; }
+
+    load_rc = load_elf_segments(vspace, rtld_blob, DL_RTLD_LOAD_VA);
+    if (load_rc != 0) { tm_err("spawn: rtld load failed"); return load_rc; }
+
+    /* 3c. Pre-apply relocations in taskman (mirrors NQ's loader.c
+     * approach) so the user-mode rtld walks a pre-relocated world.
+     *
+     * Order:
+     *   1. libc.so first -- internal R_RISCV_RELATIVE entries get
+     *      bias added; cross-image references stay unresolved
+     *      because no resolver is plumbed in yet (libc.so itself
+     *      has no DT_NEEDED).  Then build a resolver from libc.so's
+     *      dynsym for the next two passes.
+     *   2. rtld next -- -Bsymbolic-linked, so its relocs are all
+     *      internal RELATIVE entries that resolve via bias alone.
+     *      Still gets libc.so as ext as a safety net.
+     *   3. Main image (qsh) last -- its JUMP_SLOT entries resolve
+     *      to runtime addresses inside libc.so via the resolver.
+     *
+     * Each pass: parse the file blob into a tm_elf_view_t, then
+     * call tm_reloc_apply with reloc_write_cb scratch-mapping
+     * frames in the child VSpace. */
+    tm_elf_view_t libc_view, rtld_view, main_view;
+    if (tm_elf_parse(libc_blob, libc_size, &libc_view) != 0) {
+        tm_err("spawn: libc.so re-parse failed");
+        return -ENOEXEC;
+    }
+    if (tm_elf_parse(rtld_blob, rtld_size, &rtld_view) != 0) {
+        tm_err("spawn: rtld re-parse failed");
+        return -ENOEXEC;
+    }
+    if (tm_elf_parse(elf_blob, elf_len, &main_view) != 0) {
+        tm_err("spawn: main image re-parse failed");
+        return -ENOEXEC;
+    }
+
+    /* Per-skip logger per feedback_stubs_announce: silent NULL
+     * slots crash hours later with no context.  Surface every
+     * unresolved external at load time -- the boot trace then
+     * tells us exactly which lq/libc/ stub to add. */
+    extern void tm_reloc_skip_warn(void *user, const char *name);
+
+    unsigned long ap = 0, tot = 0, sk = 0;
+    if (tm_reloc_apply(&libc_view, DL_LIBC_LOAD_VA, /*ext=*/0,
+                        reloc_write_cb, tm_reloc_skip_warn,
+                        (void *)"libc.so",
+                        &ap, &tot, &sk) != 0) {
+        tm_err("spawn: libc.so reloc failed");
+        return -ENOEXEC;
+    }
+    tm_dbg("spawn: libc.so relocs %lu/%lu (%lu skipped)", ap, tot, sk);
+
+    tm_reloc_resolver_t libc_resolver;
+    if (tm_reloc_init_resolver(&libc_view, DL_LIBC_LOAD_VA,
+                                &libc_resolver) != 0) {
+        tm_err("spawn: libc.so resolver init failed");
+        return -ENOEXEC;
+    }
+
+    if (tm_reloc_apply(&rtld_view, DL_RTLD_LOAD_VA, &libc_resolver,
+                        reloc_write_cb, tm_reloc_skip_warn,
+                        (void *)"rtld",
+                        &ap, &tot, &sk) != 0) {
+        tm_err("spawn: rtld reloc failed");
+        return -ENOEXEC;
+    }
+    tm_dbg("spawn: rtld relocs %lu/%lu (%lu skipped)", ap, tot, sk);
+
+    if (tm_reloc_apply(&main_view, /*bias=*/0, &libc_resolver,
+                        reloc_write_cb, tm_reloc_skip_warn,
+                        (void *)"main",
+                        &ap, &tot, &sk) != 0) {
+        tm_err("spawn: main reloc failed");
+        return -ENOEXEC;
+    }
+    tm_dbg("spawn: main relocs %lu/%lu (%lu skipped)", ap, tot, sk);
+
+    /* AT_PHDR is the VA of the main image's program-header table.
+     * The PHDR table sits in the first PT_LOAD; compute its VA as
+     * (first_load.p_vaddr - first_load.p_offset) + e_phoff. */
+    for (u16 i = 0; i < eh->e_phnum; ++i) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        if (eh->e_phoff >= ph[i].p_offset &&
+            eh->e_phoff <  ph[i].p_offset + ph[i].p_filesz) {
+            *main_phdr_va = ph[i].p_vaddr +
+                            (eh->e_phoff - ph[i].p_offset);
+            break;
+        }
+    }
+
+    *rtld_load_base = DL_RTLD_LOAD_VA;
+    const struct elf64_hdr *rtld_eh = rtld_blob;
+    /* NQ pattern: skip rtld and jump straight to the user image's
+     * entry.  Taskman's pre-reloc pass already resolved every
+     * R_RISCV_RELATIVE / R_RISCV_64 / R_RISCV_JUMP_SLOT in qsh,
+     * libc.so, and rtld -- letting rtld re-run relocate_objects
+     * would DOUBLE the bias on libc.so's GOT/PLT (target +
+     * 2*0x60000000 instead of target + 0x60000000) and jump into
+     * unmapped memory at the first call.  rtld_load_base is
+     * still recorded so the AT_BASE auxv entry tells curious
+     * libc code where rtld lives; rtld is just dormant.  When
+     * dlopen() lands we revisit -- at that point taskman won't
+     * have done the new image's relocs and rtld needs to step
+     * back into the picture. */
+    (void)rtld_eh;
+    *entry_pc = eh->e_entry;
+    *dyn_link = 1;
+
+    const unsigned char *rb = (const unsigned char *)rtld_blob;
+    tm_dbg("spawn: skip rtld magic=%02x%02x%02x%02x rtld_entry=%08lx pc=%08lx phdr_va=%08lx",
+            rb[0], rb[1], rb[2], rb[3],
+            (unsigned long)rtld_eh->e_entry,
+            (unsigned long)*entry_pc,
+            (unsigned long)*main_phdr_va);
+
+    return 0;
+}
+
+
 static int tm_spawn_commit_cspace(const tm_spawn_build_t *build,
                                   pid_t pid,
                                   seL4_CPtr primary_ep,
@@ -1738,9 +1952,6 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     int plan_rc = tm_spawn_plan_prepare(&plan, elf_blob, elf_len, elf_name);
     if (plan_rc != 0) return plan_rc;
 
-    const struct elf64_hdr *eh = plan.eh;
-    const struct elf64_phdr *ph = plan.ph;
-    const struct elf64_phdr *interp_ph = plan.interp_ph;
     int dyn_link = plan.dyn_link;
     unsigned long entry_pc = plan.entry_pc;
     unsigned long main_phdr_va = plan.main_phdr_va;
@@ -1752,201 +1963,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     int build_rc = tm_spawn_build_base_objects(&build, &plan);
     if (build_rc != 0) return build_rc;
 
-    seL4_CPtr vspace = build.vspace;
-    seL4_Word err = 0;
-    int load_rc = 0;
 
-    /* 3b. Phase 4: dynamic linking.  If the main image has PT_INTERP,
-     *     pre-load rtld + libc.so into the child VSpace and arrange
-     *     for the child to start in rtld instead of the main image's
-     *     entry.
-     *
-     *     Layout in the child VSpace:
-     *       [0x10000 .. 0x46000)   main image (qsh ET_EXEC link VA)
-     *       [0x1F9000 .. 0x1FB000) stack
-     *       [0x1FB000 .. 0x1FC000) TLS/TCB page
-     *       [0x1FC000 .. 0x1FD000) sysmap (read-only PSYS, QSOE_SYSMAP_VA)
-     *       [0x1FE000 .. 0x1FF000) IPC buffer
-     *       [0x60000000 .. +2 MiB) libc.so   -- DL_LIBC_LOAD_VA contract
-     *       [0x70000000 .. +2 MiB) rtld      -- private, told via AT_BASE
-     *
-     *     rtld receives the auxv we build below; its _rtld() walks
-     *     AT_KPRELOAD to register libc.so as an Obj_Entry (matched
-     *     by DT_SONAME = "libc.so" so the main image's DT_NEEDED
-     *     resolves to it without a duplicate filesystem load), then
-     *     applies relocations to qsh and libc.so, then jumps to qsh's
-     *     entry (AT_ENTRY) with the original sp.                    */
-    if (interp_ph) {
-        /* PT_INTERP body is an ASCIIZ path like "/lib/ld-qsoe.so.1".
-         * Strip the leading '/' for the cpio (flat) namespace. */
-        const char *interp_path = (const char *)elf_blob + interp_ph->p_offset;
-        const char *interp_cpio_name = interp_path;
-        if (interp_cpio_name[0] == '/') interp_cpio_name++;
+    build_rc = tm_spawn_build_dynamic_loader(&build, &plan, &workers_l1_cap,
+                                             &dyn_link, &entry_pc,
+                                             &main_phdr_va, &rtld_load_base);
+    if (build_rc != 0) return build_rc;
 
-        unsigned long rtld_size = 0;
-        const void   *rtld_blob = tm_cpio_lookup(interp_cpio_name, &rtld_size);
-        if (!rtld_blob) {
-            tm_err("spawn: rtld not in cpio: %s", interp_cpio_name);
-            return -ENOENT;
-        }
-
-        unsigned long libc_size = 0;
-        const void   *libc_blob = tm_cpio_lookup("lib/libc.so", &libc_size);
-        if (!libc_blob) {
-            tm_err("spawn: lib/libc.so not in cpio");
-            return -ENOENT;
-        }
-
-        /* Install the page-table tree covering [0x40000000, 0x80000000).
-         * One L1 PT (for L2[1]), plus one L0 PT for each of the two
-         * 2 MiB regions holding libc.so and rtld.  seL4 picks the
-         * level from vaddr + what's already installed. */
-        seL4_CPtr dl_l1 = alloc_object(seL4_RISCV_PageTableObject, 0);
-        if (!dl_l1) return -ENOMEM;
-        err = qsoe_riscv_pagetable_map(dl_l1, vspace, DL_LIBC_LOAD_VA,
-                                        QSOE_VM_ATTR_DEFAULT);
-        if (err) { tm_err("spawn: DL L1 PT map failed"); return -ENOMEM; }
-        /* Same PT object also covers the worker region at 0x40000000 —
-         * record it so ensure_workers_pts() doesn't try to install a
-         * second L1 PT into the same already-populated L2[1] slot. */
-        workers_l1_cap = dl_l1;
-
-        /* dl_l1 above is NOT recorded for objcnode-move: it doubles as
-         * workers_l1_cap -> workers_l1_pt, whose slot teardown step 7
-         * already frees.  The two L0s below have no such alias, so their
-         * slots must be reclaimed here. */
-        seL4_CPtr libc_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
-        if (!libc_l0) return -ENOMEM;
-        if (spawn_record_pt(libc_l0) != 0) return -ENOMEM;
-        err = qsoe_riscv_pagetable_map(libc_l0, vspace, DL_LIBC_LOAD_VA,
-                                        QSOE_VM_ATTR_DEFAULT);
-        if (err) { tm_err("spawn: libc L0 PT map failed"); return -ENOMEM; }
-
-        seL4_CPtr rtld_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
-        if (!rtld_l0) return -ENOMEM;
-        if (spawn_record_pt(rtld_l0) != 0) return -ENOMEM;
-        err = qsoe_riscv_pagetable_map(rtld_l0, vspace, DL_RTLD_LOAD_VA,
-                                        QSOE_VM_ATTR_DEFAULT);
-        if (err) { tm_err("spawn: rtld L0 PT map failed"); return -ENOMEM; }
-
-        /* PT_LOAD-walk libc.so at the fixed VA, then rtld at its base. */
-        load_rc = load_elf_segments(vspace, libc_blob, DL_LIBC_LOAD_VA);
-        if (load_rc != 0) { tm_err("spawn: libc.so load failed"); return load_rc; }
-
-        load_rc = load_elf_segments(vspace, rtld_blob, DL_RTLD_LOAD_VA);
-        if (load_rc != 0) { tm_err("spawn: rtld load failed"); return load_rc; }
-
-        /* 3c. Pre-apply relocations in taskman (mirrors NQ's loader.c
-         * approach) so the user-mode rtld walks a pre-relocated world.
-         *
-         * Order:
-         *   1. libc.so first -- internal R_RISCV_RELATIVE entries get
-         *      bias added; cross-image references stay unresolved
-         *      because no resolver is plumbed in yet (libc.so itself
-         *      has no DT_NEEDED).  Then build a resolver from libc.so's
-         *      dynsym for the next two passes.
-         *   2. rtld next -- -Bsymbolic-linked, so its relocs are all
-         *      internal RELATIVE entries that resolve via bias alone.
-         *      Still gets libc.so as ext as a safety net.
-         *   3. Main image (qsh) last -- its JUMP_SLOT entries resolve
-         *      to runtime addresses inside libc.so via the resolver.
-         *
-         * Each pass: parse the file blob into a tm_elf_view_t, then
-         * call tm_reloc_apply with reloc_write_cb scratch-mapping
-         * frames in the child VSpace. */
-        tm_elf_view_t libc_view, rtld_view, main_view;
-        if (tm_elf_parse(libc_blob, libc_size, &libc_view) != 0) {
-            tm_err("spawn: libc.so re-parse failed");
-            return -ENOEXEC;
-        }
-        if (tm_elf_parse(rtld_blob, rtld_size, &rtld_view) != 0) {
-            tm_err("spawn: rtld re-parse failed");
-            return -ENOEXEC;
-        }
-        if (tm_elf_parse(elf_blob, elf_len, &main_view) != 0) {
-            tm_err("spawn: main image re-parse failed");
-            return -ENOEXEC;
-        }
-
-        /* Per-skip logger per feedback_stubs_announce: silent NULL
-         * slots crash hours later with no context.  Surface every
-         * unresolved external at load time -- the boot trace then
-         * tells us exactly which lq/libc/ stub to add. */
-        extern void tm_reloc_skip_warn(void *user, const char *name);
-
-        unsigned long ap = 0, tot = 0, sk = 0;
-        if (tm_reloc_apply(&libc_view, DL_LIBC_LOAD_VA, /*ext=*/0,
-                            reloc_write_cb, tm_reloc_skip_warn,
-                            (void *)"libc.so",
-                            &ap, &tot, &sk) != 0) {
-            tm_err("spawn: libc.so reloc failed");
-            return -ENOEXEC;
-        }
-        tm_dbg("spawn: libc.so relocs %lu/%lu (%lu skipped)", ap, tot, sk);
-
-        tm_reloc_resolver_t libc_resolver;
-        if (tm_reloc_init_resolver(&libc_view, DL_LIBC_LOAD_VA,
-                                    &libc_resolver) != 0) {
-            tm_err("spawn: libc.so resolver init failed");
-            return -ENOEXEC;
-        }
-
-        if (tm_reloc_apply(&rtld_view, DL_RTLD_LOAD_VA, &libc_resolver,
-                            reloc_write_cb, tm_reloc_skip_warn,
-                            (void *)"rtld",
-                            &ap, &tot, &sk) != 0) {
-            tm_err("spawn: rtld reloc failed");
-            return -ENOEXEC;
-        }
-        tm_dbg("spawn: rtld relocs %lu/%lu (%lu skipped)", ap, tot, sk);
-
-        if (tm_reloc_apply(&main_view, /*bias=*/0, &libc_resolver,
-                            reloc_write_cb, tm_reloc_skip_warn,
-                            (void *)"main",
-                            &ap, &tot, &sk) != 0) {
-            tm_err("spawn: main reloc failed");
-            return -ENOEXEC;
-        }
-        tm_dbg("spawn: main relocs %lu/%lu (%lu skipped)", ap, tot, sk);
-
-        /* AT_PHDR is the VA of the main image's program-header table.
-         * The PHDR table sits in the first PT_LOAD; compute its VA as
-         * (first_load.p_vaddr - first_load.p_offset) + e_phoff. */
-        for (u16 i = 0; i < eh->e_phnum; ++i) {
-            if (ph[i].p_type != PT_LOAD) continue;
-            if (eh->e_phoff >= ph[i].p_offset &&
-                eh->e_phoff <  ph[i].p_offset + ph[i].p_filesz) {
-                main_phdr_va = ph[i].p_vaddr +
-                               (eh->e_phoff - ph[i].p_offset);
-                break;
-            }
-        }
-
-        rtld_load_base = DL_RTLD_LOAD_VA;
-        const struct elf64_hdr *rtld_eh = rtld_blob;
-        /* NQ pattern: skip rtld and jump straight to the user image's
-         * entry.  Taskman's pre-reloc pass already resolved every
-         * R_RISCV_RELATIVE / R_RISCV_64 / R_RISCV_JUMP_SLOT in qsh,
-         * libc.so, and rtld -- letting rtld re-run relocate_objects
-         * would DOUBLE the bias on libc.so's GOT/PLT (target +
-         * 2*0x60000000 instead of target + 0x60000000) and jump into
-         * unmapped memory at the first call.  rtld_load_base is
-         * still recorded so the AT_BASE auxv entry tells curious
-         * libc code where rtld lives; rtld is just dormant.  When
-         * dlopen() lands we revisit -- at that point taskman won't
-         * have done the new image's relocs and rtld needs to step
-         * back into the picture. */
-        (void)rtld_eh;
-        entry_pc       = eh->e_entry;
-        dyn_link       = 1;
-
-        const unsigned char *rb = (const unsigned char *)rtld_blob;
-        tm_dbg("spawn: skip rtld magic=%02x%02x%02x%02x rtld_entry=%08lx pc=%08lx phdr_va=%08lx",
-                rb[0], rb[1], rb[2], rb[3],
-                (unsigned long)rtld_eh->e_entry,
-                (unsigned long)entry_pc,
-                (unsigned long)main_phdr_va);
-    }
 
     build_rc = tm_spawn_build_runtime_pages(&build, &plan, dyn_link,
                                             main_phdr_va, rtld_load_base,
