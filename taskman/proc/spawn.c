@@ -1389,6 +1389,22 @@ typedef struct tm_loader_map_plan {
     tm_elf_view_t main_view;
 } tm_loader_map_plan_t;
 
+typedef enum tm_loader_auxv_status {
+    TM_LOADER_AUXV_EMPTY,
+    TM_LOADER_AUXV_STATIC,
+    TM_LOADER_AUXV_READY,
+    TM_LOADER_AUXV_BAD_PROTO,
+    TM_LOADER_AUXV_BAD_MAP,
+    TM_LOADER_AUXV_TOO_MANY,
+} tm_loader_auxv_status_t;
+
+typedef struct tm_loader_auxv_plan {
+    tm_loader_auxv_status_t status;
+    struct aux_pair auxv[TM_SPAWN_ARGPACK_MAX_AUXV];
+    int auxc;
+} tm_loader_auxv_plan_t;
+
+
 typedef struct tm_spawn_plan {
     const void *elf_blob;
     unsigned long elf_len;
@@ -1514,6 +1530,73 @@ static int tm_loader_map_dynamic(tm_loader_map_plan_t *map_plan,
     }
 
     map_plan->status = TM_LOADER_MAP_READY;
+    return 0;
+}
+
+
+static int tm_loader_auxv_init_static(tm_loader_auxv_plan_t *auxv_plan)
+{
+    if (!auxv_plan)
+        return -EINVAL;
+
+    qmemset(auxv_plan, 0, sizeof *auxv_plan);
+    auxv_plan->status = TM_LOADER_AUXV_STATIC;
+    return 0;
+}
+
+static int tm_loader_auxv_add(tm_loader_auxv_plan_t *auxv_plan,
+                              unsigned long type,
+                              unsigned long value)
+{
+    if (!auxv_plan)
+        return -EINVAL;
+    if (auxv_plan->auxc >= TM_SPAWN_ARGPACK_MAX_AUXV) {
+        auxv_plan->status = TM_LOADER_AUXV_TOO_MANY;
+        return -E2BIG;
+    }
+
+    auxv_plan->auxv[auxv_plan->auxc++] = (struct aux_pair){ type, value };
+    return 0;
+}
+
+static int tm_loader_auxv_admit_dynamic(tm_loader_auxv_plan_t *auxv_plan,
+                                        const tm_loader_proto_t *proto,
+                                        const tm_loader_map_plan_t *map_plan,
+                                        const struct elf64_hdr *eh)
+{
+    if (!auxv_plan || !proto || !map_plan || !eh)
+        return -EINVAL;
+
+    int rc = tm_loader_auxv_init_static(auxv_plan);
+    if (rc != 0)
+        return rc;
+    auxv_plan->status = TM_LOADER_AUXV_EMPTY;
+
+    if (!proto->dyn_link) {
+        auxv_plan->status = TM_LOADER_AUXV_BAD_PROTO;
+        return -EINVAL;
+    }
+    if (map_plan->status != TM_LOADER_MAP_READY) {
+        auxv_plan->status = TM_LOADER_AUXV_BAD_MAP;
+        return -EINVAL;
+    }
+
+    rc = tm_loader_auxv_add(auxv_plan, AT_PHDR_, proto->main_phdr_va);
+    if (rc != 0) return rc;
+    rc = tm_loader_auxv_add(auxv_plan, AT_PHENT_, sizeof(struct elf64_phdr));
+    if (rc != 0) return rc;
+    rc = tm_loader_auxv_add(auxv_plan, AT_PHNUM_, eh->e_phnum);
+    if (rc != 0) return rc;
+    rc = tm_loader_auxv_add(auxv_plan, AT_BASE_, proto->rtld_load_base);
+    if (rc != 0) return rc;
+    rc = tm_loader_auxv_add(auxv_plan, AT_ENTRY_, proto->entry_pc);
+    if (rc != 0) return rc;
+    rc = tm_loader_auxv_add(auxv_plan, AT_PAGESZ_, 0x1000);
+    if (rc != 0) return rc;
+    rc = tm_loader_auxv_add(auxv_plan, AT_KPRELOAD_, map_plan->libc_load_base);
+    if (rc != 0) return rc;
+
+    auxv_plan->status = TM_LOADER_AUXV_READY;
     return 0;
 }
 
@@ -1662,6 +1745,10 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     const struct elf64_phdr *ph = plan.ph;
     const struct elf64_phdr *interp_ph = plan.interp_ph;
     tm_loader_proto_t loader_proto = plan.loader_proto;
+    tm_loader_auxv_plan_t loader_auxv;
+    int auxv_init_rc = tm_loader_auxv_init_static(&loader_auxv);
+    if (auxv_init_rc != 0)
+        return auxv_init_rc;
 
     /* BUILD phase: allocate child objects, map image/address-space state,
      * and prepare the initial user stack without publishing process state. */
@@ -1843,6 +1930,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                                      loader_map.rtld_load_base);
         if (proto_rc != 0)
             return proto_rc;
+        int auxv_rc = tm_loader_auxv_admit_dynamic(&loader_auxv,
+                                                   &loader_proto,
+                                                   &loader_map,
+                                                   eh);
+        if (auxv_rc != 0)
+            return auxv_rc;
         const struct elf64_hdr *rtld_eh = loader_admit.rtld_blob;
         /* NQ pattern: skip rtld and jump straight to the user image's
          * entry.  Taskman's pre-reloc pass already resolved every
@@ -1954,26 +2047,15 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
     }
     /* Build the SysV initial-stack image in the top stack page
-     * BEFORE mapping it into the child.  For dynamically-linked
-     * programs hand rtld the auxv entries it asserts on: AT_PHDR /
-     * AT_PHENT / AT_PHNUM / AT_BASE / AT_ENTRY / AT_PAGESZ plus
-     * AT_KPRELOAD = DL_LIBC_LOAD_VA so load_kpreload() picks up
-     * libc.so under its DT_SONAME = "libc.so" alias. */
-    struct aux_pair auxv[TM_SPAWN_ARGPACK_MAX_AUXV];
-    int auxc = 0;
+     * BEFORE mapping it into the child.  The loader auxv plan owns any
+     * dynamic-linker auxv entries handed to rtld: AT_PHDR / AT_PHENT /
+     * AT_PHNUM / AT_BASE / AT_ENTRY / AT_PAGESZ plus AT_KPRELOAD from
+     * the admitted loader map.  Static spawns keep an empty auxv plan. */
     tm_spawn_argpack_t argpack;
-    if (loader_proto.dyn_link) {
-        auxv[auxc++] = (struct aux_pair){ AT_PHDR_,     loader_proto.main_phdr_va };
-        auxv[auxc++] = (struct aux_pair){ AT_PHENT_,    sizeof(struct elf64_phdr) };
-        auxv[auxc++] = (struct aux_pair){ AT_PHNUM_,    eh->e_phnum };
-        auxv[auxc++] = (struct aux_pair){ AT_BASE_,     loader_proto.rtld_load_base };
-        auxv[auxc++] = (struct aux_pair){ AT_ENTRY_,    loader_proto.entry_pc };
-        auxv[auxc++] = (struct aux_pair){ AT_PAGESZ_,   0x1000 };
-        auxv[auxc++] = (struct aux_pair){ AT_KPRELOAD_, DL_LIBC_LOAD_VA };
-    }
 
     int argpack_rc = tm_spawn_argpack_prepare(&argpack, argc, argv, envc, envp,
-                                              auxv, auxc);
+                                              loader_auxv.auxv,
+                                              loader_auxv.auxc);
     if (argpack_rc != 0) {
         tm_err("spawn: tm_spawn_argpack_prepare failed rc=%d", argpack_rc);
         return argpack_rc;
