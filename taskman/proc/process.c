@@ -946,7 +946,7 @@ typedef struct tm_teardown_plan {
 
 static void tm_teardown_plan_reset(tm_teardown_plan_t *plan)
 {
-    qmemset(plan, 0, sizeof *plan);
+    plan->op_count = 0;
 }
 
 static int tm_teardown_plan_add(tm_teardown_plan_t *plan,
