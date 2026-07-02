@@ -1483,6 +1483,26 @@ typedef struct tm_spawn_publication_plan {
     int primary_idx;
 } tm_spawn_publication_plan_t;
 
+typedef enum tm_spawn_objcnode_status {
+    TM_SPAWN_OBJCNODE_EMPTY,
+    TM_SPAWN_OBJCNODE_READY,
+    TM_SPAWN_OBJCNODE_BOUND,
+    TM_SPAWN_OBJCNODE_BAD_PROCESS,
+    TM_SPAWN_OBJCNODE_BAD_OBJECT,
+} tm_spawn_objcnode_status_t;
+
+typedef struct tm_spawn_objcnode_plan {
+    tm_spawn_objcnode_status_t status;
+    pid_t pid;
+    tm_process_t *proc;
+    seL4_CPtr sc;
+    seL4_CPtr objcnode;
+    int frame_count;
+    int pt_count;
+    int relro_count;
+    int max_mprot;
+} tm_spawn_objcnode_plan_t;
+
 
 
 
@@ -1850,6 +1870,53 @@ static int tm_spawn_publication_mark_resume_ready(tm_spawn_publication_plan_t *p
         return -EINVAL;
 
     publication->status = TM_SPAWN_PUBLICATION_RESUME_READY;
+    return 0;
+}
+
+static int tm_spawn_objcnode_prepare(tm_spawn_objcnode_plan_t *objc_plan,
+                                     pid_t pid,
+                                     tm_process_t *proc,
+                                     seL4_CPtr sc,
+                                     int frame_count,
+                                     int pt_count,
+                                     int relro_count)
+{
+    if (!objc_plan)
+        return -EINVAL;
+
+    qmemset(objc_plan, 0, sizeof *objc_plan);
+    objc_plan->status = TM_SPAWN_OBJCNODE_EMPTY;
+
+    if (!pid || !proc || !sc) {
+        objc_plan->status = TM_SPAWN_OBJCNODE_BAD_PROCESS;
+        return -EINVAL;
+    }
+
+    objc_plan->pid = pid;
+    objc_plan->proc = proc;
+    objc_plan->sc = sc;
+    objc_plan->frame_count = frame_count;
+    objc_plan->pt_count = pt_count;
+    objc_plan->relro_count = relro_count;
+    objc_plan->max_mprot = TM_MAX_MPROT;
+    objc_plan->status = TM_SPAWN_OBJCNODE_READY;
+    return 0;
+}
+
+static int tm_spawn_objcnode_bind(tm_spawn_objcnode_plan_t *objc_plan,
+                                  seL4_CPtr objcnode)
+{
+    if (!objc_plan)
+        return -EINVAL;
+    if (objc_plan->status != TM_SPAWN_OBJCNODE_READY)
+        return -EINVAL;
+    if (!objcnode) {
+        objc_plan->status = TM_SPAWN_OBJCNODE_BAD_OBJECT;
+        return -EINVAL;
+    }
+
+    objc_plan->objcnode = objcnode;
+    objc_plan->status = TM_SPAWN_OBJCNODE_BOUND;
     return 0;
 }
 
@@ -2557,18 +2624,33 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     {
         tm_process_t *op = tm_process_lookup(publication.pid);
         if (op) {
-            op->sc = publication.sc;   /* main-thread SC slot, freed in teardown */
+            tm_spawn_objcnode_plan_t objc_plan;
+            int objc_rc = tm_spawn_objcnode_prepare(&objc_plan,
+                                                    publication.pid,
+                                                    op,
+                                                    publication.sc,
+                                                    s_frame_count,
+                                                    s_pt_count,
+                                                    s_relro_count);
+            if (objc_rc != 0)
+                return objc_rc;
+
+            op->sc = objc_plan.sc;   /* main-thread SC slot, freed in teardown */
             seL4_CPtr objc = alloc_object(seL4_CapTableObject, TM_OBJCNODE_RADIX);
             if (!objc) { tm_err("spawn: objcnode alloc failed"); return -ENOMEM; }
-            op->objcnode      = objc;
+            objc_rc = tm_spawn_objcnode_bind(&objc_plan, objc);
+            if (objc_rc != 0)
+                return objc_rc;
+
+            op->objcnode      = objc_plan.objcnode;
             op->objcnode_next = 0;
-            for (int i = 0; i < s_frame_count; ++i) {
+            for (int i = 0; i < objc_plan.frame_count; ++i) {
                 seL4_CPtr src  = s_frames[i].frame;
                 /* RELRO pages keep their cap INVOKEABLE (left in the root
                  * slot, recorded in op->mprot[]) so TM_REQ_MPROTECT can
                  * re-map them; everything else moves to the objcnode. */
                 if (va_in_relro(s_frames[i].va_page)) {
-                    if (op->mprot_count >= TM_MAX_MPROT) {
+                    if (op->mprot_count >= objc_plan.max_mprot) {
                         tm_err("spawn: pid %ld RELRO tracker full (cap=%d)",
                                (long)pid, TM_MAX_MPROT);
                         return -ENOMEM;
@@ -2595,7 +2677,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             /* Same for the per-spawn page-table caps: relocate into the
              * objcnode (the mapping lives in the parent PT, not the cap,
              * so the move is transparent) and reclaim their root slots. */
-            for (int i = 0; i < s_pt_count; ++i) {
+            for (int i = 0; i < objc_plan.pt_count; ++i) {
                 seL4_CPtr src  = s_pt_slots[i];
                 seL4_Word merr = qsoe_cnode_move(objc,
                                                  (seL4_Word)op->objcnode_next,
