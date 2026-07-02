@@ -1370,6 +1370,25 @@ typedef struct tm_loader_admit {
     unsigned long libc_size;
 } tm_loader_admit_t;
 
+typedef enum tm_loader_map_status {
+    TM_LOADER_MAP_EMPTY,
+    TM_LOADER_MAP_READY,
+    TM_LOADER_MAP_LIBC_LOAD_FAILED,
+    TM_LOADER_MAP_RTLD_LOAD_FAILED,
+    TM_LOADER_MAP_LIBC_PARSE_FAILED,
+    TM_LOADER_MAP_RTLD_PARSE_FAILED,
+    TM_LOADER_MAP_MAIN_PARSE_FAILED,
+} tm_loader_map_status_t;
+
+typedef struct tm_loader_map_plan {
+    tm_loader_map_status_t status;
+    unsigned long libc_load_base;
+    unsigned long rtld_load_base;
+    tm_elf_view_t libc_view;
+    tm_elf_view_t rtld_view;
+    tm_elf_view_t main_view;
+} tm_loader_map_plan_t;
+
 typedef struct tm_spawn_plan {
     const void *elf_blob;
     unsigned long elf_len;
@@ -1441,6 +1460,60 @@ static int tm_loader_admit_dynamic(tm_loader_admit_t *admit,
     }
 
     admit->status = TM_LOADER_ADMIT_READY;
+    return 0;
+}
+
+static int tm_loader_map_dynamic(tm_loader_map_plan_t *map_plan,
+                                 seL4_CPtr vspace,
+                                 const tm_loader_admit_t *admit,
+                                 const void *main_blob,
+                                 unsigned long main_len)
+{
+    if (!map_plan || !vspace || !admit || !main_blob)
+        return -EINVAL;
+    if (admit->status != TM_LOADER_ADMIT_READY)
+        return -EINVAL;
+
+    qmemset(map_plan, 0, sizeof *map_plan);
+    map_plan->status = TM_LOADER_MAP_EMPTY;
+    map_plan->libc_load_base = DL_LIBC_LOAD_VA;
+    map_plan->rtld_load_base = DL_RTLD_LOAD_VA;
+
+    int load_rc = load_elf_segments(vspace, admit->libc_blob,
+                                    map_plan->libc_load_base);
+    if (load_rc != 0) {
+        map_plan->status = TM_LOADER_MAP_LIBC_LOAD_FAILED;
+        tm_err("spawn: libc.so load failed");
+        return load_rc;
+    }
+
+    load_rc = load_elf_segments(vspace, admit->rtld_blob,
+                                map_plan->rtld_load_base);
+    if (load_rc != 0) {
+        map_plan->status = TM_LOADER_MAP_RTLD_LOAD_FAILED;
+        tm_err("spawn: rtld load failed");
+        return load_rc;
+    }
+
+    if (tm_elf_parse(admit->libc_blob, admit->libc_size,
+                     &map_plan->libc_view) != 0) {
+        map_plan->status = TM_LOADER_MAP_LIBC_PARSE_FAILED;
+        tm_err("spawn: libc.so re-parse failed");
+        return -ENOEXEC;
+    }
+    if (tm_elf_parse(admit->rtld_blob, admit->rtld_size,
+                     &map_plan->rtld_view) != 0) {
+        map_plan->status = TM_LOADER_MAP_RTLD_PARSE_FAILED;
+        tm_err("spawn: rtld re-parse failed");
+        return -ENOEXEC;
+    }
+    if (tm_elf_parse(main_blob, main_len, &map_plan->main_view) != 0) {
+        map_plan->status = TM_LOADER_MAP_MAIN_PARSE_FAILED;
+        tm_err("spawn: main image re-parse failed");
+        return -ENOEXEC;
+    }
+
+    map_plan->status = TM_LOADER_MAP_READY;
     return 0;
 }
 
@@ -1696,14 +1769,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         if (err) return err;
         workers_l1_cap = dl_l1;
 
-        /* PT_LOAD-walk libc.so at the fixed VA, then rtld at its base. */
-        load_rc = load_elf_segments(vspace, loader_admit.libc_blob,
-                                    DL_LIBC_LOAD_VA);
-        if (load_rc != 0) { tm_err("spawn: libc.so load failed"); return load_rc; }
-
-        load_rc = load_elf_segments(vspace, loader_admit.rtld_blob,
-                                    DL_RTLD_LOAD_VA);
-        if (load_rc != 0) { tm_err("spawn: rtld load failed"); return load_rc; }
+        /* PT_LOAD-walk libc.so at the fixed VA, then rtld at its base.
+         * Parse all three ELF views for the relocation pass. */
+        tm_loader_map_plan_t loader_map;
+        int map_rc = tm_loader_map_dynamic(&loader_map, vspace,
+                                           &loader_admit, elf_blob, elf_len);
+        if (map_rc != 0)
+            return map_rc;
 
         /* 3c. Pre-apply relocations in taskman (mirrors NQ's loader.c
          * approach) so the user-mode rtld walks a pre-relocated world.
@@ -1723,22 +1795,6 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * Each pass: parse the file blob into a tm_elf_view_t, then
          * call tm_reloc_apply with reloc_write_cb scratch-mapping
          * frames in the child VSpace. */
-        tm_elf_view_t libc_view, rtld_view, main_view;
-        if (tm_elf_parse(loader_admit.libc_blob, loader_admit.libc_size,
-                         &libc_view) != 0) {
-            tm_err("spawn: libc.so re-parse failed");
-            return -ENOEXEC;
-        }
-        if (tm_elf_parse(loader_admit.rtld_blob, loader_admit.rtld_size,
-                         &rtld_view) != 0) {
-            tm_err("spawn: rtld re-parse failed");
-            return -ENOEXEC;
-        }
-        if (tm_elf_parse(elf_blob, elf_len, &main_view) != 0) {
-            tm_err("spawn: main image re-parse failed");
-            return -ENOEXEC;
-        }
-
         /* Per-skip logger per feedback_stubs_announce: silent NULL
          * slots crash hours later with no context.  Surface every
          * unresolved external at load time -- the boot trace then
@@ -1746,7 +1802,8 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         extern void tm_reloc_skip_warn(void *user, const char *name);
 
         unsigned long ap = 0, tot = 0, sk = 0;
-        if (tm_reloc_apply(&libc_view, DL_LIBC_LOAD_VA, /*ext=*/0,
+        if (tm_reloc_apply(&loader_map.libc_view,
+                            loader_map.libc_load_base, /*ext=*/0,
                             reloc_write_cb, tm_reloc_skip_warn,
                             (void *)"libc.so",
                             &ap, &tot, &sk) != 0) {
@@ -1756,13 +1813,15 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         tm_dbg("spawn: libc.so relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
         tm_reloc_resolver_t libc_resolver;
-        if (tm_reloc_init_resolver(&libc_view, DL_LIBC_LOAD_VA,
+        if (tm_reloc_init_resolver(&loader_map.libc_view,
+                                    loader_map.libc_load_base,
                                     &libc_resolver) != 0) {
             tm_err("spawn: libc.so resolver init failed");
             return -ENOEXEC;
         }
 
-        if (tm_reloc_apply(&rtld_view, DL_RTLD_LOAD_VA, &libc_resolver,
+        if (tm_reloc_apply(&loader_map.rtld_view,
+                            loader_map.rtld_load_base, &libc_resolver,
                             reloc_write_cb, tm_reloc_skip_warn,
                             (void *)"rtld",
                             &ap, &tot, &sk) != 0) {
@@ -1771,7 +1830,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
         tm_dbg("spawn: rtld relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
-        if (tm_reloc_apply(&main_view, /*bias=*/0, &libc_resolver,
+        if (tm_reloc_apply(&loader_map.main_view, /*bias=*/0, &libc_resolver,
                             reloc_write_cb, tm_reloc_skip_warn,
                             (void *)"main",
                             &ap, &tot, &sk) != 0) {
@@ -1781,7 +1840,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         tm_dbg("spawn: main relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
         int proto_rc = tm_loader_proto_admit_dynamic(&loader_proto, eh, ph,
-                                                     DL_RTLD_LOAD_VA);
+                                                     loader_map.rtld_load_base);
         if (proto_rc != 0)
             return proto_rc;
         const struct elf64_hdr *rtld_eh = loader_admit.rtld_blob;
