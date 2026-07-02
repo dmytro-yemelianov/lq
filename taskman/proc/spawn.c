@@ -1404,6 +1404,23 @@ typedef struct tm_loader_auxv_plan {
     int auxc;
 } tm_loader_auxv_plan_t;
 
+typedef enum tm_loader_entry_status {
+    TM_LOADER_ENTRY_EMPTY,
+    TM_LOADER_ENTRY_READY,
+    TM_LOADER_ENTRY_BAD_PROTO,
+    TM_LOADER_ENTRY_BAD_STACK,
+} tm_loader_entry_status_t;
+
+typedef struct tm_loader_entry_plan {
+    tm_loader_entry_status_t status;
+    unsigned long pc;
+    unsigned long sp;
+    unsigned long gp;
+    unsigned long tp;
+    seL4_Word a0;
+} tm_loader_entry_plan_t;
+
+
 
 typedef struct tm_spawn_plan {
     const void *elf_blob;
@@ -1597,6 +1614,36 @@ static int tm_loader_auxv_admit_dynamic(tm_loader_auxv_plan_t *auxv_plan,
     if (rc != 0) return rc;
 
     auxv_plan->status = TM_LOADER_AUXV_READY;
+    return 0;
+}
+
+
+static int tm_loader_entry_prepare(tm_loader_entry_plan_t *entry_plan,
+                                   const tm_loader_proto_t *proto,
+                                   unsigned long initial_sp,
+                                   pid_t pid)
+{
+    if (!entry_plan || !proto)
+        return -EINVAL;
+
+    qmemset(entry_plan, 0, sizeof *entry_plan);
+    entry_plan->status = TM_LOADER_ENTRY_EMPTY;
+
+    if (!proto->entry_pc) {
+        entry_plan->status = TM_LOADER_ENTRY_BAD_PROTO;
+        return -EINVAL;
+    }
+    if (!initial_sp) {
+        entry_plan->status = TM_LOADER_ENTRY_BAD_STACK;
+        return -EINVAL;
+    }
+
+    entry_plan->pc = proto->entry_pc;
+    entry_plan->sp = initial_sp;
+    entry_plan->gp = 0;
+    entry_plan->tp = CHILD_TCB_BASE;
+    entry_plan->a0 = (seL4_Word)pid;
+    entry_plan->status = TM_LOADER_ENTRY_READY;
     return 0;
 }
 
@@ -2193,13 +2240,19 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    For static binaries loader_proto.entry_pc == eh->e_entry.  For dynamic
      *    binaries it's rtld's .rtld_start; rtld parses the auxv,
      *    relocates qsh + libc.so, then jumps to qsh.e_entry. */
+    tm_loader_entry_plan_t entry_plan;
+    int entry_rc = tm_loader_entry_prepare(&entry_plan, &loader_proto,
+                                           initial_sp, pid);
+    if (entry_rc != 0)
+        return entry_rc;
+
     qsoe_user_ctx_t ctx;
     qmemset(&ctx, 0, sizeof ctx);
-    ctx.pc = loader_proto.entry_pc;
-    ctx.sp = initial_sp;
-    ctx.gp = 0;
-    ctx.tp = CHILD_TCB_BASE;     /* points at the zeroed TCB page above */
-    ctx.a0 = (seL4_Word)pid;
+    ctx.pc = entry_plan.pc;
+    ctx.sp = entry_plan.sp;
+    ctx.gp = entry_plan.gp;
+    ctx.tp = entry_plan.tp;     /* points at the zeroed TCB page above */
+    ctx.a0 = entry_plan.a0;
     err = qsoe_tcb_write_registers(tcb, 0, &ctx);
     if (err) { tm_err("spawn: TCB_WriteRegisters failed"); return -ENOMEM; }
 
