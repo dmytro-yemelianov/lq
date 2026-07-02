@@ -1420,6 +1420,40 @@ typedef struct tm_loader_entry_plan {
     seL4_Word a0;
 } tm_loader_entry_plan_t;
 
+typedef enum tm_tcb_handoff_status {
+    TM_TCB_HANDOFF_EMPTY,
+    TM_TCB_HANDOFF_CONFIG_READY,
+    TM_TCB_HANDOFF_READY,
+    TM_TCB_HANDOFF_BAD_OBJECTS,
+    TM_TCB_HANDOFF_BAD_FAULT,
+} tm_tcb_handoff_status_t;
+
+typedef struct tm_tcb_handoff_plan {
+    tm_tcb_handoff_status_t status;
+    seL4_CPtr tcb;
+    seL4_CPtr cnode;
+    seL4_CPtr vspace;
+    seL4_CPtr ipc_frame;
+    seL4_CPtr cspace_root;
+    seL4_CPtr primary_ep;
+    seL4_CPtr reply_untyped;
+    seL4_CPtr sc;
+    seL4_CPtr fault_ep;
+    seL4_Word cnode_data;
+    seL4_Word vspace_data;
+    unsigned long ipc_buffer;
+    int sched_core;
+    seL4_CPtr sched_authority;
+    seL4_Word sched_mcp;
+    seL4_Word sched_prio;
+    seL4_Uint8 cspace_depth;
+    seL4_Uint8 primary_ep_depth;
+    seL4_CapRights_t fault_rights;
+    seL4_Word fault_badge;
+    seL4_CPtr reply_slot;
+} tm_tcb_handoff_plan_t;
+
+
 
 
 typedef struct tm_spawn_plan {
@@ -1644,6 +1678,71 @@ static int tm_loader_entry_prepare(tm_loader_entry_plan_t *entry_plan,
     entry_plan->tp = CHILD_TCB_BASE;
     entry_plan->a0 = (seL4_Word)pid;
     entry_plan->status = TM_LOADER_ENTRY_READY;
+    return 0;
+}
+
+
+static int tm_tcb_handoff_prepare(tm_tcb_handoff_plan_t *handoff,
+                                  pid_t pid,
+                                  seL4_CPtr tcb,
+                                  seL4_CPtr cnode,
+                                  seL4_CPtr vspace,
+                                  seL4_CPtr ipc_frame,
+                                  seL4_CPtr cspace_root,
+                                  seL4_CPtr primary_ep,
+                                  seL4_CPtr reply_untyped)
+{
+    if (!handoff)
+        return -EINVAL;
+
+    qmemset(handoff, 0, sizeof *handoff);
+    handoff->status = TM_TCB_HANDOFF_EMPTY;
+
+    if (!tcb || !cnode || !vspace || !ipc_frame ||
+        !cspace_root || !primary_ep || !reply_untyped) {
+        handoff->status = TM_TCB_HANDOFF_BAD_OBJECTS;
+        return -EINVAL;
+    }
+
+    handoff->tcb = tcb;
+    handoff->cnode = cnode;
+    handoff->vspace = vspace;
+    handoff->ipc_frame = ipc_frame;
+    handoff->cspace_root = cspace_root;
+    handoff->primary_ep = primary_ep;
+    handoff->reply_untyped = reply_untyped;
+    handoff->cnode_data = 52UL;
+    handoff->vspace_data = 0;
+    handoff->ipc_buffer = CHILD_IPC_BUFFER;
+    handoff->sched_core = 0;
+    handoff->sched_authority = seL4_CapInitThreadTCB;
+    handoff->sched_mcp = TM_PRIO_USER_DEFAULT;
+    handoff->sched_prio = TM_PRIO_USER_DEFAULT;
+    handoff->cspace_depth = TM_DEPTH_TASKMAN;
+    handoff->primary_ep_depth = TM_DEPTH_TASKMAN;
+    handoff->fault_rights = QSOE_RIGHTS_SEND;
+    handoff->fault_badge = TM_FAULT_BADGE_FLAG | (seL4_Word)pid;
+    handoff->reply_slot = QSOE_CAP_REPLY;
+    handoff->status = TM_TCB_HANDOFF_CONFIG_READY;
+    return 0;
+}
+
+static int tm_tcb_handoff_bind_sched_fault(tm_tcb_handoff_plan_t *handoff,
+                                           seL4_CPtr sc,
+                                           seL4_CPtr fault_ep)
+{
+    if (!handoff)
+        return -EINVAL;
+    if (handoff->status != TM_TCB_HANDOFF_CONFIG_READY)
+        return -EINVAL;
+    if (!sc || !fault_ep) {
+        handoff->status = TM_TCB_HANDOFF_BAD_FAULT;
+        return -EINVAL;
+    }
+
+    handoff->sc = sc;
+    handoff->fault_ep = fault_ep;
+    handoff->status = TM_TCB_HANDOFF_READY;
     return 0;
 }
 
@@ -2185,52 +2284,60 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * UART (phys 0x10001000, the virtio window) -- the driver mapped the
      * wrong device and uart_tx spun forever on a bogus LSR. */
 
-    /* 6. Configure the TCB. cnode_data encodes guard size (52 = 64 −
-     *    12) and guard value 0; the CNode is 2^12 slots so addresses
-     *    fit in 12 bits. seL4_CNode_CapData layout: bits[0..5] =
-     *    guardSize, bits[6..63] = guard value. */
-    seL4_Word cnode_data = 52UL;  /* guardSize=52, guard=0 */
-    err = qsoe_tcb_configure(tcb,
-                              cnode, cnode_data,
-                              vspace, 0 /*vspace_data*/,
-                              CHILD_IPC_BUFFER, ipc_frame);
+    /* 6. Configure the TCB and bind scheduling/fault/reply handoff state
+     *    from a prepared C-owned plan.  The plan records the values, while
+     *    the seL4 authority calls remain here in C. */
+    tm_tcb_handoff_plan_t tcb_handoff;
+    int tcb_handoff_rc = tm_tcb_handoff_prepare(&tcb_handoff, pid,
+                                                tcb, cnode, vspace,
+                                                ipc_frame, s_cnode_root,
+                                                primary_ep, s_untyped);
+    if (tcb_handoff_rc != 0)
+        return tcb_handoff_rc;
+
+    err = qsoe_tcb_configure(tcb_handoff.tcb,
+                              tcb_handoff.cnode,
+                              tcb_handoff.cnode_data,
+                              tcb_handoff.vspace,
+                              tcb_handoff.vspace_data,
+                              tcb_handoff.ipc_buffer,
+                              tcb_handoff.ipc_frame);
     if (err) { tm_err("spawn: TCB_Configure failed"); return -ENOMEM; }
 
-    /* MCS: a TCB cannot run until a scheduling context is bound.  Give
-     * the main thread a round-robin SC on core 0 and bind it (along with
-     * priority) via SetSchedParams.  Spawned processes run in the QNX
-     * default user band (TM_PRIO_USER_DEFAULT), well below taskman; taskman
-     * blocks on Recv when idle, so user threads always get the CPU. */
-    seL4_CPtr sc = tm_sched_context_create(/*core=*/0);
+    seL4_CPtr sc = tm_sched_context_create(tcb_handoff.sched_core);
     if (!sc) { tm_err("spawn: sched-context create failed"); return -ENOMEM; }
-    /* Graceful crash: give the main thread a fault handler -- a badged
-     * Send+GrantReply cap to taskman's primary EP (QSOE_RIGHTS_SEND
-     * already grants reply).  On a fatal U-mode fault seL4 delivers a
-     * fault IPC here (badge = pid | TM_FAULT_BADGE_FLAG) instead of
-     * wedging the thread; the dispatcher then terminates the process.
-     * The TCB derives its own copy of the cap, so our temp slot is
-     * reclaimed right after. */
+
     seL4_CPtr fault_ep = taskman_alloc_empty_slot();
-    err = qsoe_cnode_mint(s_cnode_root, fault_ep, TM_DEPTH_TASKMAN,
-                          s_cnode_root, primary_ep, TM_DEPTH_TASKMAN,
-                          QSOE_RIGHTS_SEND,
-                          TM_FAULT_BADGE_FLAG | (seL4_Word)pid);
+    tcb_handoff_rc = tm_tcb_handoff_bind_sched_fault(&tcb_handoff, sc,
+                                                     fault_ep);
+    if (tcb_handoff_rc != 0)
+        return tcb_handoff_rc;
+
+    err = qsoe_cnode_mint(tcb_handoff.cspace_root,
+                          tcb_handoff.fault_ep,
+                          tcb_handoff.cspace_depth,
+                          tcb_handoff.cspace_root,
+                          tcb_handoff.primary_ep,
+                          tcb_handoff.primary_ep_depth,
+                          tcb_handoff.fault_rights,
+                          tcb_handoff.fault_badge);
     if (err) { tm_err("spawn: fault-ep mint failed"); return -ENOMEM; }
-    err = qsoe_tcb_set_sched_params(tcb, seL4_CapInitThreadTCB,
-                                    /*mcp=*/TM_PRIO_USER_DEFAULT,
-                                    /*prio=*/TM_PRIO_USER_DEFAULT,
-                                    sc, fault_ep);
+
+    err = qsoe_tcb_set_sched_params(tcb_handoff.tcb,
+                                    tcb_handoff.sched_authority,
+                                    tcb_handoff.sched_mcp,
+                                    tcb_handoff.sched_prio,
+                                    tcb_handoff.sc,
+                                    tcb_handoff.fault_ep);
     if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return -ENOMEM; }
     /* The minted fault cap must stay in our CSpace -- the TCB references
      * it (deleting it strips the handler).  Stashed in the record below
      * and freed in teardown once the TCB is gone. */
 
-    /* MCS: provision the child's reply object at the well-known slot its
-     * libc MsgReceive/MsgReply ride (register a6 / Send target).  Retype
-     * straight into the child's CNode (node_depth 0 => cnode is the dest
-     * CNode itself), mirroring the IRQ-notification retype above. */
-    err = qsoe_untyped_retype(s_untyped, seL4_ReplyObject, 0,
-                              cnode, 0, 0, QSOE_CAP_REPLY, 1);
+    err = qsoe_untyped_retype(tcb_handoff.reply_untyped,
+                              seL4_ReplyObject, 0,
+                              tcb_handoff.cnode, 0, 0,
+                              tcb_handoff.reply_slot, 1);
     if (err) { tm_err("spawn: child reply object retype failed"); return -ENOMEM; }
 
     /* 7. WriteRegisters: pc=entry, a0=pid, sp=initial_sp (pointing
