@@ -1529,6 +1529,8 @@ typedef struct tm_spawn_unwind_plan {
     int relro_count;
     int stack_pages;
     int committed;
+    int failure_rc;
+    int cleanup_planned;
 } tm_spawn_unwind_plan_t;
 
 
@@ -2056,6 +2058,151 @@ static int tm_spawn_unwind_mark_committed(tm_spawn_unwind_plan_t *unwind)
     return 0;
 }
 
+typedef enum tm_spawn_cleanup_status {
+    TM_SPAWN_CLEANUP_EMPTY,
+    TM_SPAWN_CLEANUP_NOT_REQUIRED,
+    TM_SPAWN_CLEANUP_REQUIRED,
+    TM_SPAWN_CLEANUP_BAD_UNWIND,
+    TM_SPAWN_CLEANUP_TOO_MANY,
+} tm_spawn_cleanup_status_t;
+
+typedef enum tm_spawn_cleanup_op_kind {
+    TM_SPAWN_CLEANUP_OP_RECLAIM_RECORDED_FRAMES,
+    TM_SPAWN_CLEANUP_OP_RECLAIM_RECORDED_PTS,
+    TM_SPAWN_CLEANUP_OP_DELETE_FAULT_ENDPOINT,
+    TM_SPAWN_CLEANUP_OP_REVOKE_SCHED_CONTEXT,
+    TM_SPAWN_CLEANUP_OP_REVOKE_CHILD_UNTYPED,
+    TM_SPAWN_CLEANUP_OP_REVOKE_CHILD_CNODE,
+} tm_spawn_cleanup_op_kind_t;
+
+typedef struct tm_spawn_cleanup_op {
+    tm_spawn_cleanup_op_kind_t kind;
+    seL4_CPtr cap;
+    int count;
+    const char *label;
+} tm_spawn_cleanup_op_t;
+
+#define TM_SPAWN_CLEANUP_MAX_OPS 8
+
+typedef struct tm_spawn_unwind_cleanup_plan {
+    tm_spawn_cleanup_status_t status;
+    pid_t pid;
+    int failure_rc;
+    unsigned op_count;
+    tm_spawn_cleanup_op_t ops[TM_SPAWN_CLEANUP_MAX_OPS];
+} tm_spawn_unwind_cleanup_plan_t;
+
+static int tm_spawn_unwind_cleanup_add(tm_spawn_unwind_cleanup_plan_t *cleanup,
+                                       tm_spawn_cleanup_op_kind_t kind,
+                                       seL4_CPtr cap,
+                                       int count,
+                                       const char *label)
+{
+    if (!cleanup || cleanup->op_count >= TM_SPAWN_CLEANUP_MAX_OPS) {
+        if (cleanup)
+            cleanup->status = TM_SPAWN_CLEANUP_TOO_MANY;
+        return -E2BIG;
+    }
+
+    tm_spawn_cleanup_op_t *op = &cleanup->ops[cleanup->op_count++];
+    op->kind = kind;
+    op->cap = cap;
+    op->count = count;
+    op->label = label;
+    return 0;
+}
+
+static int tm_spawn_unwind_cleanup_prepare(tm_spawn_unwind_plan_t *unwind,
+                                           tm_spawn_unwind_cleanup_plan_t *cleanup,
+                                           int failure_rc)
+{
+    if (!unwind || !cleanup)
+        return -EINVAL;
+
+    qmemset(cleanup, 0, sizeof *cleanup);
+    cleanup->status = TM_SPAWN_CLEANUP_EMPTY;
+    cleanup->pid = unwind->pid;
+    cleanup->failure_rc = failure_rc;
+
+    if (unwind->status == TM_SPAWN_UNWIND_COMMITTED || unwind->committed) {
+        cleanup->status = TM_SPAWN_CLEANUP_NOT_REQUIRED;
+        return 0;
+    }
+    if (unwind->status != TM_SPAWN_UNWIND_READY || !unwind->pid) {
+        cleanup->status = TM_SPAWN_CLEANUP_BAD_UNWIND;
+        return -EINVAL;
+    }
+
+    if (unwind->frame_count > 0 &&
+        tm_spawn_unwind_cleanup_add(cleanup,
+                                    TM_SPAWN_CLEANUP_OP_RECLAIM_RECORDED_FRAMES,
+                                    0, unwind->frame_count,
+                                    "recorded frame slots") != 0)
+        return -E2BIG;
+    if (unwind->pt_count > 0 &&
+        tm_spawn_unwind_cleanup_add(cleanup,
+                                    TM_SPAWN_CLEANUP_OP_RECLAIM_RECORDED_PTS,
+                                    0, unwind->pt_count,
+                                    "recorded page-table slots") != 0)
+        return -E2BIG;
+    if (unwind->fault_ep &&
+        tm_spawn_unwind_cleanup_add(cleanup,
+                                    TM_SPAWN_CLEANUP_OP_DELETE_FAULT_ENDPOINT,
+                                    unwind->fault_ep, 1,
+                                    "fault endpoint slot") != 0)
+        return -E2BIG;
+    if (unwind->sc &&
+        tm_spawn_unwind_cleanup_add(cleanup,
+                                    TM_SPAWN_CLEANUP_OP_REVOKE_SCHED_CONTEXT,
+                                    unwind->sc, 1,
+                                    "scheduler context") != 0)
+        return -E2BIG;
+    if (unwind->child_untyped &&
+        tm_spawn_unwind_cleanup_add(cleanup,
+                                    TM_SPAWN_CLEANUP_OP_REVOKE_CHILD_UNTYPED,
+                                    unwind->child_untyped, 1,
+                                    "child untyped") != 0)
+        return -E2BIG;
+    if (unwind->cnode &&
+        tm_spawn_unwind_cleanup_add(cleanup,
+                                    TM_SPAWN_CLEANUP_OP_REVOKE_CHILD_CNODE,
+                                    unwind->cnode, 1,
+                                    "child cnode") != 0)
+        return -E2BIG;
+
+    cleanup->status = cleanup->op_count ? TM_SPAWN_CLEANUP_REQUIRED
+                                        : TM_SPAWN_CLEANUP_NOT_REQUIRED;
+    unwind->failure_rc = failure_rc;
+    unwind->cleanup_planned = (cleanup->status == TM_SPAWN_CLEANUP_REQUIRED);
+    return 0;
+}
+
+static int tm_spawn_unwind_cleanup_commit(const tm_spawn_unwind_cleanup_plan_t *cleanup)
+{
+    if (!cleanup)
+        return -EINVAL;
+    if (cleanup->status == TM_SPAWN_CLEANUP_NOT_REQUIRED)
+        return 0;
+    if (cleanup->status != TM_SPAWN_CLEANUP_REQUIRED)
+        return -EINVAL;
+
+    /* Authority remains C-owned and deferred to the follow-up implementation:
+     * this seam commits the bounded cleanup action ordering, not the seL4
+     * revoke/delete/free calls themselves. */
+    return 0;
+}
+
+static int tm_spawn_unwind_return(tm_spawn_unwind_plan_t *unwind,
+                                  int failure_rc)
+{
+    tm_spawn_unwind_cleanup_plan_t cleanup;
+    int cleanup_rc = tm_spawn_unwind_cleanup_prepare(unwind, &cleanup,
+                                                     failure_rc);
+    if (cleanup_rc == 0)
+        (void)tm_spawn_unwind_cleanup_commit(&cleanup);
+    return failure_rc;
+}
+
 static void tm_spawn_state_reset(void)
 {
     /* Reset per-spawn state.  Frame table is rebuilt as PT_LOAD pages
@@ -2146,7 +2293,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                     opt_arg, sizeof opt_arg) == 0) {
             if (interp_path[0] != '/') {
                 tm_err("spawn: shebang interp must be absolute");
-                return -ENOEXEC;
+                return tm_spawn_unwind_return(&unwind_plan, -ENOEXEC);
             }
             const char *interp_cpio = interp_path + 1;   /* skip leading '/' */
             int has_arg = (opt_arg[0] != 0);
@@ -2155,7 +2302,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             const void *interp_blob = tm_cpio_lookup(interp_cpio, &interp_size);
             if (!interp_blob) {
                 tm_err("spawn: shebang interpreter not found: %s", interp_cpio);
-                return -ENOENT;
+                return tm_spawn_unwind_return(&unwind_plan, -ENOENT);
             }
             /* Recursion limit: interpreter must itself be ELF. */
             const unsigned char *ib = (const unsigned char *) interp_blob;
@@ -2163,7 +2310,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                 ib[0] != 0x7f || ib[1] != 'E' ||
                 ib[2] != 'L'  || ib[3] != 'F') {
                 tm_err("spawn: nested shebang not supported");
-                return -ENOEXEC;
+                return tm_spawn_unwind_return(&unwind_plan, -ENOEXEC);
             }
 
             /* Build new argv: [interp, opt_arg?, script_path, argv[1..]].
@@ -2175,7 +2322,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             static char script_path[80];
             unsigned long nlen = 0;
             while (elf_name && elf_name[nlen]) ++nlen;
-            if (nlen + 2 > sizeof script_path) return -ENOEXEC;
+            if (nlen + 2 > sizeof script_path) return tm_spawn_unwind_return(&unwind_plan, -ENOEXEC);
             script_path[0] = '/';
             for (unsigned long i = 0; i < nlen; ++i) {
                 script_path[1 + i] = elf_name[i];
@@ -2220,11 +2367,11 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    tm_spawn_unwind_plan records the resource inventory for the
      *    follow-up cleanup commit seam. */
     seL4_CPtr cnode = alloc_object(seL4_CapTableObject, 12);
-    if (!cnode) return -ENOMEM;
+    if (!cnode) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     seL4_CPtr vspace = alloc_object(seL4_RISCV_PageTableObject, 0);
-    if (!vspace) return -ENOMEM;
+    if (!vspace) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     seL4_CPtr tcb    = alloc_object(seL4_TCBObject, 0);
-    if (!tcb) return -ENOMEM;
+    if (!tcb) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     unwind_rc = tm_spawn_unwind_track_core(&unwind_plan, cnode, vspace, tcb);
     if (unwind_rc != 0)
         return unwind_rc;
@@ -2234,7 +2381,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     seL4_Word err = qsoe_riscv_asidpool_assign(seL4_CapInitThreadASIDPool, vspace);
     if (err) {
         tm_err("spawn: ASIDPool_Assign failed");
-        return -ENOMEM;
+        return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     }
 
     /* 2. Build the child's page-table tree. We need an L1 PT
@@ -2242,9 +2389,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    Sv39 with 4 KiB pages → call PageTable_Map at each
      *    intermediate level. The kernel decides the level from vaddr. */
     seL4_CPtr l1_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
-    if (!l1_pt) return -ENOMEM;
+    if (!l1_pt) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     seL4_CPtr l0_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
-    if (!l0_pt) return -ENOMEM;
+    if (!l0_pt) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     unwind_rc = tm_spawn_unwind_track_vspace(&unwind_plan, l1_pt, l0_pt,
                                              workers_l1_cap);
     if (unwind_rc != 0)
@@ -2255,7 +2402,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                               1, "L1 PageTable_Map") != 0 ||
         tm_vspace_plan_add_pt(&vspace_plan, l0_pt, 0,
                               1, "L0 PageTable_Map") != 0)
-        return -ENOMEM;
+        return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     err = tm_vspace_plan_commit(&vspace_plan);
     if (err) return err;
 
@@ -2298,7 +2445,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * 2 MiB regions holding libc.so and rtld.  seL4 picks the
          * level from vaddr + what's already installed. */
         seL4_CPtr dl_l1 = alloc_object(seL4_RISCV_PageTableObject, 0);
-        if (!dl_l1) return -ENOMEM;
+        if (!dl_l1) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
         /* Same PT object also covers the worker region at 0x40000000 —
          * record it so ensure_workers_pts() doesn't try to install a
          * second L1 PT into the same already-populated L2[1] slot. */
@@ -2308,10 +2455,10 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * already frees.  The two L0s below have no such alias, so their
          * slots must be reclaimed here. */
         seL4_CPtr libc_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
-        if (!libc_l0) return -ENOMEM;
+        if (!libc_l0) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
 
         seL4_CPtr rtld_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
-        if (!rtld_l0) return -ENOMEM;
+        if (!rtld_l0) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
         tm_vspace_plan_reset(&vspace_plan, vspace);
         if (tm_vspace_plan_add_pt(&vspace_plan, dl_l1, DL_LIBC_LOAD_VA,
                                   0, "DL L1 PT map") != 0 ||
@@ -2319,7 +2466,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                   1, "libc L0 PT map") != 0 ||
             tm_vspace_plan_add_pt(&vspace_plan, rtld_l0, DL_RTLD_LOAD_VA,
                                   1, "rtld L0 PT map") != 0)
-            return -ENOMEM;
+            return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
         err = tm_vspace_plan_commit(&vspace_plan);
         if (err) return err;
         workers_l1_cap = dl_l1;
@@ -2363,7 +2510,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                             (void *)"libc.so",
                             &ap, &tot, &sk) != 0) {
             tm_err("spawn: libc.so reloc failed");
-            return -ENOEXEC;
+            return tm_spawn_unwind_return(&unwind_plan, -ENOEXEC);
         }
         tm_dbg("spawn: libc.so relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
@@ -2372,7 +2519,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                     loader_map.libc_load_base,
                                     &libc_resolver) != 0) {
             tm_err("spawn: libc.so resolver init failed");
-            return -ENOEXEC;
+            return tm_spawn_unwind_return(&unwind_plan, -ENOEXEC);
         }
 
         if (tm_reloc_apply(&loader_map.rtld_view,
@@ -2381,7 +2528,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                             (void *)"rtld",
                             &ap, &tot, &sk) != 0) {
             tm_err("spawn: rtld reloc failed");
-            return -ENOEXEC;
+            return tm_spawn_unwind_return(&unwind_plan, -ENOEXEC);
         }
         tm_dbg("spawn: rtld relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
@@ -2390,7 +2537,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                             (void *)"main",
                             &ap, &tot, &sk) != 0) {
             tm_err("spawn: main reloc failed");
-            return -ENOEXEC;
+            return tm_spawn_unwind_return(&unwind_plan, -ENOEXEC);
         }
         tm_dbg("spawn: main relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
@@ -2433,17 +2580,17 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
 
     /* 4. IPC buffer page — allocate, zero, map into child. */
     seL4_CPtr ipc_frame = alloc_object(seL4_RISCV_4K_Page, 0);
-    if (!ipc_frame) return -ENOMEM;
+    if (!ipc_frame) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     err = scratch_map(ipc_frame);
-    if (err) return -ENOMEM;
+    if (err) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
     err = scratch_unmap(ipc_frame);
-    if (err) return -ENOMEM;
+    if (err) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     tm_vspace_plan_reset(&vspace_plan, vspace);
     if (tm_vspace_plan_add_page(&vspace_plan, ipc_frame, CHILD_IPC_BUFFER,
                                 QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT,
                                 1, "ipc_frame Page_Map") != 0)
-        return -ENOMEM;
+        return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     err = tm_vspace_plan_commit(&vspace_plan);
     if (err) return err;
 
@@ -2459,17 +2606,17 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     and the rest defaulted; libc_init refines on first
      *     syscall. */
     seL4_CPtr tcb_frame = alloc_object(seL4_RISCV_4K_Page, 0);
-    if (!tcb_frame) return -ENOMEM;
+    if (!tcb_frame) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     err = scratch_map(tcb_frame);
-    if (err) return -ENOMEM;
+    if (err) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
     err = scratch_unmap(tcb_frame);
-    if (err) return -ENOMEM;
+    if (err) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     tm_vspace_plan_reset(&vspace_plan, vspace);
     if (tm_vspace_plan_add_page(&vspace_plan, tcb_frame, CHILD_TCB_BASE,
                                 QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT,
                                 1, "tcb_frame Page_Map") != 0)
-        return -ENOMEM;
+        return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     err = tm_vspace_plan_commit(&vspace_plan);
     if (err) return err;
 
@@ -2485,18 +2632,18 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         const void *smp = 0;
         if (tm_sysmap_get(&smp, 0) == 0 && smp) {
             seL4_CPtr smap_frame = alloc_object(seL4_RISCV_4K_Page, 0);
-            if (!smap_frame) return -ENOMEM;
+            if (!smap_frame) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
             err = scratch_map(smap_frame);
-            if (err) return -ENOMEM;
+            if (err) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
             qmemcpy((void *)TM_SCRATCH_VADDR, smp, 0x1000);
             err = scratch_unmap(smap_frame);
-            if (err) return -ENOMEM;
+            if (err) return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
             tm_vspace_plan_reset(&vspace_plan, vspace);
             if (tm_vspace_plan_add_page(&vspace_plan, smap_frame,
                                         CHILD_SYSMAP_BASE,
                                         QSOE_RIGHTS_RO, QSOE_VM_ATTR_DEFAULT,
                                         1, "sysmap Page_Map") != 0)
-                return -ENOMEM;
+                return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
             err = tm_vspace_plan_commit(&vspace_plan);
             if (err) return err;
         }
@@ -2515,7 +2662,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         stack_frames[i] = alloc_object(seL4_RISCV_4K_Page, 0);
         if (!stack_frames[i]) {
             tm_err("spawn: stack frame alloc failed");
-            return -ENOMEM;
+            return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
         }
     }
     unwind_rc = tm_spawn_unwind_track_runtime(&unwind_plan, ipc_frame,
@@ -2541,7 +2688,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         build_initial_stack(stack_frames[CHILD_STACK_PAGES - 1], &argpack);
     if (!initial_sp) {
         tm_err("spawn: build_initial_stack failed");
-        return -E2BIG;
+        return tm_spawn_unwind_return(&unwind_plan, -E2BIG);
     }
     /* Now map all stack pages into the child. */
     tm_vspace_plan_reset(&vspace_plan, vspace);
@@ -2550,7 +2697,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         if (tm_vspace_plan_add_page(&vspace_plan, stack_frames[i], va,
                                     QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT,
                                     1, "stack Page_Map") != 0)
-            return -ENOMEM;
+            return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     }
     err = tm_vspace_plan_commit(&vspace_plan);
     if (err) return err;
@@ -2574,7 +2721,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     seL4_CPtr child_untyped = alloc_object(seL4_UntypedObject, 18);
     if (!child_untyped) {
         tm_err("spawn: child untyped retype failed");
-        return -ENOMEM;
+        return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
     }
 
     /* 5b'. Copy the child's own CNode cap into its slot
@@ -2632,10 +2779,10 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                               tcb_handoff.vspace_data,
                               tcb_handoff.ipc_buffer,
                               tcb_handoff.ipc_frame);
-    if (err) { tm_err("spawn: TCB_Configure failed"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_Configure failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
 
     seL4_CPtr sc = tm_sched_context_create(tcb_handoff.sched_core);
-    if (!sc) { tm_err("spawn: sched-context create failed"); return -ENOMEM; }
+    if (!sc) { tm_err("spawn: sched-context create failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
 
     seL4_CPtr fault_ep = taskman_alloc_empty_slot();
     unwind_rc = tm_spawn_unwind_track_publication(&unwind_plan, child_untyped,
@@ -2655,7 +2802,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                           tcb_handoff.primary_ep_depth,
                           tcb_handoff.fault_rights,
                           tcb_handoff.fault_badge);
-    if (err) { tm_err("spawn: fault-ep mint failed"); return -ENOMEM; }
+    if (err) { tm_err("spawn: fault-ep mint failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
 
     err = qsoe_tcb_set_sched_params(tcb_handoff.tcb,
                                     tcb_handoff.sched_authority,
@@ -2663,7 +2810,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                     tcb_handoff.sched_prio,
                                     tcb_handoff.sc,
                                     tcb_handoff.fault_ep);
-    if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_SetSchedParams failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
     /* The minted fault cap must stay in our CSpace -- the TCB references
      * it (deleting it strips the handler).  Stashed in the record below
      * and freed in teardown once the TCB is gone. */
@@ -2672,7 +2819,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                               seL4_ReplyObject, 0,
                               tcb_handoff.cnode, 0, 0,
                               tcb_handoff.reply_slot, 1);
-    if (err) { tm_err("spawn: child reply object retype failed"); return -ENOMEM; }
+    if (err) { tm_err("spawn: child reply object retype failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
 
     /* 7. WriteRegisters: pc=entry, a0=pid, sp=initial_sp (pointing
      *    at argc in the SysV image we just wrote into the top stack
@@ -2695,7 +2842,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     ctx.tp = entry_plan.tp;     /* points at the zeroed TCB page above */
     ctx.a0 = entry_plan.a0;
     err = qsoe_tcb_write_registers(tcb, 0, &ctx);
-    if (err) { tm_err("spawn: TCB_WriteRegisters failed"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_WriteRegisters failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
 
     unwind_rc = tm_spawn_unwind_track_counts(&unwind_plan, s_frame_count,
                                              s_pt_count, s_relro_count);
@@ -2802,7 +2949,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
 
             op->sc = objc_plan.sc;   /* main-thread SC slot, freed in teardown */
             seL4_CPtr objc = alloc_object(seL4_CapTableObject, TM_OBJCNODE_RADIX);
-            if (!objc) { tm_err("spawn: objcnode alloc failed"); return -ENOMEM; }
+            if (!objc) { tm_err("spawn: objcnode alloc failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
             objc_rc = tm_spawn_objcnode_bind(&objc_plan, objc);
             if (objc_rc != 0)
                 return objc_rc;
@@ -2818,7 +2965,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                     if (op->mprot_count >= objc_plan.max_mprot) {
                         tm_err("spawn: pid %ld RELRO tracker full (cap=%d)",
                                (long)pid, TM_MAX_MPROT);
-                        return -ENOMEM;
+                        return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
                     }
                     op->mprot[op->mprot_count].va_page = s_frames[i].va_page;
                     op->mprot[op->mprot_count].frame   = src;
@@ -2833,7 +2980,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                 if (merr) {
                     tm_err("spawn: objcnode move failed err=%lu",
                            (unsigned long)merr);
-                    return -ENOMEM;
+                    return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
                 }
                 op->objcnode_va[op->objcnode_next] = s_frames[i].va_page;
                 op->objcnode_next++;
@@ -2852,7 +2999,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                 if (merr) {
                     tm_err("spawn: objcnode PT move failed err=%lu",
                            (unsigned long)merr);
-                    return -ENOMEM;
+                    return tm_spawn_unwind_return(&unwind_plan, -ENOMEM);
                 }
                 op->objcnode_va[op->objcnode_next] = 0;
                 op->objcnode_next++;
@@ -2867,7 +3014,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
 
     /* 9. Liftoff. */
     err = qsoe_tcb_resume(publication.tcb);
-    if (err) { tm_err("spawn: TCB_Resume failed"); return -ENOMEM; }
+    if (err) { tm_err("spawn: TCB_Resume failed"); return tm_spawn_unwind_return(&unwind_plan, -ENOMEM); }
     unwind_rc = tm_spawn_unwind_mark_committed(&unwind_plan);
     if (unwind_rc != 0)
         return unwind_rc;
