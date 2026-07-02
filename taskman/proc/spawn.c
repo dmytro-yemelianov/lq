@@ -1784,7 +1784,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                                      DL_RTLD_LOAD_VA);
         if (proto_rc != 0)
             return proto_rc;
-        const struct elf64_hdr *rtld_eh = rtld_blob;
+        const struct elf64_hdr *rtld_eh = loader_admit.rtld_blob;
         /* NQ pattern: skip rtld and jump straight to the user image's
          * entry.  Taskman's pre-reloc pass already resolved every
          * R_RISCV_RELATIVE / R_RISCV_64 / R_RISCV_JUMP_SLOT in qsh,
