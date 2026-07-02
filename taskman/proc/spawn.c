@@ -1453,6 +1453,36 @@ typedef struct tm_tcb_handoff_plan {
     seL4_CPtr reply_slot;
 } tm_tcb_handoff_plan_t;
 
+typedef enum tm_spawn_publication_status {
+    TM_SPAWN_PUBLICATION_EMPTY,
+    TM_SPAWN_PUBLICATION_READY,
+    TM_SPAWN_PUBLICATION_CONNECTION_READY,
+    TM_SPAWN_PUBLICATION_RESUME_READY,
+    TM_SPAWN_PUBLICATION_BAD_OBJECTS,
+    TM_SPAWN_PUBLICATION_BAD_CHANNEL,
+} tm_spawn_publication_status_t;
+
+typedef struct tm_spawn_publication_plan {
+    tm_spawn_publication_status_t status;
+    pid_t pid;
+    seL4_CPtr cnode;
+    seL4_CPtr tcb;
+    seL4_CPtr vspace;
+    seL4_CPtr first_child_slot;
+    seL4_CPtr child_untyped;
+    seL4_CPtr fault_ep;
+    seL4_CPtr sc;
+    seL4_CPtr workers_l1_pt;
+    const char *name_base;
+    unsigned name_len;
+    pid_t taskman_owner_pid;
+    int taskman_owner_chid;
+    seL4_CPtr taskman_ep_slot;
+    seL4_Word taskman_scoid;
+    seL4_Word taskman_flags;
+    int primary_idx;
+} tm_spawn_publication_plan_t;
+
 
 
 
@@ -1743,6 +1773,83 @@ static int tm_tcb_handoff_bind_sched_fault(tm_tcb_handoff_plan_t *handoff,
     handoff->sc = sc;
     handoff->fault_ep = fault_ep;
     handoff->status = TM_TCB_HANDOFF_READY;
+    return 0;
+}
+
+static int tm_spawn_publication_prepare(tm_spawn_publication_plan_t *publication,
+                                        pid_t pid,
+                                        seL4_CPtr cnode,
+                                        seL4_CPtr tcb,
+                                        seL4_CPtr vspace,
+                                        seL4_CPtr child_untyped,
+                                        seL4_CPtr fault_ep,
+                                        seL4_CPtr sc,
+                                        seL4_CPtr workers_l1_pt,
+                                        const char *elf_name)
+{
+    if (!publication)
+        return -EINVAL;
+
+    qmemset(publication, 0, sizeof *publication);
+    publication->status = TM_SPAWN_PUBLICATION_EMPTY;
+
+    if (!pid || !cnode || !tcb || !vspace ||
+        !child_untyped || !fault_ep || !sc) {
+        publication->status = TM_SPAWN_PUBLICATION_BAD_OBJECTS;
+        return -EINVAL;
+    }
+
+    publication->pid = pid;
+    publication->cnode = cnode;
+    publication->tcb = tcb;
+    publication->vspace = vspace;
+    publication->first_child_slot = QSOE_CAP_WELL_KNOWN_END;
+    publication->child_untyped = child_untyped;
+    publication->fault_ep = fault_ep;
+    publication->sc = sc;
+    publication->workers_l1_pt = workers_l1_pt;
+
+    publication->name_base = elf_name ? elf_name : "?";
+    for (const char *s = publication->name_base; *s; ++s)
+        if (*s == '/') publication->name_base = s + 1;
+    while (publication->name_base[publication->name_len] != '\0')
+        publication->name_len++;
+
+    publication->taskman_owner_pid = QSOE_PID_TASKMAN;
+    publication->taskman_owner_chid = 1;
+    publication->taskman_ep_slot = QSOE_CAP_TASKMAN_EP;
+    publication->taskman_scoid = (seL4_Word)pid;
+    publication->taskman_flags = 0;
+    publication->primary_idx = -1;
+    publication->status = TM_SPAWN_PUBLICATION_READY;
+    return 0;
+}
+
+static int tm_spawn_publication_bind_taskman_channel(tm_spawn_publication_plan_t *publication,
+                                                     int primary_idx)
+{
+    if (!publication)
+        return -EINVAL;
+    if (publication->status != TM_SPAWN_PUBLICATION_READY)
+        return -EINVAL;
+    if (primary_idx < 0) {
+        publication->status = TM_SPAWN_PUBLICATION_BAD_CHANNEL;
+        return -EINVAL;
+    }
+
+    publication->primary_idx = primary_idx;
+    publication->status = TM_SPAWN_PUBLICATION_CONNECTION_READY;
+    return 0;
+}
+
+static int tm_spawn_publication_mark_resume_ready(tm_spawn_publication_plan_t *publication)
+{
+    if (!publication)
+        return -EINVAL;
+    if (publication->status != TM_SPAWN_PUBLICATION_CONNECTION_READY)
+        return -EINVAL;
+
+    publication->status = TM_SPAWN_PUBLICATION_RESUME_READY;
     return 0;
 }
 
@@ -2363,31 +2470,41 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     err = qsoe_tcb_write_registers(tcb, 0, &ctx);
     if (err) { tm_err("spawn: TCB_WriteRegisters failed"); return -ENOMEM; }
 
+    tm_spawn_publication_plan_t publication;
+    int publication_rc = tm_spawn_publication_prepare(&publication, pid,
+                                                      cnode, tcb, vspace,
+                                                      child_untyped,
+                                                      fault_ep, sc,
+                                                      workers_l1_cap,
+                                                      elf_name);
+    if (publication_rc != 0)
+        return publication_rc;
+
     /* 8. Register the new process in taskman's process table so the
      *    lifecycle handlers can find its CSpace + slot allocator. */
-    int reg_err = tm_process_register(pid, cnode, tcb, vspace,
-                                       QSOE_CAP_WELL_KNOWN_END);
+    int reg_err = tm_process_register(publication.pid,
+                                       publication.cnode,
+                                       publication.tcb,
+                                       publication.vspace,
+                                       publication.first_child_slot);
     if (reg_err) {
         tm_err("spawn: tm_process_register failed");
         return reg_err;
     }
     /* Record the child's untyped budget master for cleanup on terminate,
      * and capture the ELF basename as the process name for /proc. */
-    tm_process_t *prec = tm_process_lookup(pid);
+    tm_process_t *prec = tm_process_lookup(publication.pid);
     if (prec) {
-        prec->untyped_budget = child_untyped;
-        prec->fault_ep       = fault_ep;
+        prec->untyped_budget = publication.child_untyped;
+        prec->fault_ep       = publication.fault_ep;
         /* Seed the main thread's tracked scheduling state to match the
          * priority/policy it was just configured with (SetSchedParams
          * above), so SchedGet reports the truth before any SchedSet. */
         prec->sched_prio     = TM_PRIO_USER_DEFAULT;
         prec->sched_policy   = TM_SCHED_RR;
-        const char *base = elf_name ? elf_name : "?";
-        for (const char *s = base; *s; ++s)
-            if (*s == '/') base = s + 1;
         unsigned ni = 0;
-        while (base[ni] != '\0' && ni < sizeof prec->name - 1) {
-            prec->name[ni] = base[ni];
+        while (ni < publication.name_len && ni < sizeof prec->name - 1) {
+            prec->name[ni] = publication.name_base[ni];
             ++ni;
         }
         prec->name[ni] = '\0';
@@ -2398,7 +2515,8 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     }
     /* Hand the dyn-link L1 PT to the worker-region allocator (same
      * L2[1] slot covers libc.so/rtld AND the worker region at 0x40000000). */
-    if (prec && workers_l1_cap) prec->workers_l1_pt = workers_l1_cap;
+    if (prec && publication.workers_l1_pt)
+        prec->workers_l1_pt = publication.workers_l1_pt;
 
     /* 8b. Register the connection record for the SYSMGR_COID cap we
      *     minted in step 5. The badge we used was `pid` itself, so the
@@ -2409,16 +2527,21 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * tm_channel_index matches owner_chid as stored, so we use the
      * raw index here -- NOT the encoded TASKMAN_CHID = (gen<<16)|idx
      * the user-facing ABI exposes (see <sys/qsoe.h>).               */
-    int primary_idx = tm_channel_index(QSOE_PID_TASKMAN, /*raw chid*/1);
+    int primary_idx = tm_channel_index(publication.taskman_owner_pid,
+                                       publication.taskman_owner_chid);
     tm_dbg("spawn: probe channel pid=%lu chid=1 -> idx=%ld",
-            (unsigned long)QSOE_PID_TASKMAN, (long)primary_idx);
-    if (primary_idx < 0) {
+            (unsigned long)publication.taskman_owner_pid, (long)primary_idx);
+    publication_rc = tm_spawn_publication_bind_taskman_channel(&publication,
+                                                              primary_idx);
+    if (publication_rc != 0) {
         tm_err("spawn: primary channel not registered yet");
-        return -EINVAL;
+        return publication_rc;
     }
-    int cnreg = tm_connection_register_existing(pid, QSOE_CAP_TASKMAN_EP,
-                                                primary_idx,
-                                                (seL4_Word)pid, 0);
+    int cnreg = tm_connection_register_existing(publication.pid,
+                                                publication.taskman_ep_slot,
+                                                publication.primary_idx,
+                                                publication.taskman_scoid,
+                                                publication.taskman_flags);
     if (cnreg) {
         tm_err("spawn: tm_connection_register_existing failed");
         return cnreg;
@@ -2432,9 +2555,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      * lives in the frame cap, so it survives the move; safe now that the
      * loads and the relocation pass have finished touching the frames. */
     {
-        tm_process_t *op = tm_process_lookup(pid);
+        tm_process_t *op = tm_process_lookup(publication.pid);
         if (op) {
-            op->sc = sc;   /* main-thread SC slot, freed in teardown */
+            op->sc = publication.sc;   /* main-thread SC slot, freed in teardown */
             seL4_CPtr objc = alloc_object(seL4_CapTableObject, TM_OBJCNODE_RADIX);
             if (!objc) { tm_err("spawn: objcnode alloc failed"); return -ENOMEM; }
             op->objcnode      = objc;
@@ -2491,8 +2614,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
     }
 
+    publication_rc = tm_spawn_publication_mark_resume_ready(&publication);
+    if (publication_rc != 0)
+        return publication_rc;
+
     /* 9. Liftoff. */
-    err = qsoe_tcb_resume(tcb);
+    err = qsoe_tcb_resume(publication.tcb);
     if (err) { tm_err("spawn: TCB_Resume failed"); return -ENOMEM; }
 
     return 0;
