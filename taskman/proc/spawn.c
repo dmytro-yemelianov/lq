@@ -1346,6 +1346,13 @@ static int load_elf_segments(seL4_CPtr vspace, const void *elf_blob,
     return 0;
 }
 
+typedef struct tm_loader_proto {
+    int dyn_link;
+    unsigned long entry_pc;
+    unsigned long main_phdr_va;
+    unsigned long rtld_load_base;
+} tm_loader_proto_t;
+
 typedef struct tm_spawn_plan {
     const void *elf_blob;
     unsigned long elf_len;
@@ -1353,11 +1360,36 @@ typedef struct tm_spawn_plan {
     const struct elf64_hdr *eh;
     const struct elf64_phdr *ph;
     const struct elf64_phdr *interp_ph;
-    int dyn_link;
-    unsigned long entry_pc;
-    unsigned long main_phdr_va;
-    unsigned long rtld_load_base;
+    tm_loader_proto_t loader_proto;
 } tm_spawn_plan_t;
+
+static int tm_loader_proto_admit_dynamic(tm_loader_proto_t *proto,
+                                         const struct elf64_hdr *eh,
+                                         const struct elf64_phdr *ph,
+                                         unsigned long rtld_load_base)
+{
+    if (!proto || !eh || !ph)
+        return -EINVAL;
+
+    proto->main_phdr_va = 0;
+    /* AT_PHDR is the VA of the main image's program-header table.
+     * The PHDR table sits in the first PT_LOAD; compute its VA as
+     * (first_load.p_vaddr - first_load.p_offset) + e_phoff. */
+    for (u16 i = 0; i < eh->e_phnum; ++i) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        if (eh->e_phoff >= ph[i].p_offset &&
+            eh->e_phoff <  ph[i].p_offset + ph[i].p_filesz) {
+            proto->main_phdr_va = ph[i].p_vaddr +
+                                  (eh->e_phoff - ph[i].p_offset);
+            break;
+        }
+    }
+
+    proto->rtld_load_base = rtld_load_base;
+    proto->entry_pc       = eh->e_entry;
+    proto->dyn_link       = 1;
+    return 0;
+}
 
 static void tm_spawn_state_reset(void)
 {
@@ -1402,7 +1434,7 @@ static int tm_spawn_plan_prepare(tm_spawn_plan_t *plan,
         }
     }
 
-    plan->entry_pc = eh->e_entry;
+    plan->loader_proto.entry_pc = eh->e_entry;
 
     tm_dbg("spawn: %s e_type=%u e_phnum=%u interp=%s", elf_name,
             eh->e_type, eh->e_phnum, plan->interp_ph ? "yes" : "no");
@@ -1503,10 +1535,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     const struct elf64_hdr *eh = plan.eh;
     const struct elf64_phdr *ph = plan.ph;
     const struct elf64_phdr *interp_ph = plan.interp_ph;
-    int dyn_link = plan.dyn_link;
-    unsigned long entry_pc = plan.entry_pc;
-    unsigned long main_phdr_va = plan.main_phdr_va;
-    unsigned long rtld_load_base = plan.rtld_load_base;
+    tm_loader_proto_t loader_proto = plan.loader_proto;
 
     /* BUILD phase: allocate child objects, map image/address-space state,
      * and prepare the initial user stack without publishing process state. */
@@ -1708,20 +1737,10 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         }
         tm_dbg("spawn: main relocs %lu/%lu (%lu skipped)", ap, tot, sk);
 
-        /* AT_PHDR is the VA of the main image's program-header table.
-         * The PHDR table sits in the first PT_LOAD; compute its VA as
-         * (first_load.p_vaddr - first_load.p_offset) + e_phoff. */
-        for (u16 i = 0; i < eh->e_phnum; ++i) {
-            if (ph[i].p_type != PT_LOAD) continue;
-            if (eh->e_phoff >= ph[i].p_offset &&
-                eh->e_phoff <  ph[i].p_offset + ph[i].p_filesz) {
-                main_phdr_va = ph[i].p_vaddr +
-                               (eh->e_phoff - ph[i].p_offset);
-                break;
-            }
-        }
-
-        rtld_load_base = DL_RTLD_LOAD_VA;
+        int proto_rc = tm_loader_proto_admit_dynamic(&loader_proto, eh, ph,
+                                                     DL_RTLD_LOAD_VA);
+        if (proto_rc != 0)
+            return proto_rc;
         const struct elf64_hdr *rtld_eh = rtld_blob;
         /* NQ pattern: skip rtld and jump straight to the user image's
          * entry.  Taskman's pre-reloc pass already resolved every
@@ -1736,15 +1755,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * have done the new image's relocs and rtld needs to step
          * back into the picture. */
         (void)rtld_eh;
-        entry_pc       = eh->e_entry;
-        dyn_link       = 1;
 
         const unsigned char *rb = (const unsigned char *)rtld_blob;
         tm_dbg("spawn: skip rtld magic=%02x%02x%02x%02x rtld_entry=%08lx pc=%08lx phdr_va=%08lx",
                 rb[0], rb[1], rb[2], rb[3],
                 (unsigned long)rtld_eh->e_entry,
-                (unsigned long)entry_pc,
-                (unsigned long)main_phdr_va);
+                (unsigned long)loader_proto.entry_pc,
+                (unsigned long)loader_proto.main_phdr_va);
     }
 
     /* 4. IPC buffer page — allocate, zero, map into child. */
@@ -1843,12 +1860,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     struct aux_pair auxv[TM_SPAWN_ARGPACK_MAX_AUXV];
     int auxc = 0;
     tm_spawn_argpack_t argpack;
-    if (dyn_link) {
-        auxv[auxc++] = (struct aux_pair){ AT_PHDR_,     main_phdr_va };
+    if (loader_proto.dyn_link) {
+        auxv[auxc++] = (struct aux_pair){ AT_PHDR_,     loader_proto.main_phdr_va };
         auxv[auxc++] = (struct aux_pair){ AT_PHENT_,    sizeof(struct elf64_phdr) };
         auxv[auxc++] = (struct aux_pair){ AT_PHNUM_,    eh->e_phnum };
-        auxv[auxc++] = (struct aux_pair){ AT_BASE_,     rtld_load_base };
-        auxv[auxc++] = (struct aux_pair){ AT_ENTRY_,    eh->e_entry };
+        auxv[auxc++] = (struct aux_pair){ AT_BASE_,     loader_proto.rtld_load_base };
+        auxv[auxc++] = (struct aux_pair){ AT_ENTRY_,    loader_proto.entry_pc };
         auxv[auxc++] = (struct aux_pair){ AT_PAGESZ_,   0x1000 };
         auxv[auxc++] = (struct aux_pair){ AT_KPRELOAD_, DL_LIBC_LOAD_VA };
     }
@@ -1989,12 +2006,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    at argc in the SysV image we just wrote into the top stack
      *    page). gp=0 because the binary's start.S sets it itself.
      *
-     *    For static binaries entry_pc == eh->e_entry.  For dynamic
+     *    For static binaries loader_proto.entry_pc == eh->e_entry.  For dynamic
      *    binaries it's rtld's .rtld_start; rtld parses the auxv,
      *    relocates qsh + libc.so, then jumps to qsh.e_entry. */
     qsoe_user_ctx_t ctx;
     qmemset(&ctx, 0, sizeof ctx);
-    ctx.pc = entry_pc;
+    ctx.pc = loader_proto.entry_pc;
     ctx.sp = initial_sp;
     ctx.gp = 0;
     ctx.tp = CHILD_TCB_BASE;     /* points at the zeroed TCB page above */
