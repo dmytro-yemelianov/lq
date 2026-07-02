@@ -924,6 +924,75 @@ int tm_sched_get(pid_t caller_pid, pid_t pid, int tid,
 
 /* ----------- v0.4.1 process termination ----------- */
 
+#define TM_TEARDOWN_PLAN_MAX_OPS 12
+
+typedef enum tm_teardown_op_kind {
+    TM_TEARDOWN_REVOKE_DELETE_FREE,
+    TM_TEARDOWN_DELETE_FREE,
+    TM_TEARDOWN_FREE_ONLY,
+} tm_teardown_op_kind_t;
+
+typedef struct tm_teardown_op {
+    tm_teardown_op_kind_t kind;
+    seL4_CPtr slot;
+    seL4_CPtr *clear_slot;
+    const char *label;
+} tm_teardown_op_t;
+
+typedef struct tm_teardown_plan {
+    unsigned op_count;
+    tm_teardown_op_t ops[TM_TEARDOWN_PLAN_MAX_OPS];
+} tm_teardown_plan_t;
+
+static void tm_teardown_plan_reset(tm_teardown_plan_t *plan)
+{
+    plan->op_count = 0;
+}
+
+static int tm_teardown_plan_add(tm_teardown_plan_t *plan,
+                                tm_teardown_op_kind_t kind,
+                                seL4_CPtr slot,
+                                seL4_CPtr *clear_slot,
+                                const char *label)
+{
+    if (!plan || !slot)
+        return 0;
+    if (plan->op_count >= TM_TEARDOWN_PLAN_MAX_OPS)
+        return -E2BIG;
+
+    tm_teardown_op_t *op = &plan->ops[plan->op_count++];
+    op->kind = kind;
+    op->slot = slot;
+    op->clear_slot = clear_slot;
+    op->label = label;
+    return 0;
+}
+
+static void tm_teardown_plan_commit(const tm_teardown_plan_t *plan)
+{
+    if (!plan)
+        return;
+
+    for (unsigned i = 0; i < plan->op_count; ++i) {
+        const tm_teardown_op_t *op = &plan->ops[i];
+
+        if (op->kind == TM_TEARDOWN_REVOKE_DELETE_FREE) {
+            qsoe_cnode_revoke(s_cnode_root, op->slot, TM_DEPTH_TASKMAN);
+            qsoe_cnode_delete(s_cnode_root, op->slot, TM_DEPTH_TASKMAN);
+            taskman_free_slot(op->slot);
+        } else if (op->kind == TM_TEARDOWN_DELETE_FREE) {
+            qsoe_cnode_delete(s_cnode_root, op->slot, TM_DEPTH_TASKMAN);
+            taskman_free_slot(op->slot);
+        } else if (op->kind == TM_TEARDOWN_FREE_ONLY) {
+            taskman_free_slot(op->slot);
+        }
+
+        if (op->clear_slot)
+            *op->clear_slot = 0;
+        (void)op->label;
+    }
+}
+
 int tm_process_terminate(pid_t target, int status)
 {
     if (target == QSOE_PID_TASKMAN) return -EINVAL;
@@ -1007,30 +1076,27 @@ int tm_process_terminate(pid_t target, int status)
     extern void tm_connections_drop_for_pid(pid_t pid);
     tm_connections_drop_for_pid(target);
 
+    tm_teardown_plan_t teardown;
+    tm_teardown_plan_reset(&teardown);
     /* 4. Main TCB. */
-    qsoe_cnode_revoke(s_cnode_root, p->tcb, TM_DEPTH_TASKMAN);
-    qsoe_cnode_delete(s_cnode_root, p->tcb, TM_DEPTH_TASKMAN);
-    taskman_free_slot(p->tcb);
-
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_REVOKE_DELETE_FREE,
+                             p->tcb, 0, "main TCB") != 0)
+        return -ENOMEM;
     /* 4a. Main-thread SC.  Object dies with Revoke(pput); reclaim its
      *     root slot now that the TCB it was bound to is gone. */
-    if (p->sc) {
-        qsoe_cnode_delete(s_cnode_root, p->sc, TM_DEPTH_TASKMAN);
-        taskman_free_slot(p->sc);
-        p->sc = 0;
-    }
-
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_DELETE_FREE,
+                             p->sc, &p->sc, "main SC") != 0)
+        return -ENOMEM;
     /* 4b. Fault-handler cap -- the TCB referenced it; safe to drop now. */
-    if (p->fault_ep) {
-        qsoe_cnode_delete(s_cnode_root, p->fault_ep, TM_DEPTH_TASKMAN);
-        taskman_free_slot(p->fault_ep);
-        p->fault_ep = 0;
-    }
-
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_DELETE_FREE,
+                             p->fault_ep, &p->fault_ep,
+                             "fault handler") != 0)
+        return -ENOMEM;
     /* 5. VSpace. */
-    qsoe_cnode_revoke(s_cnode_root, p->vspace, TM_DEPTH_TASKMAN);
-    qsoe_cnode_delete(s_cnode_root, p->vspace, TM_DEPTH_TASKMAN);
-    taskman_free_slot(p->vspace);
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_REVOKE_DELETE_FREE,
+                             p->vspace, 0, "vspace") != 0)
+        return -ENOMEM;
+    tm_teardown_plan_commit(&teardown);
 
     /* Clear all capabilities inside the child's CSpace to avoid leaks and unblock clients.
      * Running this after the TCB is destroyed (Step 4) guarantees that the kernel has already
@@ -1047,27 +1113,26 @@ int tm_process_terminate(pid_t target, int status)
         }
     }
 
+    tm_teardown_plan_reset(&teardown);
     /* 6. CNode. */
-    qsoe_cnode_revoke(s_cnode_root, p->cnode, TM_DEPTH_TASKMAN);
-    qsoe_cnode_delete(s_cnode_root, p->cnode, TM_DEPTH_TASKMAN);
-    taskman_free_slot(p->cnode);
-
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_REVOKE_DELETE_FREE,
+                             p->cnode, 0, "cnode") != 0)
+        return -ENOMEM;
     /* 7. Workers L0/L1 PTs if allocated. */
-    if (p->workers_l0_pt) {
-        qsoe_cnode_delete(s_cnode_root, p->workers_l0_pt, TM_DEPTH_TASKMAN);
-        taskman_free_slot(p->workers_l0_pt);
-    }
-    if (p->workers_l1_pt) {
-        qsoe_cnode_delete(s_cnode_root, p->workers_l1_pt, TM_DEPTH_TASKMAN);
-        taskman_free_slot(p->workers_l1_pt);
-    }
-
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_DELETE_FREE,
+                             p->workers_l0_pt, &p->workers_l0_pt,
+                             "workers L0 PT") != 0)
+        return -ENOMEM;
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_DELETE_FREE,
+                             p->workers_l1_pt, &p->workers_l1_pt,
+                             "workers L1 PT") != 0)
+        return -ENOMEM;
     /* 8. Untyped budget. */
-    if (p->untyped_budget) {
-        qsoe_cnode_revoke(s_cnode_root, p->untyped_budget, TM_DEPTH_TASKMAN);
-        qsoe_cnode_delete(s_cnode_root, p->untyped_budget, TM_DEPTH_TASKMAN);
-        taskman_free_slot(p->untyped_budget);
-    }
+    if (tm_teardown_plan_add(&teardown, TM_TEARDOWN_REVOKE_DELETE_FREE,
+                             p->untyped_budget, 0,
+                             "untyped budget") != 0)
+        return -ENOMEM;
+    tm_teardown_plan_commit(&teardown);
 
     /* 8b. mmap megapage frame caps -- both the live mappings and the
      *     parked recycle list.  Their objects die with Revoke(pput)

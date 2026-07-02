@@ -658,6 +658,112 @@ static int tm_cap_plan_commit(const tm_cap_plan_t *plan)
     return 0;
 }
 
+static int spawn_record_frame(unsigned long va_page, seL4_CPtr frame);
+static int spawn_record_pt(seL4_CPtr pt);
+
+#define TM_VSPACE_PLAN_MAX_OPS 8
+
+typedef enum tm_vspace_op_kind {
+    TM_VSPACE_OP_PAGETABLE_MAP,
+    TM_VSPACE_OP_PAGE_MAP,
+} tm_vspace_op_kind_t;
+
+typedef struct tm_vspace_op {
+    tm_vspace_op_kind_t kind;
+    seL4_CPtr cap;
+    unsigned long va;
+    seL4_CapRights_t rights;
+    seL4_Word attrs;
+    int record_cap;
+    const char *label;
+} tm_vspace_op_t;
+
+typedef struct tm_vspace_plan {
+    seL4_CPtr vspace;
+    unsigned op_count;
+    tm_vspace_op_t ops[TM_VSPACE_PLAN_MAX_OPS];
+} tm_vspace_plan_t;
+
+static void tm_vspace_plan_reset(tm_vspace_plan_t *plan, seL4_CPtr vspace)
+{
+    qmemset(plan, 0, sizeof *plan);
+    plan->vspace = vspace;
+}
+
+static int tm_vspace_plan_add_pt(tm_vspace_plan_t *plan,
+                                 seL4_CPtr pt,
+                                 unsigned long va,
+                                 int record_cap,
+                                 const char *label)
+{
+    if (!plan || !pt || plan->op_count >= TM_VSPACE_PLAN_MAX_OPS)
+        return -E2BIG;
+
+    tm_vspace_op_t *op = &plan->ops[plan->op_count++];
+    op->kind = TM_VSPACE_OP_PAGETABLE_MAP;
+    op->cap = pt;
+    op->va = va;
+    op->attrs = QSOE_VM_ATTR_DEFAULT;
+    op->record_cap = record_cap;
+    op->label = label;
+    return 0;
+}
+
+static int tm_vspace_plan_add_page(tm_vspace_plan_t *plan,
+                                   seL4_CPtr frame,
+                                   unsigned long va,
+                                   seL4_CapRights_t rights,
+                                   seL4_Word attrs,
+                                   int record_cap,
+                                   const char *label)
+{
+    if (!plan || !frame || plan->op_count >= TM_VSPACE_PLAN_MAX_OPS)
+        return -E2BIG;
+
+    tm_vspace_op_t *op = &plan->ops[plan->op_count++];
+    op->kind = TM_VSPACE_OP_PAGE_MAP;
+    op->cap = frame;
+    op->va = va;
+    op->rights = rights;
+    op->attrs = attrs;
+    op->record_cap = record_cap;
+    op->label = label;
+    return 0;
+}
+
+static int tm_vspace_plan_commit(const tm_vspace_plan_t *plan)
+{
+    if (!plan || !plan->vspace)
+        return -EINVAL;
+
+    for (unsigned i = 0; i < plan->op_count; ++i) {
+        const tm_vspace_op_t *op = &plan->ops[i];
+        seL4_Word err;
+
+        if (op->kind == TM_VSPACE_OP_PAGETABLE_MAP) {
+            if (op->record_cap && spawn_record_pt(op->cap) != 0)
+                return -ENOMEM;
+            err = qsoe_riscv_pagetable_map(op->cap, plan->vspace,
+                                           op->va, op->attrs);
+        } else if (op->kind == TM_VSPACE_OP_PAGE_MAP) {
+            err = qsoe_riscv_page_map(op->cap, plan->vspace,
+                                      op->va, op->rights, op->attrs);
+            if (!err && op->record_cap &&
+                spawn_record_frame(op->va, op->cap) != 0)
+                return -ENOMEM;
+        } else {
+            return -EINVAL;
+        }
+
+        if (err) {
+            tm_err("spawn: %s failed", op->label);
+            return -ENOMEM;
+        }
+    }
+
+    return 0;
+}
+
 /* Build the SysV ABI initial-stack image into the top page of the
  * child's stack region.
  *
@@ -1431,15 +1537,17 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *    intermediate level. The kernel decides the level from vaddr. */
     seL4_CPtr l1_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
     if (!l1_pt) return -ENOMEM;
-    if (spawn_record_pt(l1_pt) != 0) return -ENOMEM;
-    err = qsoe_riscv_pagetable_map(l1_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: L1 PageTable_Map failed"); return -ENOMEM; }
-
     seL4_CPtr l0_pt = alloc_object(seL4_RISCV_PageTableObject, 0);
     if (!l0_pt) return -ENOMEM;
-    if (spawn_record_pt(l0_pt) != 0) return -ENOMEM;
-    err = qsoe_riscv_pagetable_map(l0_pt, vspace, 0, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: L0 PageTable_Map failed"); return -ENOMEM; }
+    tm_vspace_plan_t vspace_plan;
+    tm_vspace_plan_reset(&vspace_plan, vspace);
+    if (tm_vspace_plan_add_pt(&vspace_plan, l1_pt, 0,
+                              1, "L1 PageTable_Map") != 0 ||
+        tm_vspace_plan_add_pt(&vspace_plan, l0_pt, 0,
+                              1, "L0 PageTable_Map") != 0)
+        return -ENOMEM;
+    err = tm_vspace_plan_commit(&vspace_plan);
+    if (err) return err;
 
     /* 3. Walk PT_LOAD segments of the main image at link VA.
      *    For ET_EXEC like our current binaries, p_vaddr is the final
@@ -1495,13 +1603,9 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * level from vaddr + what's already installed. */
         seL4_CPtr dl_l1 = alloc_object(seL4_RISCV_PageTableObject, 0);
         if (!dl_l1) return -ENOMEM;
-        err = qsoe_riscv_pagetable_map(dl_l1, vspace, DL_LIBC_LOAD_VA,
-                                        QSOE_VM_ATTR_DEFAULT);
-        if (err) { tm_err("spawn: DL L1 PT map failed"); return -ENOMEM; }
         /* Same PT object also covers the worker region at 0x40000000 —
          * record it so ensure_workers_pts() doesn't try to install a
          * second L1 PT into the same already-populated L2[1] slot. */
-        workers_l1_cap = dl_l1;
 
         /* dl_l1 above is NOT recorded for objcnode-move: it doubles as
          * workers_l1_cap -> workers_l1_pt, whose slot teardown step 7
@@ -1509,17 +1613,20 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * slots must be reclaimed here. */
         seL4_CPtr libc_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
         if (!libc_l0) return -ENOMEM;
-        if (spawn_record_pt(libc_l0) != 0) return -ENOMEM;
-        err = qsoe_riscv_pagetable_map(libc_l0, vspace, DL_LIBC_LOAD_VA,
-                                        QSOE_VM_ATTR_DEFAULT);
-        if (err) { tm_err("spawn: libc L0 PT map failed"); return -ENOMEM; }
 
         seL4_CPtr rtld_l0 = alloc_object(seL4_RISCV_PageTableObject, 0);
         if (!rtld_l0) return -ENOMEM;
-        if (spawn_record_pt(rtld_l0) != 0) return -ENOMEM;
-        err = qsoe_riscv_pagetable_map(rtld_l0, vspace, DL_RTLD_LOAD_VA,
-                                        QSOE_VM_ATTR_DEFAULT);
-        if (err) { tm_err("spawn: rtld L0 PT map failed"); return -ENOMEM; }
+        tm_vspace_plan_reset(&vspace_plan, vspace);
+        if (tm_vspace_plan_add_pt(&vspace_plan, dl_l1, DL_LIBC_LOAD_VA,
+                                  0, "DL L1 PT map") != 0 ||
+            tm_vspace_plan_add_pt(&vspace_plan, libc_l0, DL_LIBC_LOAD_VA,
+                                  1, "libc L0 PT map") != 0 ||
+            tm_vspace_plan_add_pt(&vspace_plan, rtld_l0, DL_RTLD_LOAD_VA,
+                                  1, "rtld L0 PT map") != 0)
+            return -ENOMEM;
+        err = tm_vspace_plan_commit(&vspace_plan);
+        if (err) return err;
+        workers_l1_cap = dl_l1;
 
         /* PT_LOAD-walk libc.so at the fixed VA, then rtld at its base. */
         load_rc = load_elf_segments(vspace, libc_blob, DL_LIBC_LOAD_VA);
@@ -1648,10 +1755,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
     err = scratch_unmap(ipc_frame);
     if (err) return -ENOMEM;
-    err = qsoe_riscv_page_map(ipc_frame, vspace, CHILD_IPC_BUFFER,
-                              QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: ipc_frame Page_Map failed"); return -ENOMEM; }
-    if (spawn_record_frame(CHILD_IPC_BUFFER, ipc_frame) != 0) return -ENOMEM;
+    tm_vspace_plan_reset(&vspace_plan, vspace);
+    if (tm_vspace_plan_add_page(&vspace_plan, ipc_frame, CHILD_IPC_BUFFER,
+                                QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT,
+                                1, "ipc_frame Page_Map") != 0)
+        return -ENOMEM;
+    err = tm_vspace_plan_commit(&vspace_plan);
+    if (err) return err;
 
     /* 4b. TCB page -- one zeroed 4 KiB page at CHILD_TCB_BASE that the
      *     thread's tp register will point at.  libc.so / rtld use
@@ -1671,10 +1781,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
     qmemset((void *)TM_SCRATCH_VADDR, 0, 0x1000);
     err = scratch_unmap(tcb_frame);
     if (err) return -ENOMEM;
-    err = qsoe_riscv_page_map(tcb_frame, vspace, CHILD_TCB_BASE,
-                              QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-    if (err) { tm_err("spawn: tcb_frame Page_Map failed"); return -ENOMEM; }
-    if (spawn_record_frame(CHILD_TCB_BASE, tcb_frame) != 0) return -ENOMEM;
+    tm_vspace_plan_reset(&vspace_plan, vspace);
+    if (tm_vspace_plan_add_page(&vspace_plan, tcb_frame, CHILD_TCB_BASE,
+                                QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT,
+                                1, "tcb_frame Page_Map") != 0)
+        return -ENOMEM;
+    err = tm_vspace_plan_commit(&vspace_plan);
+    if (err) return err;
 
     /* 4c. Sysmap page -- one READ-ONLY 'PSYS' page at QSOE_SYSMAP_VA
      *     carrying the platform catalog (mtime freq, cpu count, PCI
@@ -1694,11 +1807,14 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
             qmemcpy((void *)TM_SCRATCH_VADDR, smp, 0x1000);
             err = scratch_unmap(smap_frame);
             if (err) return -ENOMEM;
-            err = qsoe_riscv_page_map(smap_frame, vspace, CHILD_SYSMAP_BASE,
-                                      QSOE_RIGHTS_RO, QSOE_VM_ATTR_DEFAULT);
-            if (err) { tm_err("spawn: sysmap Page_Map failed"); return -ENOMEM; }
-            if (spawn_record_frame(CHILD_SYSMAP_BASE, smap_frame) != 0)
+            tm_vspace_plan_reset(&vspace_plan, vspace);
+            if (tm_vspace_plan_add_page(&vspace_plan, smap_frame,
+                                        CHILD_SYSMAP_BASE,
+                                        QSOE_RIGHTS_RO, QSOE_VM_ATTR_DEFAULT,
+                                        1, "sysmap Page_Map") != 0)
                 return -ENOMEM;
+            err = tm_vspace_plan_commit(&vspace_plan);
+            if (err) return err;
         }
     }
 
@@ -1751,16 +1867,16 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         return -E2BIG;
     }
     /* Now map all stack pages into the child. */
+    tm_vspace_plan_reset(&vspace_plan, vspace);
     for (int i = 0; i < CHILD_STACK_PAGES; ++i) {
         unsigned long va = CHILD_STACK_BASE + (unsigned long)i * 0x1000UL;
-        err = qsoe_riscv_page_map(stack_frames[i], vspace, va,
-                                  QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT);
-        if (err) {
-            tm_err("spawn: stack Page_Map failed");
+        if (tm_vspace_plan_add_page(&vspace_plan, stack_frames[i], va,
+                                    QSOE_RIGHTS_ALL, QSOE_VM_ATTR_DEFAULT,
+                                    1, "stack Page_Map") != 0)
             return -ENOMEM;
-        }
-        if (spawn_record_frame(va, stack_frames[i]) != 0) return -ENOMEM;
     }
+    err = tm_vspace_plan_commit(&vspace_plan);
+    if (err) return err;
 
     /* COMMIT phase: publish caps/process records and resume only after
      * the address space, stack, and loader state have been built. */
