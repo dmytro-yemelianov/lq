@@ -1353,6 +1353,23 @@ typedef struct tm_loader_proto {
     unsigned long rtld_load_base;
 } tm_loader_proto_t;
 
+typedef enum tm_loader_admit_status {
+    TM_LOADER_ADMIT_EMPTY,
+    TM_LOADER_ADMIT_READY,
+    TM_LOADER_ADMIT_MISSING_RTLD,
+    TM_LOADER_ADMIT_MISSING_LIBC,
+} tm_loader_admit_status_t;
+
+typedef struct tm_loader_admit {
+    tm_loader_admit_status_t status;
+    const char *interp_path;
+    const char *interp_cpio_name;
+    const void *rtld_blob;
+    unsigned long rtld_size;
+    const void *libc_blob;
+    unsigned long libc_size;
+} tm_loader_admit_t;
+
 typedef struct tm_spawn_plan {
     const void *elf_blob;
     unsigned long elf_len;
@@ -1388,6 +1405,42 @@ static int tm_loader_proto_admit_dynamic(tm_loader_proto_t *proto,
     proto->rtld_load_base = rtld_load_base;
     proto->entry_pc       = eh->e_entry;
     proto->dyn_link       = 1;
+    return 0;
+}
+
+static int tm_loader_admit_dynamic(tm_loader_admit_t *admit,
+                                   const void *elf_blob,
+                                   const struct elf64_phdr *interp_ph)
+{
+    if (!admit || !elf_blob || !interp_ph)
+        return -EINVAL;
+
+    qmemset(admit, 0, sizeof *admit);
+    admit->status = TM_LOADER_ADMIT_EMPTY;
+
+    /* PT_INTERP body is an ASCIIZ path like "/lib/ld-qsoe.so.1".
+     * Strip the leading '/' for the cpio (flat) namespace. */
+    admit->interp_path = (const char *)elf_blob + interp_ph->p_offset;
+    admit->interp_cpio_name = admit->interp_path;
+    if (admit->interp_cpio_name[0] == '/')
+        admit->interp_cpio_name++;
+
+    admit->rtld_blob = tm_cpio_lookup(admit->interp_cpio_name,
+                                      &admit->rtld_size);
+    if (!admit->rtld_blob) {
+        admit->status = TM_LOADER_ADMIT_MISSING_RTLD;
+        tm_err("spawn: rtld not in cpio: %s", admit->interp_cpio_name);
+        return -ENOENT;
+    }
+
+    admit->libc_blob = tm_cpio_lookup("lib/libc.so", &admit->libc_size);
+    if (!admit->libc_blob) {
+        admit->status = TM_LOADER_ADMIT_MISSING_LIBC;
+        tm_err("spawn: lib/libc.so not in cpio");
+        return -ENOENT;
+    }
+
+    admit->status = TM_LOADER_ADMIT_READY;
     return 0;
 }
 
@@ -1606,25 +1659,11 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
      *     applies relocations to qsh and libc.so, then jumps to qsh's
      *     entry (AT_ENTRY) with the original sp.                    */
     if (interp_ph) {
-        /* PT_INTERP body is an ASCIIZ path like "/lib/ld-qsoe.so.1".
-         * Strip the leading '/' for the cpio (flat) namespace. */
-        const char *interp_path = (const char *)elf_blob + interp_ph->p_offset;
-        const char *interp_cpio_name = interp_path;
-        if (interp_cpio_name[0] == '/') interp_cpio_name++;
-
-        unsigned long rtld_size = 0;
-        const void   *rtld_blob = tm_cpio_lookup(interp_cpio_name, &rtld_size);
-        if (!rtld_blob) {
-            tm_err("spawn: rtld not in cpio: %s", interp_cpio_name);
-            return -ENOENT;
-        }
-
-        unsigned long libc_size = 0;
-        const void   *libc_blob = tm_cpio_lookup("lib/libc.so", &libc_size);
-        if (!libc_blob) {
-            tm_err("spawn: lib/libc.so not in cpio");
-            return -ENOENT;
-        }
+        tm_loader_admit_t loader_admit;
+        int admit_rc = tm_loader_admit_dynamic(&loader_admit, elf_blob,
+                                               interp_ph);
+        if (admit_rc != 0)
+            return admit_rc;
 
         /* Install the page-table tree covering [0x40000000, 0x80000000).
          * One L1 PT (for L2[1]), plus one L0 PT for each of the two
@@ -1658,10 +1697,12 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
         workers_l1_cap = dl_l1;
 
         /* PT_LOAD-walk libc.so at the fixed VA, then rtld at its base. */
-        load_rc = load_elf_segments(vspace, libc_blob, DL_LIBC_LOAD_VA);
+        load_rc = load_elf_segments(vspace, loader_admit.libc_blob,
+                                    DL_LIBC_LOAD_VA);
         if (load_rc != 0) { tm_err("spawn: libc.so load failed"); return load_rc; }
 
-        load_rc = load_elf_segments(vspace, rtld_blob, DL_RTLD_LOAD_VA);
+        load_rc = load_elf_segments(vspace, loader_admit.rtld_blob,
+                                    DL_RTLD_LOAD_VA);
         if (load_rc != 0) { tm_err("spawn: rtld load failed"); return load_rc; }
 
         /* 3c. Pre-apply relocations in taskman (mirrors NQ's loader.c
@@ -1683,11 +1724,13 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * call tm_reloc_apply with reloc_write_cb scratch-mapping
          * frames in the child VSpace. */
         tm_elf_view_t libc_view, rtld_view, main_view;
-        if (tm_elf_parse(libc_blob, libc_size, &libc_view) != 0) {
+        if (tm_elf_parse(loader_admit.libc_blob, loader_admit.libc_size,
+                         &libc_view) != 0) {
             tm_err("spawn: libc.so re-parse failed");
             return -ENOEXEC;
         }
-        if (tm_elf_parse(rtld_blob, rtld_size, &rtld_view) != 0) {
+        if (tm_elf_parse(loader_admit.rtld_blob, loader_admit.rtld_size,
+                         &rtld_view) != 0) {
             tm_err("spawn: rtld re-parse failed");
             return -ENOEXEC;
         }
@@ -1741,7 +1784,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
                                                      DL_RTLD_LOAD_VA);
         if (proto_rc != 0)
             return proto_rc;
-        const struct elf64_hdr *rtld_eh = rtld_blob;
+        const struct elf64_hdr *rtld_eh = loader_admit.rtld_blob;
         /* NQ pattern: skip rtld and jump straight to the user image's
          * entry.  Taskman's pre-reloc pass already resolved every
          * R_RISCV_RELATIVE / R_RISCV_64 / R_RISCV_JUMP_SLOT in qsh,
@@ -1756,7 +1799,7 @@ int tm_spawn(const void *elf_blob, unsigned long elf_len,
          * back into the picture. */
         (void)rtld_eh;
 
-        const unsigned char *rb = (const unsigned char *)rtld_blob;
+        const unsigned char *rb = (const unsigned char *)loader_admit.rtld_blob;
         tm_dbg("spawn: skip rtld magic=%02x%02x%02x%02x rtld_entry=%08lx pc=%08lx phdr_va=%08lx",
                 rb[0], rb[1], rb[2], rb[3],
                 (unsigned long)rtld_eh->e_entry,
